@@ -1,5 +1,11 @@
 # Shard
 
+<div align="center">
+
+**English** | [简体中文](README_CN.md)
+
+</div>
+
 **The engine for a permissionless compute network** — *BitTorrent, but you share
 VRAM and compute instead of disk.* Anyone plugs in a GPU of any kind; the network
 pools them into swarms that run models far larger than any single card holds. The
