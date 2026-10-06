@@ -750,7 +750,7 @@ def _is_pred_hello(msg):
 
 def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=None, device=None,
                 receipts=None, key_path=None, timeout=600.0, bind="127.0.0.1", ready=None,
-                ret_relay=None, dspark=False):
+                ret_relay=None, dspark=False, runtime_metrics=None):
     """Serve one contiguous layer block [lo:hi) in the fire-forward ring.
 
     head (stage 0)      embeds token ids -> h [b, s, 4, dim], runs its layers, forwards (h, ids).
@@ -791,7 +791,10 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
         # same cuda condition so the CPU suite keeps its fp32 default.
         torch.set_default_dtype(torch.bfloat16)
     with _BUILD_LOCK:                                   # process-wide torch/reference globals — see the lock
-        st = V4.Stage(lo, hi, args, head=head, tail=tail, dspark=(dspark and tail), device=dev)
+        options = dict(head=head, tail=tail, dspark=(dspark and tail), device=dev)
+        if runtime_metrics is not None:
+            options["runtime_metrics"] = runtime_metrics
+        st = V4.Stage(lo, hi, args, **options)
         if ckpt_dir is not None:
             st.load(ckpt_dir)
     node_key = load_or_make_node_key(key_path) if receipts else None
@@ -984,7 +987,8 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
             if op == "receipt":                               # job done: append my receipt, pass on
                 timer.report()                                # the job barrier: one timing line per job
                 if signer is not None:
-                    msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
+                    msg.setdefault("receipts", []).append(
+                        {"stage": stage, **_finalize_stage_receipt(signer, st)})
                 _fwd_open(kw, nxt, timeout, msg, tag)          # the sweep opens a leg that idled all job
                 continue
             if op == "step":
@@ -1102,6 +1106,12 @@ def _tail_drafter(st, ckpt_dir, cache):
         cache["drafter"] = _dspark().ring_drafter(st, ckpt_dir)
         print(f"[tail] dspark drafter {cache['drafter'].tail}", flush=True)
     return cache["drafter"]
+
+
+def _finalize_stage_receipt(signer, stage):
+    """Optional observations belong in the signature preimage; off keeps the old call contract."""
+    snapshot = getattr(stage, "runtime_metrics", lambda: None)()
+    return signer.finalize() if snapshot is None else signer.finalize(runtime_metrics=snapshot)
 
 
 class _RetChannel:
@@ -1226,6 +1236,9 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                 try:
                     drafter = _tail_drafter(st, ckpt_dir, built) if st._dspark else None
                     if drafter is not None:                   # streamed s=1 frames vs one chunk
+                        observer = getattr(st, "observe_runtime_drafter", None)
+                        if observer is not None:
+                            observer(drafter)
                         drafter.pipelined = bool(msg.get("pipelined"))
                 except Exception as e:  # noqa: BLE001 — any drafter fault is this JOB's, not the ring's
                     # A dspark job on a tail that cannot draft — launched without --dspark, or a
@@ -1247,7 +1260,8 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
             if op == "receipt":
                 timer.report()                                # the job barrier: one timing line per job
                 if signer is not None:
-                    msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
+                    msg.setdefault("receipts", []).append(
+                        {"stage": "tail", **_finalize_stage_receipt(signer, st)})
                 chan.send(msg.get("receipts", []))
                 continue
             if op == "step":
@@ -1975,7 +1989,10 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
 
     def _mark():
         """Advance the fill integral to NOW at the CURRENT level — called BEFORE c/horizon moves."""
-        now = time.monotonic()
+        # perf_counter has sub-millisecond resolution on Windows/Python 3.11 too.
+        # A coarse monotonic clock can report zero elapsed time for a complete
+        # short traversal, erasing the measured fill without changing its work.
+        now = time.perf_counter()
         if tick["t"] is not None:
             dt = now - tick["t"]
             tick["area"] += (horizon - c + 1) * dt
@@ -2402,6 +2419,7 @@ ENG_ENV = [
     "V4_KEEPWARM", "V4_KEEPWARM_MS",                                            # transport keep-warm
     "V4_DIAL_CONNECT_TIMEOUT", "V4_DIAL_RETRY_S",                               # inter-stage dial
     "V4_TIMING", "V4_TIMING_EVERY",                                             # instrumentation
+    "V4_RUNTIME_METRICS",                                                       # signed work/residency observations
     "V4_LEVERS_STRICT",                                                         # lever audit
 ]
 
@@ -3105,6 +3123,8 @@ def main():
     s.add_argument("--device", default=None)
     s.add_argument("--bind", default=os.environ.get("M25_ENGINE_BIND", "127.0.0.1"))
     s.add_argument("--receipts", action="store_true")
+    s.add_argument("--runtime-metrics", action="store_true", default=None,
+                   help="observe per-job routing and local KV memory in signed receipts (V4_RUNTIME_METRICS)")
 
     c = sub.add_parser("coord", help="drive jobs over a formed ring (stdin JSON lines)")
     c.add_argument("--head", default=f"127.0.0.1:{ENG_IN}")
@@ -3122,7 +3142,7 @@ def main():
     if a.cmd == "stage":
         serve_stage(a.stage, a.nstages, a.lo, a.hi, a.port, nxt=a.next, ckpt_dir=a.dir,
                     device=a.device, receipts=(a.receipts or RECEIPTS), bind=a.bind,
-                    ret_relay=a.ret_relay, dspark=a.dspark)
+                    ret_relay=a.ret_relay, dspark=a.dspark, runtime_metrics=a.runtime_metrics)
     elif a.cmd == "coord":
         sys.exit(_coord_cli(a))
     elif a.cmd == "selftest":

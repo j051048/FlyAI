@@ -110,7 +110,7 @@ def test_every_lever_names_the_module_that_actually_reads_it():
     """`owner` is what an operator is told to look at when a lever misbehaves, so it has to be the
     module that really parses the var — checked against the source, not against the docstring."""
     for lv in VL.LEVERS:
-        src = open(_module_file(lv.owner)).read()
+        src = open(_module_file(lv.owner), encoding="utf-8").read()
         assert re.search(r"""environ(?:\.get)?[.(\[]+["']%s["']""" % lv.env, src), \
             f"{lv.env} is registered to {lv.owner}, which does not read it"
 
@@ -122,7 +122,8 @@ def test_engine_modules_accounts_for_every_v4_module_on_disk():
     bench_only = {"v4_whole_layer_bench.py", "v4_wire_bench.py",
                   # measurement/pricing tools, never imported by a serving process: the workload-class
                   # acceptance harness, the round-replay economics, and the discrete-event ring sim
-                  "v4_ngram_accept.py", "v4_ngram_econ.py", "v4_pipe_sim.py"}
+                  "v4_ngram_accept.py", "v4_ngram_econ.py", "v4_pipe_sim.py",
+                  "v4_benchmark.py"}
     unclassified = on_disk - set(VL.ENGINE_MODULES) - bench_only
     assert not unclassified, (
         f"{sorted(unclassified)} is neither in v4_levers.ENGINE_MODULES (scraped for levers, and the "

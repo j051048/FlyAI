@@ -96,6 +96,12 @@ from safetensors import safe_open
 # file must fail at import -- loudly, in the launch log, before the ring forms -- rather than serve
 # unaudited. v4_levers imports nothing from here at module scope, so this cannot cycle.
 import v4_levers
+try:                                                      # flat stage deploy / repository layout
+    from runtime_metrics import RuntimeMetrics
+except ImportError:
+    from shard.runtime_metrics import RuntimeMetrics
+
+V4_RUNTIME_METRICS = os.environ.get("V4_RUNTIME_METRICS", "0") not in ("", "0")
 
 # Nothing here reads the checkpoint at import time (k3_stage's rule): resolving lazily costs one
 # memoized call and lets `import v4_stage` work on a box with no model on disk -- which is every box
@@ -631,7 +637,7 @@ class Stage:
     is for: it loads the embedding on a stage that would otherwise have no use for it."""
 
     def __init__(self, lo, hi, args=None, *, head=False, tail=False, dspark=False,
-                 device=None, dtype=None, spec_depth=None, fast_verify=None):
+                 device=None, dtype=None, spec_depth=None, fast_verify=None, runtime_metrics=None):
         self.lo, self.hi = lo, hi
         self.args = args if args is not None else config()
         self.device = device or dev
@@ -709,6 +715,10 @@ class Stage:
         self._last_tap = {}
         self._pos = 0
         self._replaying = False
+        enabled = V4_RUNTIME_METRICS if runtime_metrics is None else bool(runtime_metrics)
+        self._runtime_metrics = RuntimeMetrics(self.device, torch_module=torch) if enabled else None
+        self._runtime_draft = None
+        self._runtime_draft_hooks = []
         self.reset()
         # One graph object per layer, capturing lazily on the first decode step (see V4_CUDA_GRAPH):
         # island mode graphs only the hc_pre/hc_post/norm islands, whole mode graphs the WHOLE decode
@@ -825,6 +835,75 @@ class Stage:
         self._pos = 0
         self._last_tap = {}
         self._spec_ckpts.clear()
+        if self._runtime_metrics is not None:
+            # A rollback never calls reset: every reset here starts a fresh job's counters.
+            self._runtime_metrics.reset()
+            self._runtime_metrics.sample_kv(self._runtime_kv_tensors())
+
+    def _runtime_kv_tensors(self):
+        """Owned KV/indexer/compressor allocations and retained rollback KV state.
+
+        Includes reserved capacity and fast-verify scratch, not just occupied tokens.
+        Compressor aliases share backing storage and are deduplicated by RuntimeMetrics.
+        Snapshot input activations/ids are not KV; their cost remains in allocator peaks.
+        """
+        layers = list(self.layers)
+        if self._runtime_draft is not None:
+            layers += list(self._runtime_draft.mtp)
+        for layer in layers:
+            attn = layer.attn
+            yield attn.kv_cache
+            indexer = getattr(attn, "indexer", None)
+            if indexer is not None:
+                yield indexer.kv_cache
+            for owner in (attn, indexer):
+                compressor = getattr(owner, "compressor", None)
+                if compressor is not None:
+                    for name in ("kv_cache", "kv_state", "score_state"):
+                        yield getattr(compressor, name, None)
+        for checkpoint in self._spec_ckpts:
+            for state in checkpoint["state"]:
+                yield from state.values()
+
+    def observe_runtime_drafter(self, drafter):
+        """Observe the actual DSpark Gate calls, including the fast drafter's skipped FFNs.
+
+        DSpark graphs capture only forward_head, which has no Gate. Gate hooks therefore
+        stay outside its graphs; a capture warm-up is explicitly excluded. Unlike counting
+        advance_and_draft's input length, this measures the MoEs actually executed when the
+        fast path advances intermediate positions using attention alone. No tensor readback.
+        """
+        if self._runtime_metrics is None:
+            return
+        tail = getattr(drafter, "tail", None)
+        if tail is None or not hasattr(tail, "mtp") or tail is self._runtime_draft:
+            return
+        for handle in self._runtime_draft_hooks:
+            handle.remove()
+        self._runtime_draft_hooks = []
+        self._runtime_draft = tail
+
+        def observe_gate(gate, inputs, output):
+            if self._runtime_metrics.mode == "gpu_resident" and torch.cuda.is_current_stream_capturing():
+                return
+            # Gate's indices are [token rows, top-k]; numel() is host metadata.
+            self._runtime_metrics.resident_routes(output[1].numel(), role="draft", phase="decode")
+
+        for layer in tail.mtp:
+            self._runtime_draft_hooks.append(layer.ffn.gate.register_forward_hook(observe_gate))
+        self._runtime_metrics.sample_kv(self._runtime_kv_tensors())
+
+    def runtime_metrics(self):
+        """Detached per-job observations, collected before ReceiptSigner signs them."""
+        if self._runtime_metrics is None:
+            return None
+        self._runtime_metrics.sample_kv(self._runtime_kv_tensors())
+        return self._runtime_metrics.snapshot()
+
+    def placement_requirements(self, calibration=None):
+        """An explicit measured resource contract, never a guess from checkpoint bytes."""
+        import v4_resources  # lazy, and works in the flat deployed engine layout
+        return v4_resources.placement_requirements_for_stage(self, calibration)
 
     def _snapshot(self):
         """Clone exactly the state a rejected speculation can poison. `_seek` restores it.
@@ -1014,6 +1093,12 @@ class Stage:
         graphed = bg is not None and not self._replaying and start_pos > 0 and h.shape[1] == 1
         for i, (li, L) in enumerate(zip(range(self.lo, self.hi), self.layers)):
             h = bg[i].run(h, ids, start_pos) if graphed else L(h, start_pos, ids)
+            if self._runtime_metrics is not None:
+                # Outside the graph: count this executed layer once, not its capture/warmups.
+                # world_size=1 is enforced at construction, so each row owns the full top-k.
+                phase = "replay" if self._replaying else "prefill" if start_pos == 0 else "decode"
+                self._runtime_metrics.resident_routes(
+                    h.shape[0] * h.shape[1] * L.ffn.n_activated_experts, phase=phase)
             if self._dspark and li in self._tap_ids:
                 # THE TAP MUST STAY OUT HERE, on the Python side of the replay. It is safe today
                 # because a graph spans at most ONE layer, so this runs per step on that layer's fresh
@@ -1027,7 +1112,10 @@ class Stage:
         # A graphed layer's output ALIASES its hc_post graph's static buffer; the last layer's escapes
         # the stage (onto the wire, or into logits) and must not be overwritten by the next step's
         # replay. One clone of [1,1,4,dim] per token, only on the graphed path.
-        return h.clone() if graphed else h
+        out = h.clone() if graphed else h
+        if self._runtime_metrics is not None:
+            self._runtime_metrics.sample_kv(self._runtime_kv_tensors())
+        return out
 
     def _chunk_ok(self, s):
         """Can this chunk go through the fast path? Anything else falls back to the per-token loop.
@@ -1191,6 +1279,7 @@ class Stage:
                                        f"the checkpoint, this config declares {tuple(p.shape)}")
                 with torch.no_grad():
                     p.data.copy_(t)
+        self._resource_checkpoint_dir = os.path.abspath(d)
         return self
 
     def __repr__(self):

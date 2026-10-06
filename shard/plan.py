@@ -296,6 +296,10 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     """
     if isinstance(model, str):
         model = profile_for(model)
+    if isinstance(model, dict) and ("schema" in model
+            or model.get("calibration_status") in {"structural", "unmeasured"}):
+        raise ValueError("structural/resource evidence is not a calibrated scalar GPU placement profile; "
+                         "the memory-aware planner has not been enabled")
     m = {**M25_PROFILE, **(model or {})}
     n = len(nodes)
     if n == 0:

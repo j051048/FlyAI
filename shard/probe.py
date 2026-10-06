@@ -50,6 +50,7 @@ import threading
 import time
 
 from .plan import M25_PROFILE, density_cap_layers
+from .resources import byte_count, measure_host_resources  # independent resource-v1 capability API
 
 # Admission thresholds — docs/ADMISSION_SPEC.md v0 (LIVING: revise here AND there).
 SPEC_V0 = {
@@ -636,6 +637,58 @@ def measure_gpu(model_dir, layer=30, backend="auto", kv_tokens=1024):
     return out
 
 
+def measure_transfer_resources(device="cuda:0", sample_bytes=16 * 1024 * 1024, repeats=5):
+    """Optional actual pinned allocation + H2D effective-bandwidth probe.
+
+    A successful sample proves ONLY that this sample can be pinned, not that a
+    complete expert pool fits. Missing CUDA/torch or failed allocation stays
+    unknown; it never manufactures a zero bandwidth or zero RAM capacity.
+    This helper does not alter derive_role() or the existing M25 GPU probe.
+    """
+    byte_count(sample_bytes, "sample_bytes")
+    if not 1024 * 1024 <= sample_bytes <= 64 * 1024 * 1024 or type(repeats) is not int or not 1 <= repeats <= 100:
+        raise ValueError("transfer probe requires 1..64 MiB and 1..100 repeats")
+    out = {"schema": "shard-transfer-capability/1", "device": str(device),
+           "status": "unavailable", "pinned_allocation_status": "unknown",
+           "tested_pinned_bytes": None, "h2d_bytes_per_second": None,
+           "sample_bytes": sample_bytes, "repeats": repeats}
+    try:
+        import torch  # optional and lazy; the capability/role CLI stays torch-free
+        if not torch.cuda.is_available():
+            out["error"] = "CUDA unavailable"
+            return out
+        dev = torch.device(device)
+        if dev.type != "cuda":
+            raise ValueError("H2D probe requires a CUDA device")
+        with torch.cuda.device(dev):
+            source = torch.empty(sample_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+            source.zero_()
+            if not source.is_pinned():
+                raise RuntimeError("requested pinned allocation is not pinned")
+            out["pinned_allocation_status"] = "available"
+            out["tested_pinned_bytes"] = sample_bytes
+            destination = torch.empty_like(source, device=dev)
+            destination.copy_(source, non_blocking=True)
+            torch.cuda.synchronize(dev)
+            start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(repeats):
+                destination.copy_(source, non_blocking=True)
+            stop.record()
+            stop.synchronize()
+            elapsed_ms = start.elapsed_time(stop)
+            if elapsed_ms <= 0 or not math.isfinite(elapsed_ms):
+                raise RuntimeError("invalid CUDA event transfer timing")
+            out.update(status="measured", elapsed_ms=elapsed_ms,
+                       h2d_bytes_per_second=int(sample_bytes * repeats * 1000 / elapsed_ms))
+    except ImportError as exc:
+        out["error"] = f"optional dependency unavailable: {exc}"
+    except Exception as exc:  # probe failure is reported evidence, not a synthetic capacity
+        out["status"] = "error"
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 # ---------------------------------------------------------------------------
 # CLI — role mode on stdin JSON (the c0mpute seam) + the measurement modes.
 # ---------------------------------------------------------------------------
@@ -646,6 +699,11 @@ def _main() -> int:
     ap.add_argument("--measure", action="store_true", help="GPU 1-block probe (needs the model dir)")
     ap.add_argument("--net-only", action="store_true", help="network vector only (stdlib, no GPU)")
     ap.add_argument("--serve", action="store_true", help="run the probe-peer endpoint")
+    ap.add_argument("--resources", action="store_true", help="host resource-v1 evidence, independent of existing admission")
+    ap.add_argument("--h2d", action="store_true", help="with --resources, perform a bounded actual pinned/H2D probe")
+    ap.add_argument("--device", default="cuda:0", help="optional H2D probe device")
+    ap.add_argument("--h2d-sample-mib", type=int, default=16)
+    ap.add_argument("--h2d-repeats", type=int, default=5)
     ap.add_argument("--dir", default="/root/m25")
     ap.add_argument("--layer", type=int, default=30)
     ap.add_argument("--backend", default="auto")
@@ -655,6 +713,21 @@ def _main() -> int:
                     help="port peers dial back (behind a port-mapping NAT it differs from --port)")
     ap.add_argument("--upload-mb", type=int, default=16)
     a = ap.parse_args()
+
+    if a.h2d and not a.resources:
+        ap.error("--h2d requires --resources")
+    if a.resources:
+        if a.serve or a.measure or a.net_only or a.peers:
+            ap.error("--resources is independent of existing GPU/network/admission modes")
+        try:
+            result = {"schema": "shard-node-resource-probe/1", "host": measure_host_resources(),
+                      "transfer": measure_transfer_resources(a.device, a.h2d_sample_mib * 1024 * 1024,
+                                                            a.h2d_repeats) if a.h2d else None}
+        except (ValueError, OSError) as exc:
+            json.dump({"error": f"resource probe failed: {exc}"}, sys.stdout)
+            return 1
+        json.dump(result, sys.stdout, indent=1, allow_nan=False)
+        return 0
 
     if a.serve:
         serve(a.port)

@@ -49,9 +49,11 @@ class ModelRuntime:
 
     # ---- lifecycle ----
     def load_shard(self) -> None:
-        """pull only this block's weights (+ embed if head, + norm/lm_head if tail) and
-        load to vram. weight key names are derived from the manifest weight_map + config,
-        never hardcoded to one architecture's naming."""
+        """Pull only this block's weights and its assigned boundary pieces, then
+        load them into the memory tiers declared by placement_requirements().
+        A backend may use full GPU residency or a measured GPU/host placement;
+        the contract itself does not implement weight offloading. Weight key
+        names derive from the manifest weight_map and model config."""
         raise NotImplementedError
 
     def reset(self) -> None:
@@ -60,8 +62,18 @@ class ModelRuntime:
         raise NotImplementedError
 
     def heartbeat(self) -> dict:
-        """liveness + vram/util, reported to the scheduler."""
+        """Liveness and measured resource availability, reported to the scheduler.
+        Unavailable RAM, pinned-memory or transfer measurements remain unknown."""
         raise NotImplementedError
+
+    def placement_requirements(self):
+        """Measured shard.resources.PlacementRequirements for this exact block/config.
+
+        Checkpoint storage sizes are insufficient to calibrate runtime peaks. A
+        backend must measure its resident weights, state, graph/workspace and
+        loading peaks; absence of calibration must remain an explicit failure.
+        """
+        raise NotImplementedError("this runtime has no measured placement resource contract")
 
     # ---- forward (the hot path) ----
     def embed(self, token_ids):

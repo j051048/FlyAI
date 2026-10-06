@@ -564,6 +564,7 @@ NON_LEVER_ENV = {
     "V4_DIAL_RETRY_S": "inter-stage dial retry window",
     "V4_TIMING": "instrumentation",
     "V4_TIMING_EVERY": "instrumentation period",
+    "V4_RUNTIME_METRICS": "opt-in signed per-job work/residency observations; no math or wire change",
     "V4_DSPARK_CONF_MIN": "conf-gate knob, consumed with V4_DSPARK_CONF_GATE",
     "V4_DSPARK_CONF_THRESH": "conf-gate knob, consumed with V4_DSPARK_CONF_GATE",
     "V4_DSPARK_GRAPH": "drafter head graph, rides on V4_DSPARK_FAST and is CUDA-only",
@@ -716,7 +717,7 @@ ENGINE_MODULES = (
     "v4_pipe.py", "v4_stage.py", "v4_levers.py", "v4_moe_grouped.py", "v4_moe_decode.py",
     "v4_moe_multi.py", "v4_fp8_gemv.py", "v4_dspark_fast.py", "v4_dspark_moe.py",
     "v4_dspark_draft.py", "v4_ref_slim.py", "v4_ref_cpu.py", "v4_whole_layer_graph.py",
-    "v4_kernels_cpu.py", "v4_sparse_attn_sm120.py",
+    "v4_kernels_cpu.py", "v4_sparse_attn_sm120.py", "v4_resources.py",
 )
 
 _ENV_RE = re.compile(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""")
@@ -732,7 +733,7 @@ def env_names_in_source(root=None):
     for name in ENGINE_MODULES:
         p = os.path.join(root, name)
         if os.path.exists(p):
-            with open(p) as f:
+            with open(p, encoding="utf-8") as f:
                 found |= set(_ENV_RE.findall(f.read()))
     return found
 

@@ -29,8 +29,10 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 try:                                                          # package import (engine repo)
     from .manifest import gen_key, load_key, pub_b64, save_key  # noqa: F401
+    from .runtime_metrics import validate_runtime_metrics
 except ImportError:                                           # flat import (deployed next to the node code)
     from manifest import gen_key, load_key, pub_b64, save_key  # noqa: F401
+    from runtime_metrics import validate_runtime_metrics
 
 SCHEMA = "shard-receipt/1"
 
@@ -86,11 +88,14 @@ class ReceiptSigner:
         self._out.update(_h(out_bytes))
         self.n += 1
 
-    def finalize(self) -> dict:
+    def finalize(self, runtime_metrics: dict | None = None) -> dict:
         """Stamp pubkey + signature into a signed receipt dict and return it."""
         body = dict(self.meta, schema=SCHEMA, n_chunks=self.n,
                     in_root=self._in.hexdigest(), out_root=self._out.hexdigest(),
                     pubkey=base64.b64encode(self.priv.public_key().public_bytes_raw()).decode())
+        if runtime_metrics is not None:
+            # Attach BEFORE signing; detach the live counters from this immutable job snapshot.
+            body["runtime_metrics"] = validate_runtime_metrics(runtime_metrics)
         body["sig"] = base64.b64encode(self.priv.sign(_canonical(body))).decode()
         return body
 
@@ -100,6 +105,11 @@ def verify_receipt(receipt: dict, expected_pubkey: str | None = None) -> None:
     pubkey equals expected_pubkey (the key c0mpute bound to the node assigned this block)."""
     if receipt.get("schema") != SCHEMA:
         raise ReceiptError(f"unknown receipt schema {receipt.get('schema')!r}")
+    if "runtime_metrics" in receipt:
+        try:
+            validate_runtime_metrics(receipt["runtime_metrics"])
+        except (ValueError, TypeError, OverflowError) as e:
+            raise ReceiptError(f"invalid runtime metrics: {e}") from e
     pub_b64 = receipt.get("pubkey")
     sig_b64 = receipt.get("sig")
     if not pub_b64 or not sig_b64:

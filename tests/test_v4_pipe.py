@@ -36,6 +36,7 @@ import select
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -399,21 +400,36 @@ def test_fwd_open_reraises_when_there_is_no_address_to_redial():
 
 # ── 5-6. keeping an idle leg alive: the accept-wait ticker and the cwnd keep-warm ──────────────────
 
-def test_warm_until_accept_ticks_and_stops():
+def test_warm_until_accept_ticks_and_stops(monkeypatch):
     """A stage dials its successor at launch, then blocks in accept() waiting for its predecessor —
     which does not connect until a job flows down from the coordinator. Live, WAN paths dropped that
     idle leg in ~50s, so the first forward send crashed the stage. Noops must flow from the moment of
     dial, and MUST stop before the forward loop touches the socket (no concurrent send)."""
     a, b = _pair()
+    finished_sends = []
+    original_send = VP.send_msg
+
+    def observe_send(sock, frame):
+        original_send(sock, frame)
+        if sock is a:
+            finished_sends.append(time.perf_counter())
+
+    monkeypatch.setattr(VP, "send_msg", observe_send)
     stop = VP._warm_until_accept(a, period=0.02)
     frames = _drain(b, 0.15)
     stop()
+    stopped_at = time.perf_counter()
     time.sleep(0.05)
     after = _drain(b, 0.1)
     a.close()
     b.close()
     assert len(frames) >= 2 and all(f == {"op": "noop"} for f in frames), frames
-    assert after == [], "the ticker kept sending after stop() — it would race the forward loop"
+    # The receiver can still have a noop queued BEFORE stop() returned. Check
+    # the sender's completion times, rather than mistaking buffered delivery
+    # for a concurrent writer on Windows or under scheduler contention.
+    assert all(f == {"op": "noop"} for f in after), after
+    assert finished_sends and max(finished_sends) <= stopped_at, \
+        "the ticker kept sending after stop() — it would race the forward loop"
 
 
 def test_warm_until_accept_is_a_noop_without_a_leg():
@@ -1786,6 +1802,10 @@ class _Ring:
         self.n = len(ranges)
         self.layer_count = args.n_layers
         self.receipts = receipts
+        # Each independently created test ring has its own node identities.
+        # Reusing a checkpoint does not mean reusing another ring's key files;
+        # key-file reload/permission policy has separate manifest tests.
+        key_dir = tempfile.mkdtemp(prefix="ring-keys-", dir=ckpt_dir) if receipts else ckpt_dir
         ports = VP._free_ports(self.n)
         relay_i = self.n - tail_box_g                          # ingress of a multi-GPU tail box (>1)
         events = [threading.Event() for _ in range(self.n)]
@@ -1795,7 +1815,7 @@ class _Ring:
             ret_relay = f"127.0.0.1:{ports[-1]}" if (tail_box_g > 1 and i == relay_i) else None
             t = threading.Thread(target=VP.serve_stage, kwargs=dict(
                 stage=i, nstages=self.n, lo=lo, hi=hi, port=ports[i], nxt=nxt, ckpt_dir=ckpt_dir,
-                device="cpu", receipts=receipts, key_path=f"{ckpt_dir}/s{i}.key",
+                device="cpu", receipts=receipts, key_path=f"{key_dir}/s{i}.key",
                 ret_relay=ret_relay, dspark=dspark, ready=events[i]), daemon=True)
             t.start()
             self.threads.append(t)
@@ -2887,7 +2907,7 @@ def _levers_the_stage_process_reads():
         if p is None:
             continue
         if True:
-            with open(p) as f:
+            with open(p, encoding="utf-8") as f:
                 found |= set(re.findall(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""", f.read()))
     return found
 
