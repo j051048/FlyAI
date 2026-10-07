@@ -16,14 +16,14 @@ import socket
 import struct
 
 try:  # deployed flat beside the engine files
-    from resources import PlacementRequirements, ResourceError, byte_count
+    from resources import PlacementRequirements, ResourceError, StorageRequirements, byte_count
 except ImportError:
     # A direct absolute-path CLI invocation need not have the repo cwd/PYTHONPATH.
     import sys
     repo_root = Path(__file__).resolve().parents[2]
     if (repo_root / "shard" / "resources.py").is_file() and str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    from shard.resources import PlacementRequirements, ResourceError, byte_count
+    from shard.resources import PlacementRequirements, ResourceError, StorageRequirements, byte_count
 
 MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash-0731"
 MAX_HEADER_BYTES = 16 * 1024 * 1024
@@ -241,6 +241,93 @@ def stage_storage_inventory(inventory, lo, hi, *, head=False, tail=False, dspark
             "routed_expert_storage_bytes": routed, "resident_parameter_floor_bytes": resident,
             "total_storage_bytes": sum(info["storage_bytes"] for info in selected.values()),
             "runtime_peak_bytes": None, "aliases": {"mtp.*.embed.weight": "embed.weight", "mtp.*.head.weight": "head.weight"} if dspark else {}}
+
+
+def compute_node_host_budget(lo, hi, *, total_layers=43, kv_offload_bytes=0,
+                             prefill_bytes=0, staging_bytes=0, draft_bytes=0,
+                             load_peak_extra_bytes=0, reserve_bytes=2048 * 1024 * 1024,
+                             experts_bytes_total=147169738752):
+    """Derive per-node host budget based on assigned layer slice instead of fixed 64GB.
+
+    pinned_experts_bytes(node) = experts_bytes_total * layers_assigned(node) / total_layers
+    host_budget(node) = pinned_experts_bytes + kv_offload_bytes + prefill_bytes
+                      + staging_bytes + draft_bytes + load_peak_extra_bytes + reserve_bytes
+    """
+    byte_count(lo, "lo")
+    byte_count(hi, "hi")
+    if hi <= lo or lo < 0 or hi > total_layers:
+        raise ResourceError("invalid layer slice for host budget computation")
+    layers_assigned = hi - lo
+    pinned_experts_bytes = int(round(experts_bytes_total * (layers_assigned / total_layers)))
+    host_budget = (pinned_experts_bytes + kv_offload_bytes + prefill_bytes
+                   + staging_bytes + draft_bytes + load_peak_extra_bytes + reserve_bytes)
+    return {
+        "lo": lo,
+        "hi": hi,
+        "layers_assigned": layers_assigned,
+        "pinned_experts_bytes": pinned_experts_bytes,
+        "host_budget_bytes": host_budget,
+        "kv_offload_bytes": kv_offload_bytes,
+        "prefill_bytes": prefill_bytes,
+        "staging_bytes": staging_bytes,
+        "draft_bytes": draft_bytes,
+        "load_peak_extra_bytes": load_peak_extra_bytes,
+        "reserve_bytes": reserve_bytes,
+    }
+
+
+def evaluate_node_host_admissibility(lo, hi, pinnable_ram_bytes, *, total_layers=43, **kwargs):
+    """Check if node can host the assigned layer slice under measured pinnable RAM.
+
+    admissible(node) = host_budget(node) <= pinnable_ram_bytes(node)
+    Fails closed when pinnable_ram_bytes is None/unmeasured.
+    """
+    if pinnable_ram_bytes is None:
+        return {
+            "admissible": False,
+            "status": "unknown",
+            "reason": "pinnable_ram_bytes is unmeasured/None; fail-closed. Run bounded allocation probe to establish pinnable capacity.",
+            "budget": None,
+        }
+    byte_count(pinnable_ram_bytes, "pinnable_ram_bytes")
+    budget = compute_node_host_budget(lo, hi, total_layers=total_layers, **kwargs)
+    admissible = budget["host_budget_bytes"] <= pinnable_ram_bytes
+    return {
+        "admissible": admissible,
+        "status": "fits" if admissible else "insufficient",
+        "reason": None if admissible else f"host budget ({budget['host_budget_bytes']} bytes) exceeds pinnable RAM ({pinnable_ram_bytes} bytes)",
+        "budget": budget,
+    }
+
+
+def derive_stage_storage_requirements(inventory_or_dir, lo, hi, *, head=False, tail=False, dspark=False):
+    """Derive selective pull files and storage requirement for stage [lo:hi]."""
+    inventory = inspect_checkpoint(inventory_or_dir) if isinstance(inventory_or_dir, (str, Path)) else inventory_or_dir
+    stage_inv = stage_storage_inventory(inventory, lo, hi, head=head, tail=tail, dspark=dspark)
+    files = tuple(sorted(set(info["file"] for info in stage_inv["tensors"].values())))
+    manifest_body = {"checkpoint_id": inventory["checkpoint_id"], "files": list(files), "lo": lo, "hi": hi}
+    manifest_sha256 = hashlib.sha256(json.dumps(manifest_body, sort_keys=True).encode()).hexdigest()
+    return StorageRequirements(
+        model_id=MODEL_ID,
+        layer_start=lo,
+        layer_end=hi,
+        storage_bytes=stage_inv["total_storage_bytes"],
+        files=files,
+        manifest_sha256=manifest_sha256,
+    )
+
+
+def verify_selective_pull(checkpoint_dir, storage_req):
+    """Verify that only and all required shard files for the stage are present and uncorrupted."""
+    checkpoint_dir = Path(checkpoint_dir).resolve()
+    for fname in storage_req.files:
+        path = checkpoint_dir / fname
+        if not path.is_file():
+            raise ResourceError(f"missing selective shard file: {fname}")
+        header = read_safetensors_header(path)
+        if not header.get("tensors"):
+            raise ResourceError(f"empty or corrupted shard header: {fname}")
+    return True
 
 
 def load_calibration(path_or_dict, *, checkpoint_id=None):

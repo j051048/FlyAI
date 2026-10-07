@@ -13,6 +13,7 @@ ENGINE model (reserves, per-layer ms, the select_ring decision). Deps point one 
 TypeScript orchestrator drives the same proven planner as `ring_up` without porting its subtleties.
 """
 import json
+import math
 import sys
 
 from .topology import select_ring
@@ -369,7 +370,13 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
         if host_ram_per_layer > 0.0:
             free_ram = nodes[i].get("free_ram_mb")
             pinnable_ram = nodes[i].get("pinnable_ram_mb")
-            avail_ram = pinnable_ram if pinnable_ram is not None else free_ram
+            if m.get("placement") == "ram":
+                if pinnable_ram is None:
+                    # Fail-closed: unmeasured pinnable memory cannot host pinned expert pool
+                    return 0
+                avail_ram = pinnable_ram
+            else:
+                avail_ram = pinnable_ram if pinnable_ram is not None else free_ram
             if avail_ram is not None:
                 ram_cap = int(float(avail_ram) // host_ram_per_layer)
                 return min(vram_cap, ram_cap)
@@ -453,6 +460,10 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
 
     if "max_stages" in m:
         extra["max_stages"] = int(m["max_stages"])
+
+    tail_floor = int(m.get("tail_floor", 3 if int(m.get("n_layers", 0)) == 43 else 0))
+    if tail_floor > 0:
+        extra["tail_floor"] = tail_floor
 
     # 6) the TAIL stage also holds the final norm + lm_head (measured 1.15 GiB bf16 on
     #    M2.5 — a 13-layer tail OOM'd loading it on a 32 GB 5090, live 2026-07-09, while
@@ -550,6 +561,47 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
         "min_roundtrip_ms": round(min_c_rtt, 2),
         "in_region": min_c_rtt < 35.0,
     }
+
+    # Per-node impairment and bottleneck reporting (pricing & hardware suitability tiering)
+    impairments = []
+    ideal_layers = math.ceil(int(m["n_layers"]) / len(stages)) if stages else 0
+    for st in stages:
+        idx = next(i for i in range(n) if ids[i] == st["id"])
+        nd = nodes[idx]
+        total_vram = float(nd.get("total_vram_mb") or 0.0)
+        v_cap = int(nd.get("cap_layers")) if nd.get("cap_layers") is not None else (
+            density_cap_layers(cap_layers, total_vram) if total_vram > 0 else cap_layers
+        )
+        host_ram_per_layer = float(m.get("layer_host_ram_mb") or 0.0)
+        r_cap = v_cap
+        if m.get("placement") == "ram" and host_ram_per_layer > 0.0:
+            p_ram = nd.get("pinnable_ram_mb")
+            r_cap = int(float(p_ram) // host_ram_per_layer) if p_ram is not None else 0
+
+        binding = "none"
+        reason = "adequate capacity"
+        if r_cap < v_cap and st["layers"] <= r_cap:
+            binding = "pinned_ram"
+            reason = f"pinnable RAM ({nd.get('pinnable_ram_mb', 0):.0f} MB) capped layers to {st['layers']} (VRAM permitted {v_cap})"
+        elif v_cap < r_cap and st["layers"] >= v_cap:
+            binding = "vram"
+            reason = f"GPU VRAM capped layers to {st['layers']}"
+
+        penalty_ms = 0.0
+        if binding == "pinned_ram" and st["layers"] < ideal_layers:
+            penalty_ms = (ideal_layers - st["layers"]) * float(m.get("layer_ms_base", 0.75))
+
+        impairments.append({
+            "node_id": st["id"],
+            "stage_index": st["index"],
+            "allocated_layers": st["layers"],
+            "binding_constraint": binding,
+            "vram_cap": v_cap,
+            "ram_cap": r_cap,
+            "step_penalty_ms": round(penalty_ms, 2),
+            "reason": reason,
+        })
+    out["impairment_report"] = impairments
     return out
 
 

@@ -272,7 +272,7 @@ def test_inventory_cli_is_stdlib_only_outside_repo_cwd(tmp_path):
 
 
 def test_cuda_probe_unavailable_has_unknown_bandwidth():
-    import torch
+    torch = pytest.importorskip("torch")
     if torch.cuda.is_available():
         pytest.skip("this test pins the unavailable branch without allocating on a live GPU")
     from shard.probe import measure_transfer_resources
@@ -291,10 +291,11 @@ def test_host_resource_cli_needs_no_torch_or_model(tmp_path):
     assert report["schema"] == "shard-node-resource-probe/1"
     assert report["transfer"] is None
     assert report["host"]["pinnable_ram_bytes"] is None
+    assert "available_disk_bytes" in report["host"]
 
 
 def test_live_storage_inventory_deduplicates_aliases_and_reports_unknown_gpu_peaks():
-    import torch
+    torch = pytest.importorskip("torch")
     layer = torch.nn.Linear(2, 2, bias=False)
     layer.register_buffer("kv_cache", torch.zeros(4))
     stage = SimpleNamespace(args=SimpleNamespace(n_layers=43), lo=40, hi=43, head=False, tail=True,
@@ -315,7 +316,7 @@ def test_live_storage_inventory_deduplicates_aliases_and_reports_unknown_gpu_pea
 
 
 def test_real_safetensors_fp4_logical_shape(tmp_path):
-    import torch
+    torch = pytest.importorskip("torch")
     from safetensors.torch import save_file
     packed = torch.empty(2, 2, dtype=torch.float4_e2m1fn_x2)
     path = tmp_path / "actual.safetensors"
@@ -323,3 +324,32 @@ def test_real_safetensors_fp4_logical_shape(tmp_path):
     tensor = vr.read_safetensors_header(path)["tensors"]["packed"]
     assert tensor["dtype"] == "F4" and tensor["shape"] == [2, 4]
     assert tensor["storage_bytes"] == packed.untyped_storage().nbytes() == 4
+
+
+def test_storage_requirements_and_evaluate_fit_with_disk():
+    from shard.resources import StorageRequirements
+    storage = StorageRequirements(
+        model_id="deepseek-ai/DeepSeek-V4-Flash-0731",
+        layer_start=0,
+        layer_end=11,
+        storage_bytes=38 * 1024 * 1024 * 1024,
+        files=("model-00001-mp1.safetensors", "model-00002-mp1.safetensors"),
+        manifest_sha256="c" * 64,
+    )
+    req = requirements()
+    # Fits when disk is sufficient
+    fit_res = evaluate_fit(req, NodeResources(130, 250, 200, 50 * 1024 * 1024 * 1024), storage=storage)
+    assert fit_res["fits"] is True
+    assert fit_res["required_disk_bytes"] == 38 * 1024 * 1024 * 1024
+
+    # Insufficient disk
+    tight_res = evaluate_fit(req, NodeResources(130, 250, 200, 10 * 1024 * 1024 * 1024), storage=storage)
+    assert tight_res["fits"] is False
+    assert "disk" in tight_res["insufficient"]
+
+    # Unknown disk
+    unknown_res = evaluate_fit(req, NodeResources(130, 250, 200, None), storage=storage)
+    assert unknown_res["fits"] is False
+    assert unknown_res["status"] == "unknown"
+    assert "disk" in unknown_res["unknown"]
+    assert "measure available disk space" in unknown_res["action"]

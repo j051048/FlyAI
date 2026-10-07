@@ -339,7 +339,8 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 n_layers, layer_vram_mb, kv_mb_per_layer=0, slack=2, exclude=None, require=None,
                 up_mbps=None, prefill_bytes=0.0, decode_bytes=0.0, decode_steps=1,
                 prefill_chunks=1, prefill_layer_ms=None, relegate=True,
-                trusted=None, boundary_in=0, boundary_out=0, max_stages=6):
+                trusted=None, boundary_in=0, boundary_out=0, max_stages=6,
+                tail_floor=0):
     """The self-optimizer's pure core. From a candidate POOL, choose the subset + ring order +
     per-node layer split that MINIMIZES predicted request time, subject to:
       * VRAM feasibility — the chosen nodes must hold the whole model (+ KV),
@@ -574,6 +575,9 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                         floors = _pin_floors(order, subset_caps)
                         if floors is None:
                             continue
+                        if tail_floor > 0:
+                            floors = dict(floors)
+                            floors[order[-1]] = max(floors.get(order[-1], 0), tail_floor)
                         alloc = assign_layers(order, n_layers, subset_caps, layer_ms, floors)
                         if alloc is None:
                             continue
@@ -588,7 +592,8 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 if require is not None and order[0] != require:      # deployable orientation: coord box = stage 0
                     order = (_head_first(order, require, EL, Eout, Ein) if aware
                              else _head_first(order, require, L, c_out, c_in))
-                alloc = assign_layers(order, n_layers, subset_caps, layer_ms)
+                floors = {order[-1]: tail_floor} if tail_floor > 0 else None
+                alloc = assign_layers(order, n_layers, subset_caps, layer_ms, floors)
                 if alloc is None:
                     continue
                 rank, step, pf = _score(order, alloc)
