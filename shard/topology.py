@@ -335,12 +335,28 @@ def assign_layers(order, n_layers, caps, layer_ms, floors=None):
     return alloc if rem == 0 else None
 
 
+def _is_adjacent_same_host(order, host_id=None):
+    """Check if any adjacent stages in a ring order reside on the same physical host.
+
+    Eliminates NAT hairpinning deadlocks and Sybil adjacency attacks.
+    """
+    if not host_id or len(order) <= 1:
+        return False
+    lk = len(order)
+    for idx in range(lk):
+        ha = host_id.get(order[idx])
+        hb = host_id.get(order[(idx + 1) % lk])
+        if ha and hb and ha == hb:
+            return True
+    return False
+
+
 def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 n_layers, layer_vram_mb, kv_mb_per_layer=0, slack=2, exclude=None, require=None,
                 up_mbps=None, prefill_bytes=0.0, decode_bytes=0.0, decode_steps=1,
                 prefill_chunks=1, prefill_layer_ms=None, relegate=True,
                 trusted=None, boundary_in=0, boundary_out=0, max_stages=6,
-                tail_floor=0):
+                tail_floor=0, host_id=None):
     """The self-optimizer's pure core. From a candidate POOL, choose the subset + ring order +
     per-node layer split that MINIMIZES predicted request time, subject to:
       * VRAM feasibility — the chosen nodes must hold the whole model (+ KV),
@@ -568,10 +584,13 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 if len(set(subnet[n] for n in subset)) < k:              # never co-locate (all distinct subnets)
                     continue
                 subset_caps = {n: caps[n] for n in subset}
+
                 if pin:
                     # cheapest order whose trusted prefix/suffix can hold the boundary AND whose greedy
                     # fill keeps every boundary layer trusted. Ordered by cost, so the first hit is best.
                     for order in _pin_orders(subset, k):
+                        if _is_adjacent_same_host(order, host_id):
+                            continue
                         floors = _pin_floors(order, subset_caps)
                         if floors is None:
                             continue
@@ -592,6 +611,8 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 if require is not None and order[0] != require:      # deployable orientation: coord box = stage 0
                     order = (_head_first(order, require, EL, Eout, Ein) if aware
                              else _head_first(order, require, L, c_out, c_in))
+                if _is_adjacent_same_host(order, host_id):
+                    continue
                 floors = {order[-1]: tail_floor} if tail_floor > 0 else None
                 alloc = assign_layers(order, n_layers, subset_caps, layer_ms, floors)
                 if alloc is None:

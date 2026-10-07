@@ -158,6 +158,15 @@ def _moe_check(label, modname, attr):
         req = _flag(modname, attr)
         if ctx.mod is None:
             return req, "unloaded", None
+        if ctx.stage is not None and getattr(ctx.stage, "_expert_cache", None) is not None:
+            # Instance-local cache dispatch replaces the legacy class chain.
+            # Do not claim its flags fired merely because the original class
+            # remains patched for other, fully resident stages in this process.
+            adapters = [L.ffn._hybrid_runtime for L in ctx.stage.layers]
+            if label == "grouped":
+                active = sum(r.supports_grouped for r in adapters)
+                return req, f"local-cache/grouped-eligible-{active}", None
+            return req, "local-cache-dispatch", None
         chain = moe_chain(ctx.mod)
         broken = [w for w in ("CYCLE", "ORPHAN") if w in chain]
         if broken:
@@ -302,6 +311,16 @@ def _check_fast_verify(ctx):
         return req, "no-stage", None
     obs = "on" if getattr(ctx.stage, "_fast", False) else "off"
     return req, obs, _agree(req, obs)
+
+
+def _check_expert_placement(ctx):
+    if ctx.stage is None:
+        return os.environ.get("V4_EXPERT_PLACEMENT", "gpu"), "no-stage", None
+    stage = ctx.stage
+    requested = getattr(stage, "_expert_placement", "gpu")
+    cached = [getattr(L.ffn, "_hybrid_runtime", None) is not None for L in stage.layers]
+    observed = "ram" if cached and all(cached) else "mixed" if any(cached) else "gpu"
+    return requested, observed, requested == observed
 
 
 def _check_spec_depth(ctx):
@@ -502,6 +521,8 @@ class Lever:
 
 
 LEVERS = (
+    Lever("V4_EXPERT_PLACEMENT", STAGE, "v4_stage", _check_expert_placement,
+          "local canonical RAM experts with fixed GPU cache slots, or full device residency"),
     Lever("V4_MOE_GROUPED", STAGE, "v4_moe_grouped",
           _moe_check("grouped", "v4_moe_grouped", "V4_MOE_GROUPED"),
           "grouped fp4 MoE kernel for the s==1 score-routed decode step (CUDA only)"),
@@ -569,6 +590,9 @@ LEVERS_BY_ENV = {lv.env: lv for lv in LEVERS}
 # fails loudly on its own (a missing V4_DIR cannot be mistaken for a slow ring). Listed rather than
 # pattern-matched so the registry test stays total — an unlisted new name fails the suite.
 NON_LEVER_ENV = {
+    "V4_EXPERT_CACHE_SLOTS": "explicit fixed slots per main/MTP expert pool",
+    "V4_EXPERT_CACHE_MIB": "explicit total fixed-slot cache byte budget",
+    "V4_EXPERT_CACHE_RESERVE_MIB": "runtime headroom deducted from actual available GPU memory",
     "V4_DIR": "checkpoint directory (emitted by stage_launch_cmd)",
     "V4_DEV": "torch device (emitted by stage_launch_cmd)",
     "V4_DTYPE": "default construction dtype",
@@ -737,6 +761,7 @@ ENGINE_MODULES = (
     "v4_moe_multi.py", "v4_fp8_gemv.py", "v4_dspark_fast.py", "v4_dspark_moe.py",
     "v4_dspark_draft.py", "v4_ref_slim.py", "v4_ref_cpu.py", "v4_whole_layer_graph.py",
     "v4_kernels_cpu.py", "v4_sparse_attn_sm120.py", "v4_resources.py",
+    "v4_expert_cache.py", "v4_hybrid.py",
     "v4_expert_cache.py", "v4_hybrid.py",
 )
 

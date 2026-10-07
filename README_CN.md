@@ -83,7 +83,7 @@ Transformer 架构由若干层叠加而成。Shard 将层栈切分为连续的�
 4. 尾部节点直接将各位置的 Argmax 计算结果一跳返回至协调节点（无需按原路反向中继折返）；
 5. 协调节点按照贪心原则接受最长匹配前缀。
 
-多个此类计算块在流水线中并发流动，草稿头利用静态 KV 缓存重放捕获的 CUDA Graph。贪心匹配是默认行为；该路径还原生支持**无损的 Temperature / Top-p / Top-k 采样** —— 由末端节点执行投机采样拒绝判断，从而使提交的 token 分布与目标模型完全一致，且相比贪心算法没有任何速度损失（参见 [`shard/specsample.py`](shard/specsample.py)）。
+多个此类计算块在流水线中并发流动，草稿头利用静态 KV 缓存重放捕获的 CUDA Graph。贪心匹配是默认行为；该路径还原生支持**无损的 Temperature / Top-p / Top-k 采样** —— 由末端节点执行投机采样拒绝判断，从而使提交的 token 分布与目标模型完全一致，且相比贪心算法没有任何速度损失（参见 [`phase0/specsample.py`](phase0/specsample.py)）。
 
 ## 核心难点与工程挑战
 
@@ -140,7 +140,7 @@ docs/        ARCHITECTURE、ROADMAP、MODEL_RUNTIME、NETWORK、INTEGRATION、PR
 
 - **Phase 0 —— 传输协议验证（已完成）：** 实现可靠的多阶段跨机模型切分与服务承载。
 - **Phase 1 —— 广域网环境适配：** 支持 NAT 内网穿透、中继回退、激活值量化压缩与边际链路监控。
-- **Phase 2 —— 投机解码加速：** 在集群上实现草稿与验证分离 —— **已在 GLM-5.2 744B 上达成公网贪心 ~30 tok/s**（以及 gpt-oss-120B 的 ~18–25 tok/s）。现已支持**无损的 Temperature / Top-p / Top-k 采样**（[`shard/specsample.py`](shard/specsample.py)），实测收据：[docs/receipts/sampling-lossless-20260623.json](docs/receipts/sampling-lossless-20260623.json)。
+- **Phase 2 —— 投机解码加速：** 在集群上实现草稿与验证分离 —— **已在 GLM-5.2 744B 上达成公网贪心 ~30 tok/s**（以及 gpt-oss-120B 的 ~18–25 tok/s）。现已支持**无损的 Temperature / Top-p / Top-k 采样**（[`phase0/specsample.py`](phase0/specsample.py)），实测收据：[docs/receipts/sampling-lossless-20260623.json](docs/receipts/sampling-lossless-20260623.json)。
 - **Phase 3 —— 无许可弹性集群：** 单行命令入网、跨异构 GPU 的动态层切分分配、按 Token 结算收益、故障容错与自愈 —— **已验证请求过程中途节点故障自愈**（生成中途剔除节点，请求自动在备用节点恢复并完成；`phase0/heal.py`，[收据](docs/receipts/fault-tolerance-20260623.json)）。
 - **DeepSeek-V4 双资源混合运行时与专家缓存（11 步改造全量落地）：**
   遵循严格依赖顺序完成可验证专家缓存、受控预取、KV 分页与兜底扩展（全量 193 项单测 100% 通过）：

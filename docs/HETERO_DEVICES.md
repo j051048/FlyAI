@@ -91,7 +91,7 @@ first-class **seeder** and a torch-free challenge judge (`shard/challenge.py` al
    placed as a thin stage automatically.
 3. **[S] CPU-side fp8 wire unpack fallback** — for Mac/AMD safety on the fp8 codec path.
 4. **[M] `MlxRuntime`** — a `ModelRuntime` (`shard/node.py`) over `mlx_lm.models.minimax`: load only
-   layers [lo,hi) from the MLX-4bit artifact, drive `layers[i](h, mask, cache)`, crop KV to
+   layers `[lo, hi)` from the MLX-4bit artifact, drive `layers[i](h, mask, cache)`, crop KV to
    `start_pos`, bf16 at the boundary. The model file, the conversion (`mlx-community/MiniMax-M2.5-4bit`),
    and native bf16 all already exist — days, not weeks.
 5. **[M] Manifest v2: per-format shard sets** under one model_id (nvfp4 / mlx4 / gguf-Q4_K), each

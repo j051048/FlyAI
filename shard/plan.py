@@ -396,10 +396,10 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     #    rank centrality over trusted capable nodes only.
     pin = privacy is not None
     # STRICT bool — trust is the security boundary, so read it fail-CLOSED: only a genuine `True`
-    # (JSON `true`) marks a node trusted. A truthy string like "false"/"0" or an int must NOT sneak a
+    # (JSON `true`) marks a node trusted or staked. A truthy string like "false"/"0" or an int must NOT sneak a
     # node into the trust set (a control plane that serialized the flag as a string would otherwise
     # fail OPEN — the one way a stranger could reach a boundary while the plan claims to be pinned).
-    trusted = {i for i in range(n) if nodes[i].get("trusted") is True} if pin else None
+    trusted = {i for i in range(n) if nodes[i].get("trusted") is True or nodes[i].get("staked") is True} if pin else None
     head_pool = [i for i in cap_ok if i in trusted] if pin else cap_ok
     if not head_pool:
         return None                                          # pinning on, but no trusted node can hold a block
@@ -464,6 +464,10 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     tail_floor = int(m.get("tail_floor", 3 if int(m.get("n_layers", 0)) == 43 else 0))
     if tail_floor > 0:
         extra["tail_floor"] = tail_floor
+
+    host_map = {i: str(nodes[i].get("host_id") or nodes[i].get("public_ip") or "") for i in range(n)}
+    if any(host_map.values()):
+        extra["host_id"] = host_map
 
     # 6) the TAIL stage also holds the final norm + lm_head (measured 1.15 GiB bf16 on
     #    M2.5 — a 13-layer tail OOM'd loading it on a 32 GB 5090, live 2026-07-09, while

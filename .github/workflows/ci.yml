@@ -2,14 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, "release/**", "feature/**"]
   pull_request:
     branches: [master]
+  workflow_dispatch:
 
-# Required checks. GPU / Apple-MLX equivalence jobs need self-hosted runners and
-# are tracked separately (see docs/audits/repository-audit-2026-07-13.md §5);
-# this covers the CPU pytest suite and the Go sidecar, which is what the audit
-# flagged as missing (a sidecar build failure must fail CI, not silently skip).
+# Required checks:
+# 1. Tier 1 (CPU): Config & doc reference integrity, CPU pytest suite, Go sidecar build + tests.
+# 2. Tier 2 (GPU): Self-hosted CUDA runners for V4 engine regression and losslessness verification
+#    (triggered on workflow_dispatch or PRs labeled 'run-gpu'; see docs/PROOF.md & docs/RESOURCE_CONTRACT.md).
 jobs:
   python:
     name: python tests (CPU)
@@ -25,10 +26,12 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[k3]"
           pip install pytest transformers safetensors
+      - name: check config and doc reference integrity
+        run: python tools/check_references.py
       - name: collect-only must be side-effect free (no network/subprocess/import work)
         run: pytest tests/ --collect-only -q
-      - name: pytest
-        run: pytest tests/ -q
+      - name: pytest (CPU suite)
+        run: pytest tests/ -m "not gpu" -q
 
   go-sidecar:
     name: go sidecar build + test
@@ -43,3 +46,27 @@ jobs:
         run: |
           go build ./...
           go test ./...
+
+  python-gpu:
+    name: python tests (GPU, self-hosted)
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 90
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'run-gpu') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: env check
+        run: nvidia-smi && python -V
+      - name: cleanup stray compute procs (prevent memory leak / noisy neighbor)
+        run: |
+          nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null || true
+      - name: install deps (GPU)
+        run: |
+          python -m pip install -U pip
+          pip install -e ".[k3]"
+          pip install pytest transformers safetensors
+      - name: pytest (GPU suite)
+        run: pytest tests/ -v -m "gpu" --timeout=3600
+      - name: cleanup on exit
+        if: always()
+        run: |
+          nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null || true

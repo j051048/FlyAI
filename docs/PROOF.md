@@ -41,6 +41,29 @@ The engine is open source (Apache-2.0). The receipt embeds the exact commit, mod
 assignment, and launch commands. *Verify:* stand up your own nodes and reproduce — same code,
 same result.
 
+**5. Stage Activation Commitments & Interactive Fraud Proof (无法做恶与逐 Stage 责任判定).**
+In permissionless Web3 inference networks, trusting nodes without accountability is unsafe.
+Shard provides a zero-overhead **Activation Commitment Protocol** and **Single-Stage Fraud Proof**:
+- **Lightweight Online Commitments:** During live ring execution, each stage computes and commits
+  a 32-byte cryptographic hash of its input and output activations (`phase0/activation_proof.py`).
+  These hashes are signed and bound into the run receipt envelope (`stage_commitments`). No heavy
+  tensors are transferred during inference.
+- **Interactive Single-Stage Adjudication:** If output is challenged, only the disputed stage is
+  re-executed on a validator (`phase0/fraud_proof.py`). If the output hash mismatches recomputed
+  activations, the cheating node is definitively slashed (penalty).
+- **Same-Microarchitecture Protection:** Different GPU architectures (e.g. Blackwell sm120 vs Ada
+  sm89) exhibit ULP-level floating-point rounding differences. Shard strictly enforces same-arch
+  arbitration or tolerance thresholds, preventing honest heterogeneous nodes from being falsely slashed.
+
+**6. Anti-Sybil & Anti-Hairpin Topology Constraint (拓扑抗合谋与防 NAT 回流).**
+- **Strict Host Isolation:** Ring planning (`shard/topology.py`) strictly forbids two nodes on the
+  same physical host or public IP from being adjacent stages. This completely eliminates NAT
+  hairpinning deadlocks on shared subnets and stops Sybil attackers from monopolizing consecutive
+  stages to spoof intermediate activations.
+- **Staked Boundary Pinning:** Sensitive input/output layers (embedding and lm_head) are pinned to
+  high-reputation staked nodes (`staked: true`), ensuring permissionless stages only execute
+  masked, intermediate transformer blocks.
+
 ## Receipt schema (`docs/receipts/<run_id>.json`)
 
 ```json
