@@ -331,6 +331,7 @@ def test_select_ring_anti_hairpin_rejects_adjacent_same_host():
         layer_ms=layer_ms,
         subnet=subnet,
         host_id=host_id,
+        isolation="adjacent_host",
         n_layers=30,
         layer_vram_mb=800.0,
         kv_mb_per_layer=50.0,

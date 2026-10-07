@@ -1002,6 +1002,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             else:
                 committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
                 discard = len(inflight); d_cancel(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
+            if max_new is not None and max_new > 0 and len(out) > max_new:
+                out = out[:max_new]
             if eagle_on and eagle_active and aux is not None:   # grow the EAGLE context with the newly committed positions (degraded: skip the stack+extend work too, not just the drafting)
                 local_draft.extend(committed, _eagle_aux_range(aux, 0, len(committed)), base_pos=sp)   # committed[i] predicted by aux[i] (target hidden one pos earlier)
             if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
@@ -1028,6 +1030,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     finally:
         kw.stop()                                           # job over: never leak a noop thread onto the reused socket
     dt = time.time() - t0
+    if max_new is not None and max_new > 0 and len(out) > max_new:
+        out = out[:max_new]
     for ee in eos_set:
         if ee in out: out = out[:out.index(ee)]; break
     # True depth from the model config — never from the receipts themselves (self-referential coverage

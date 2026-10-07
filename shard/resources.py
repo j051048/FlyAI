@@ -13,6 +13,12 @@ import sys
 
 SCHEMA = "shard-placement-requirements/1"
 
+# Prevent module identity split between flat `import resources` and package `import shard.resources`
+if "resources" not in sys.modules:
+    sys.modules["resources"] = sys.modules[__name__]
+if "shard.resources" not in sys.modules:
+    sys.modules["shard.resources"] = sys.modules[__name__]
+
 
 class ResourceError(ValueError):
     pass

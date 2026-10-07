@@ -15,15 +15,25 @@ import re
 import socket
 import struct
 
-try:  # deployed flat beside the engine files
-    from resources import PlacementRequirements, ResourceError, StorageRequirements, byte_count
+import sys
+try:
+    from shard.resources import PlacementRequirements, ResourceError, StorageRequirements, byte_count
+    if "resources" not in sys.modules:
+        import shard.resources as _sr
+        sys.modules["resources"] = _sr
 except ImportError:
-    # A direct absolute-path CLI invocation need not have the repo cwd/PYTHONPATH.
-    import sys
     repo_root = Path(__file__).resolve().parents[2]
     if (repo_root / "shard" / "resources.py").is_file() and str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    from shard.resources import PlacementRequirements, ResourceError, StorageRequirements, byte_count
+        from shard.resources import PlacementRequirements, ResourceError, StorageRequirements, byte_count
+        if "resources" not in sys.modules:
+            import shard.resources as _sr
+            sys.modules["resources"] = _sr
+    else:
+        from resources import PlacementRequirements, ResourceError, StorageRequirements, byte_count
+        if "shard.resources" not in sys.modules:
+            import resources as _r
+            sys.modules["shard.resources"] = _r
 
 MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash-0731"
 MAX_HEADER_BYTES = 16 * 1024 * 1024

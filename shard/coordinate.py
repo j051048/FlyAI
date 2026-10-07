@@ -290,6 +290,8 @@ def run_job(MP, tok, eos_set, chans, a, job, emit=_emit, watchdog=None, redial=N
                     state["eos_at"] = i
                     break
         ids = out[: state["eos_at"]] if state["eos_at"] is not None else out
+        if max_new is not None and max_new > 0 and len(ids) > max_new:
+            ids = ids[:max_new]
         text = tok.decode(ids, skip_special_tokens=True)
         if len(text) > len(state["text"]):
             state["text"] = text

@@ -754,7 +754,7 @@ class WholeBlockGraphs:
             return
         _MOE_REFUSED += 1
         self.moe_mode = "eager"
-        if getattr(self.L.ffn, "_hybrid_runtime", None) is not None and \
+        if getattr(getattr(self.L, "ffn", None), "_hybrid_runtime", None) is not None and \
                 os.environ.get("V4_LEVERS_STRICT", "0") not in ("", "0"):
             raise RuntimeError(f"V4_MOE_IN_GRAPH cannot capture a local expert cache: {why}")
         print(f"[v4] V4_MOE_IN_GRAPH: layer {self.L.layer_id} keeps its routed MoE EAGER — {why}",

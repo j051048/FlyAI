@@ -28,6 +28,8 @@ import time
 
 import pytest
 
+pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="socketpair stdio inheritance requires POSIX")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fake_ring as FR                                    # noqa: E402  (bootstraps env + sys.path)
 from fake_ring import FakeRing, repetitive_T             # noqa: E402

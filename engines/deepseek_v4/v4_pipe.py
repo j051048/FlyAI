@@ -2452,7 +2452,7 @@ def _graph_env_conflict(gp_mode):
 
 def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=False,
                      device="cuda", token=None, extra_env="", gpu=None, port=None, nxt_addr=None,
-                     ret_relay=None, dspark=False, cuda_graph=True):
+                     ret_relay=None, dspark=False, cuda_graph=True, key_path=None):
     """The shell command a launcher runs to start ONE v4 engine stage over the sidecar. Fully
     DETACHED in every shape (setsid + fd redirect), mirroring k3_pipe.stage_launch_cmd /
     m25_scatter_pipe.stage_cmd — see the note by the return.
@@ -2527,7 +2527,11 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=F
     log = f"/root/v4_stage_{port}.log"
     inner = (f"python3 /root/v4_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
              f"--port {port} {nxt} {rr}{ds}--dir {model_dir} > {log} 2>&1")
-    return (f"{rc}{tk}{cvd}{gp}{_eng_env()}{extra_env}V4_DIR={model_dir} V4_DEV={device} "
+    # A multi-GPU box needs a separate signer for each GPU stage; sharing the
+    # host's one key would fail the unchanged receipt duplicate-signer check.
+    import shlex
+    node_key = f"SHARD_NODE_KEY={shlex.quote(str(key_path))} " if key_path is not None else ""
+    return (f"{rc}{tk}{cvd}{gp}{_eng_env()}{extra_env}{node_key}V4_DIR={model_dir} V4_DEV={device} "
             f"M25_ENGINE_BIND=127.0.0.1 setsid bash -c '{inner}' </dev/null >/dev/null 2>&1 &")
 
 
@@ -2632,12 +2636,14 @@ def box_ring_launch(node_stages, gpus, box_maddrs=None, *, model_dir="/root/v4",
     for sub in subs:
         eng_port, nxt, link = box_stage_wiring(sub)
         ret_relay = box_return_relay(sub, tail_box)
+        local_count = sum(s["box_index"] == sub["box_index"] for s in subs)
+        key_path = f"/root/.shard_node_key_gpu_{sub['gpu']}" if receipts and local_count > 1 else None
         cmd = stage_launch_cmd(sub["global_index"], sub["nstages"], sub["lo"], sub["hi"],
                                model_dir=model_dir, receipts=receipts, token=token,
                                gpu=sub["gpu"], port=eng_port, nxt_addr=nxt, ret_relay=ret_relay,
-                               dspark=(dspark and sub["tail"]))
+                               dspark=(dspark and sub["tail"]), key_path=key_path)
         stages.append({**sub, "eng_port": eng_port, "next": nxt, "link": link,
-                       "ret_relay": ret_relay, "cmd": cmd})
+                       "ret_relay": ret_relay, "cmd": cmd, "key_path": key_path})
     B = len(node_stages)
     sidecars = ([ring_sidecar_spec(b, B, box_maddrs, ret_maddr=ret_maddr) for b in range(B)]
                 if box_maddrs is not None else None)

@@ -1,6 +1,6 @@
 """latency-optimal pipeline ordering — the heart of serving a *scattered* swarm.
 
-c0mpute nodes are random consumer GPUs on home links, never co-located. every token
+c0mpute nodes may be scattered consumer GPUs or several GPUs in one miner's rig. every token
 traverses coordinator -> head -> ... -> tail -> (direct return) -> coordinator, so the
 per-token WAN cost is:
 
@@ -304,7 +304,7 @@ def node_capacity(free_vram_mb, layer_vram_mb, kv_mb_per_layer=0):
     return int(free_vram_mb // per) if per > 0 else 0
 
 
-def assign_layers(order, n_layers, caps, layer_ms, floors=None):
+def assign_layers(order, n_layers, caps, layer_ms, floors=None, *, groups=None, group_caps=None):
     """Size each node's contiguous block to MINIMIZE total decode-step compute — the SUM of per-stage
     times, which is exactly what predict_step_ms scores and the right model for single-traversal
     autoregressive decode (token t+1 can't enter the ring until t exits, so per-step latency is the
@@ -325,11 +325,20 @@ def assign_layers(order, n_layers, caps, layer_ms, floors=None):
     if sum(caps[n] for n in order) < n_layers:
         return None
     alloc = dict(base)
+    groups = groups or {n: n for n in order}
+    group_caps = group_caps or {}
+    used = {}
+    for n, count in alloc.items():
+        group = groups[n]
+        used[group] = used.get(group, 0) + count
+    if any(count > group_caps.get(group, INF) for group, count in used.items()):
+        return None
     rem = n_layers - need
     for n in sorted(order, key=lambda n: layer_ms[n]):          # remaining layers -> cheapest-per-layer first (min sum)
-        take = min(caps[n] - alloc[n], rem)
+        group = groups[n]
+        take = min(caps[n] - alloc[n], rem, group_caps.get(group, INF) - used[group])
         if take > 0:
-            alloc[n] += take; rem -= take
+            alloc[n] += take; rem -= take; used[group] += take
         if rem <= 0:
             break
     return alloc if rem == 0 else None
@@ -338,7 +347,7 @@ def assign_layers(order, n_layers, caps, layer_ms, floors=None):
 def _is_adjacent_same_host(order, host_id=None):
     """Check if any adjacent stages in a ring order reside on the same physical host.
 
-    Eliminates NAT hairpinning deadlocks and Sybil adjacency attacks.
+    A policy predicate, not proof of Sybil resistance or network reachability.
     """
     if not host_id or len(order) <= 1:
         return False
@@ -346,9 +355,57 @@ def _is_adjacent_same_host(order, host_id=None):
     for idx in range(lk):
         ha = host_id.get(order[idx])
         hb = host_id.get(order[(idx + 1) % lk])
-        if ha and hb and ha == hb:
+        if ha is not None and hb is not None and ha != "" and ha == hb:
             return True
     return False
+
+
+def _adjacent_host_loop(nodes, L, c_out, c_in, host_id, require=None, allowed_tails=None):
+    """Cheapest explicit host-separated cycle, including its closing edge.
+
+    Rejecting the unconstrained cheapest order can miss a valid A-B-A-B order.
+    Exclude conflicts inside the DP instead; no production isolation is implied.
+    """
+    idx = list(nodes)
+    if len(idx) == 1:
+        return idx, loop_cost(idx, L, c_out, c_in)
+    tails = set(idx) if allowed_tails is None else set(allowed_tails)
+    heads = [require] if require is not None else idx
+    if len(idx) > 16:
+        order, cost = _pin_order_oversize(idx, L, c_out, c_in, heads, tails)
+        return (order, cost) if order and not _is_adjacent_same_host(order, host_id) else (None, INF)
+    best_order, best_cost = None, INF
+    k, full = len(idx), (1 << len(idx)) - 1
+    for head in heads:
+        start = idx.index(head)
+        dp = [[INF] * k for _ in range(1 << k)]
+        parent = [[-1] * k for _ in range(1 << k)]
+        dp[1 << start][start] = c_out[head]
+        for mask in range(1 << k):
+            for j in range(k):
+                if dp[mask][j] == INF:
+                    continue
+                for m in range(k):
+                    if mask & (1 << m) or host_id[idx[j]] == host_id[idx[m]]:
+                        continue
+                    next_mask = mask | (1 << m)
+                    candidate = dp[mask][j] + L[idx[j]][idx[m]]
+                    if candidate < dp[next_mask][m]:
+                        dp[next_mask][m], parent[next_mask][m] = candidate, j
+        for j, tail in enumerate(idx):
+            if tail not in tails or host_id[head] == host_id[tail]:
+                continue
+            cost = dp[full][j] + c_in[tail]
+            if cost >= best_cost:
+                continue
+            order, mask, end = [], full, j
+            while end != -1:
+                order.append(idx[end])
+                previous = parent[mask][end]
+                mask ^= 1 << end
+                end = previous
+            best_order, best_cost = order[::-1], cost
+    return best_order, best_cost
 
 
 def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
@@ -356,11 +413,12 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 up_mbps=None, prefill_bytes=0.0, decode_bytes=0.0, decode_steps=1,
                 prefill_chunks=1, prefill_layer_ms=None, relegate=True,
                 trusted=None, boundary_in=0, boundary_out=0, max_stages=6,
-                tail_floor=0, host_id=None):
+                tail_floor=0, host_id=None, isolation="none", device_id=None,
+                host_layer_caps=None, host_memory_domain=None, tail_host_layer_caps=None):
     """The self-optimizer's pure core. From a candidate POOL, choose the subset + ring order +
     per-node layer split that MINIMIZES predicted request time, subject to:
       * VRAM feasibility — the chosen nodes must hold the whole model (+ KV),
-      * NEVER co-locate — no two stages share a `subnet` key (datacenter/network),
+      * production permits colocated distinct GPUs; isolation is explicit policy,
       * health — a power-capped/slow node has a high `layer_ms`, so it's dropped or given fewer
         layers automatically; no hand-tuned weights, just physical milliseconds.
     Prefers the FEWEST nodes that fit (each extra node is another full WAN round-trip — fewer,
@@ -409,6 +467,46 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
     Trust is a CONSTRAINT, never a score: among trust-valid rings the objective is unchanged."""
     if require is not None and exclude and require in set(exclude):
         raise ValueError("`require` and `exclude` name the same node")
+    if isolation not in ("none", "subnet", "host", "adjacent_host"):
+        raise ValueError("isolation must be none, subnet, host or adjacent_host")
+    if len(set(nodes)) != len(nodes):
+        raise ValueError("duplicate node IDs cannot contribute capacity twice")
+    host_id = dict(host_id or {})
+    raw_subnets = dict(subnet or {})
+    subnet = {n: raw_subnets.get(n) if raw_subnets.get(n) not in (None, "") else ("unknown-network", n)
+              for n in nodes}
+    devices = {}
+    for n in nodes:
+        value = (device_id or {}).get(n)
+        items = [value] if isinstance(value, str) else list(value) if value is not None else []
+        if any(not isinstance(item, str) or not item.strip() for item in items):
+            raise ValueError("device_id must identify globally unique GPU UUID strings")
+        identities = [item.strip().casefold() for item in items]
+        if len(identities) != len(set(identities)):
+            raise ValueError("a GPU UUID is repeated inside one device announcement")
+        devices[n] = set(identities)
+    memory_groups = {}
+    for n in nodes:
+        domain = (host_memory_domain or {}).get(n)
+        if domain in (None, ""):
+            domain = host_id.get(n)
+        memory_groups[n] = ("node", n) if domain in (None, "") else domain
+    host_layer_caps = dict(host_layer_caps or {})
+    tail_host_layer_caps = dict(tail_host_layer_caps or {})
+    for value in (*host_layer_caps.values(), *tail_host_layer_caps.values()):
+        if type(value) is not int or value < 0:
+            raise ValueError("host layer capacities must be nonnegative integers")
+
+    def isolation_key(n):
+        return subnet[n] if isolation == "subnet" else host_id[n] if isolation == "host" else ("node", n)
+
+    def unique_devices(subset):
+        seen = set()
+        for n in subset:
+            if seen & devices[n]:
+                return False
+            seen.update(devices[n])
+        return True
     pin = trusted is not None
     trust = set(trusted) if pin else set()
     # clamp each window to [0, n_layers]: a window >= n_layers means "that whole end is leaky" and
@@ -425,6 +523,10 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         return layer_vram_mb[n] if isinstance(layer_vram_mb, dict) else layer_vram_mb
     caps = {n: node_capacity(free_vram_mb[n], _lv(n), kv_mb_per_layer) for n in nodes}
     usable = [n for n in nodes if caps[n] > 0]
+    if isolation == "subnet":
+        usable = [n for n in usable if raw_subnets.get(n) not in (None, "")]
+    elif isolation in ("host", "adjacent_host"):
+        usable = [n for n in usable if host_id.get(n) not in (None, "")]
     if require is not None and require not in usable:
         return None                                              # the pinned coord/head can't hold a block
     if pin:
@@ -433,20 +535,27 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         if not any(n in trust for n in usable):
             return None                                          # no trusted stage-capable node -> can't hold the ends
 
-    def feasible_cap(pool):                                      # max layers coverable using DISTINCT subnets
+    def feasible_cap(pool):
         best = {}
         for n in pool:
-            best[subnet[n]] = max(best.get(subnet[n], 0), caps[n])
-        return sum(best.values())
+            key = isolation_key(n)
+            best[key] = max(best.get(key, 0), caps[n])
+        memory = {}
+        for n in pool:
+            key = memory_groups[n]
+            memory[key] = memory.get(key, 0) + caps[n]
+        return min(sum(best.values()), sum(min(count, host_layer_caps.get(key, count))
+                                          for key, count in memory.items()))
     if feasible_cap(usable) < n_layers:                          # feasibility on the FULL set, honoring co-location
         return None                                              # genuinely can't serve the model (no false negative)
 
     by_cap = sorted(usable, key=lambda n: caps[n], reverse=True)
-    acc, k_min, used_sub = 0, 0, set()                           # k_min = fewest DISTINCT-subnet nodes that fit
+    acc, k_min, used_sub, cover = 0, 0, set(), []
     for n in by_cap:
-        if subnet[n] in used_sub:
+        if isolation_key(n) in used_sub:
             continue
-        used_sub.add(subnet[n]); acc += caps[n]; k_min += 1
+        used_sub.add(isolation_key(n)); cover.append(n); k_min += 1
+        acc = feasible_cap(cover)
         if acc >= n_layers:
             break
 
@@ -454,26 +563,26 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         keep = sorted(usable, key=lambda n: c_out[n] + c_in[n])[:_TRIM]   # or `require` need
         must, seen = set(), set()                                # a DISTINCT-subnet cover (+slack) must survive: a
         for m in by_cap:                                         # subnet-BLIND top-cap `must` starves the pool of
-            if subnet[m] in seen:                                # feasible cover when the fattest cards are co-located
+            if isolation_key(m) in seen:                                # feasible cover when the fattest cards are co-located
                 continue                                         # (that was a false-"infeasible" bug) -> pick fattest
-            seen.add(subnet[m]); must.add(m)                     # node per NEW subnet, mirroring the k_min walk
+            seen.add(isolation_key(m)); must.add(m)                     # node per NEW subnet, mirroring the k_min walk
             if len(must) >= k_min + slack:
                 break
         if require is not None:                                  # ...and a REQUIRE-compatible cover: `require`
             must.add(require)                                    # sits in every ring, so its subnet's slot is
-            seen, acc = {subnet[require]}, caps[require]         # spent on IT (a same-subnet fat card can never
+            seen, acc, cover = {isolation_key(require)}, caps[require], [require]         # spent on IT (a same-subnet fat card can never
             for m in by_cap:                                     # join it) -> keep OTHER-subnet fat nodes until
-                if subnet[m] in seen:                            # they cover the model, else a require-blind
+                if isolation_key(m) in seen:                            # they cover the model, else a require-blind
                     continue                                     # `must` starves the pool the same way (that
-                seen.add(subnet[m]); must.add(m); acc += caps[m] # was false-"infeasible" bug #3)
+                seen.add(isolation_key(m)); must.add(m); cover.append(m); acc = feasible_cap(cover) # was false-"infeasible" bug #3)
                 if acc >= n_layers:
                     break
         if pin:                                                  # ...and a TRUSTED cover: both ring ends (+ the
             seen, kept_t = set(), 0                              # boundary layers) must sit on trusted nodes, and
             for m in by_cap:                                     # the low-RTT `keep` may hold none -> keep the
-                if m not in trust or subnet[m] in seen:          # fattest trusted card per distinct subnet (+slack)
+                if m not in trust or isolation_key(m) in seen:          # fattest trusted card per distinct subnet (+slack)
                     continue                                     # so pinning can't be starved into false-infeasible
-                seen.add(subnet[m]); must.add(m); kept_t += 1
+                seen.add(isolation_key(m)); must.add(m); kept_t += 1
                 if kept_t >= 2 + slack:
                     break
         usable = keep + [n for n in must if n not in keep]
@@ -508,6 +617,13 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         pf = predict_prefill_ms(order, alloc, L, c_out, c_in, up_mbps, prefill_bytes,
                                 prefill_chunks, prefill_layer_ms)
         return pf + D * step, step, pf                          # rank by total request time
+
+    def memory_limits(order):
+        limits = dict(host_layer_caps)
+        group = memory_groups[order[-1]]
+        if group in tail_host_layer_caps:
+            limits[group] = min(limits.get(group, tail_host_layer_caps[group]), tail_host_layer_caps[group])
+        return limits
 
     def _pin_floors(order, subset_caps):
         """Layer floors that FORCE the boundary onto a trusted CONTIGUOUS prefix/suffix of `order`,
@@ -581,7 +697,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                     continue
                 if pin and sum(1 for n in subset if n in trust) < (1 if k == 1 else 2):
                     continue                                             # both ends must be trusted (distinct if k>1)
-                if len(set(subnet[n] for n in subset)) < k:              # never co-locate (all distinct subnets)
+                if len(set(isolation_key(n) for n in subset)) < k or not unique_devices(subset):
                     continue
                 subset_caps = {n: caps[n] for n in subset}
 
@@ -589,7 +705,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                     # cheapest order whose trusted prefix/suffix can hold the boundary AND whose greedy
                     # fill keeps every boundary layer trusted. Ordered by cost, so the first hit is best.
                     for order in _pin_orders(subset, k):
-                        if _is_adjacent_same_host(order, host_id):
+                        if isolation == "adjacent_host" and _is_adjacent_same_host(order, host_id):
                             continue
                         floors = _pin_floors(order, subset_caps)
                         if floors is None:
@@ -597,7 +713,8 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                         if tail_floor > 0:
                             floors = dict(floors)
                             floors[order[-1]] = max(floors.get(order[-1], 0), tail_floor)
-                        alloc = assign_layers(order, n_layers, subset_caps, layer_ms, floors)
+                        alloc = assign_layers(order, n_layers, subset_caps, layer_ms, floors,
+                                              groups=memory_groups, group_caps=memory_limits(order))
                         if alloc is None:
                             continue
                         if not _boundary_nodes(order, alloc, n_layers, b_in, b_out) <= trust:
@@ -607,14 +724,22 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                             found = (rank, order, alloc, k, step, pf)
                         break                                            # cost-ordered -> first valid is this subset's best
                     continue
-                order, _ = optimal_loop(subset, EL, Eout, Ein) if aware else optimal_loop(subset, L, c_out, c_in)
+                if isolation == "adjacent_host":
+                    matrices = (EL, Eout, Ein) if aware else (L, c_out, c_in)
+                    order, _ = _adjacent_host_loop(subset, *matrices, host_id, require,
+                                                   {n for n in subset if subset_caps[n] >= max(1, tail_floor)})
+                    if order is None:
+                        continue
+                else:
+                    order, _ = optimal_loop(subset, EL, Eout, Ein) if aware else optimal_loop(subset, L, c_out, c_in)
                 if require is not None and order[0] != require:      # deployable orientation: coord box = stage 0
                     order = (_head_first(order, require, EL, Eout, Ein) if aware
                              else _head_first(order, require, L, c_out, c_in))
-                if _is_adjacent_same_host(order, host_id):
+                if isolation == "adjacent_host" and _is_adjacent_same_host(order, host_id):
                     continue
                 floors = {order[-1]: tail_floor} if tail_floor > 0 else None
-                alloc = assign_layers(order, n_layers, subset_caps, layer_ms, floors)
+                alloc = assign_layers(order, n_layers, subset_caps, layer_ms, floors,
+                                      groups=memory_groups, group_caps=memory_limits(order))
                 if alloc is None:
                     continue
                 rank, step, pf = _score(order, alloc)

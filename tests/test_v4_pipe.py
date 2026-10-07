@@ -1752,9 +1752,9 @@ def test_plan_layer_ranges_names_the_missing_v4_profile():
     offline fallback, instead of surfacing as a bare KeyError three frames down."""
     nodes = [{"id": "b0", "free_vram_mb": 96000.0, "subnet": "10.0.0.0/24"}]
     with pytest.raises(RuntimeError, match="no engine profile"):
-        VP.plan_layer_ranges(nodes, [[0.0]])
+        VP.plan_layer_ranges(nodes, [[0.0]], model_id="deepseek-ai/DeepSeek-V4-Flash-Missing")
     with pytest.raises(RuntimeError, match="even_tiling"):
-        VP.plan_layer_ranges(nodes, [[0.0]])
+        VP.plan_layer_ranges(nodes, [[0.0]], model_id="deepseek-ai/DeepSeek-V4-Flash-Missing")
 
 
 def test_tail_drafter_seam_is_unset_by_default():

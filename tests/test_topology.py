@@ -10,8 +10,17 @@ Run: `python3 tests/test_topology.py`  (also collectable by pytest as test_*).
 """
 import os, sys, copy
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from shard.topology import (select_ring, predict_step_ms, predict_prefill_ms, node_capacity,
+from shard.topology import (select_ring as _select_ring, predict_step_ms, predict_prefill_ms, node_capacity,
                             optimal_loop, assign_layers)
+
+
+def select_ring(*args, **kwargs):
+    """Retain this suite's historical strict-subnet scenarios explicitly.
+
+    Production defaults are covered independently in test_colocation_policy.py.
+    """
+    kwargs.setdefault("isolation", "subnet")
+    return _select_ring(*args, **kwargs)
 
 MODEL = dict(n_layers=62, layer_vram_mb=1700.0, kv_mb_per_layer=150.0)
 H, DT = 3072, 2

@@ -227,6 +227,7 @@ V4_DUAL_RESOURCE_PROFILE = {
     "n_layers": _V4_N_LAYERS,
     "layer_vram_mb": 758.0,          # ~350 MB resident + 32 expert cache slots (~408 MB)
     "layer_host_ram_mb": _V4_ROUTED_HOST_MB,  # 3264.0 MB pinned host RAM per layer
+    "tail_host_reserve_mb": 3 * _V4_ROUTED_HOST_MB,  # MTP pools; charged once to the tail's RAM domain
     "kv_mb_per_layer": 150.0,
     "layer_ms_base": 0.75,           # includes DMA overlap execution
     "reserve_mb": 2048.0,
@@ -291,7 +292,7 @@ def density_cap_layers(cap_layers, total_vram_mb):
     return max(0, int(round(int(cap_layers) * float(total_vram_mb) / _PROVEN_CAP_VRAM_MB)))
 
 
-def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
+def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=None):
     """Place a deployable sharded ring from announced capabilities + a measured RTT mesh.
 
     nodes: [{"id": <hashable>, "free_vram_mb": float, "subnet": str,
@@ -316,13 +317,16 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     rtt:   NxN one-way ms matrix, row/col order aligned to `nodes` (rtt[i][i] ignored).
     model: profile dict (see M25_PROFILE), or a catalog model_id resolved through `profile_for`
            (see PROFILES); defaults to M2.5.
-    slack: select_ring pool headroom; defaults to min(len(nodes), 3) — enough to drop weak/co-located
+    slack: select_ring pool headroom; defaults to min(len(nodes), 3) — enough to drop weak
            boxes without letting the exact subset search range over every k up to the pool size.
     privacy: {"boundary_in": int, "boundary_out": int} — turn on BOUNDARY-LAYER PINNING: the ring's
              head/tail (they handle raw prompt / output tokens) and every stage holding a boundary
              layer must be `trusted` nodes; strangers hold only deep-middle layers. The head is the
              most central TRUSTED capable node under pinning (it runs the coordinator, which sees
              the raw prompt). None (default) = placement exactly as before.
+    isolation: "none" (production default), "host", "subnet" or "adjacent_host".
+               None uses the model profile's policy, falling back to "none". Host/GPU metadata
+               comes from explicit announcements; a public IP does not identify a machine.
 
     Returns a plan dict, or None if the pool genuinely can't hold the model (with pinning: can't
     hold it SAFELY — e.g. no trusted node for an end):
@@ -343,12 +347,23 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
         raise ValueError("structural/resource evidence is not a calibrated scalar GPU placement profile; "
                          "the memory-aware planner has not been enabled")
     m = {**M25_PROFILE, **(model or {})}
+    isolation = m.get("isolation", "none") if isolation is None else isolation
+    if isolation not in ("none", "subnet", "host", "adjacent_host"):
+        raise ValueError("isolation must be none, subnet, host or adjacent_host")
     n = len(nodes)
     if n == 0:
         return None
     ids = [nd["id"] for nd in nodes]
     if len(set(ids)) != len(ids):                            # duplicate ids collide in the output maps
         raise ValueError("duplicate node id in `nodes`")     # (order/roles/boundary_stages) -> mis-deploy
+    # Network addresses do not identify physical hosts: several independent
+    # miners may share one NAT IP, while one host may have several subnets.
+    host_map = {i: str(nd["host_id"]) if nd.get("host_id") not in (None, "") else None
+                for i, nd in enumerate(nodes)}
+    memory_map = {i: str(nd["memory_domain_id"]) if nd.get("memory_domain_id") not in (None, "")
+                  else host_map[i] or ("node", i) for i, nd in enumerate(nodes)}
+    devices = {i: nd.get("gpu_uuids") or nd.get("gpu_uuid") or nd.get("device_id")
+               for i, nd in enumerate(nodes)}
     layer_vram, kv = float(m["layer_vram_mb"]), float(m["kv_mb_per_layer"])
     cap_layers = int(m["cap_layers"])
 
@@ -362,19 +377,20 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
 
     def _node_cap(i):
         if nodes[i].get("cap_layers") is not None:
-            return int(nodes[i]["cap_layers"])                    # probe-verdict ceiling wins outright
-        total = float(nodes[i].get("total_vram_mb") or 0.0)
-        vram_cap = density_cap_layers(cap_layers, total) if total > 0 else cap_layers
+            vram_cap = int(nodes[i]["cap_layers"])
+        else:
+            total = float(nodes[i].get("total_vram_mb") or 0.0)
+            vram_cap = density_cap_layers(cap_layers, total) if total > 0 else cap_layers
         # Dual-resource check: host RAM / pinnable RAM bottleneck
         host_ram_per_layer = float(m.get("layer_host_ram_mb") or 0.0)
         if host_ram_per_layer > 0.0:
             free_ram = nodes[i].get("free_ram_mb")
             pinnable_ram = nodes[i].get("pinnable_ram_mb")
             if m.get("placement") == "ram":
-                if pinnable_ram is None:
+                if pinnable_ram is None or free_ram is None:
                     # Fail-closed: unmeasured pinnable memory cannot host pinned expert pool
                     return 0
-                avail_ram = pinnable_ram
+                avail_ram = min(float(free_ram), float(pinnable_ram))
             else:
                 avail_ram = pinnable_ram if pinnable_ram is not None else free_ram
             if avail_ram is not None:
@@ -390,6 +406,27 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     cap_ok = [i for i in range(n) if free[i] >= per_layer[i]]
     if not cap_ok:
         return None                                          # no node can hold even one layer
+
+    host_caps, tail_host_caps = {}, {}
+    host_ram_per_layer = float(m.get("layer_host_ram_mb") or 0.0)
+    if m.get("placement") == "ram" and host_ram_per_layer > 0:
+        budgets = {}
+        for i in cap_ok:
+            nd = nodes[i]
+            ram, pinned = nd.get("free_ram_mb"), nd.get("pinnable_ram_mb")
+            available = min(float(ram), float(pinned)) if ram is not None and pinned is not None else 0.0
+            if not math.isfinite(available) or available < 0:
+                raise ValueError("RAM and pinned-memory budgets must be finite nonnegative MiB")
+            group = memory_map[i]
+            budgets[group] = min(budgets.get(group, available), available)
+        reserve = float(m.get("host_reserve_mb", 0.0))
+        tail_reserve_host = float(m.get("tail_host_reserve_mb", 0.0))
+        if not all(math.isfinite(v) and v >= 0 for v in (reserve, tail_reserve_host)):
+            raise ValueError("host reserves must be finite nonnegative MiB")
+        host_caps = {group: max(0, int((available - reserve) // host_ram_per_layer))
+                     for group, available in budgets.items()}
+        tail_host_caps = {group: max(0, int((available - reserve - tail_reserve_host) // host_ram_per_layer))
+                          for group, available in budgets.items()}
 
     # 2) head = most central capable node (lowest total RTT to the rest); it runs the coordinator.
     #    Under privacy pinning the coordinator sees the raw prompt, so the head must be TRUSTED —
@@ -411,9 +448,13 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
 
     def _connected_cap(i):
         # layers reachable from i: its own budget + every capable peer with a finite path BOTH ways
-        return int(free[i] // per_layer[i]) + sum(
-            int(free[j] // per_layer[j]) for j in cap_ok
-            if j != i and rtt[i][j] < _UNREACHABLE and rtt[j][i] < _UNREACHABLE)
+        reachable = [j for j in cap_ok if j == i or
+                     (rtt[i][j] < _UNREACHABLE and rtt[j][i] < _UNREACHABLE)]
+        capacity = {}
+        for j in reachable:
+            group = memory_map[j]
+            capacity[group] = capacity.get(group, 0) + int(free[j] // per_layer[j])
+        return sum(min(count, host_caps.get(group, count)) for group, count in capacity.items())
     head_pool = [i for i in head_pool if _connected_cap(i) >= int(m["n_layers"])]
     if not head_pool:
         return None                              # no candidate head can REACH enough capacity to serve
@@ -440,18 +481,20 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     # 4) coordinator entry/return hops are measured relative to the chosen head.
     c_out = [rtt[head][i] if i != head else 1.0 for i in range(n)]
     c_in = [rtt[i][head] if i != head else 1.0 for i in range(n)]
-    subnet = {i: nodes[i]["subnet"] for i in range(n)}
+    subnet = {i: nodes[i].get("subnet") for i in range(n)}
 
     # 5) upload-aware placement iff EVERY node announced an uplink (residential lever); else decode-only.
     ups = [nodes[i].get("up_mbps") for i in range(n)]
     aware = all(u is not None for u in ups)
-    extra = {}
+    extra = {"isolation": isolation, "host_id": host_map, "device_id": devices,
+             "host_layer_caps": host_caps, "host_memory_domain": memory_map,
+             "tail_host_layer_caps": tail_host_caps}
     if aware:
-        extra = {"up_mbps": {i: float(ups[i]) for i in range(n)},
+        extra.update({"up_mbps": {i: float(ups[i]) for i in range(n)},
                  "prefill_bytes": float(m.get("prefill_bytes", 0.0)),
                  "decode_bytes": float(m.get("decode_bytes", 0.0)),
                  "decode_steps": int(m.get("decode_steps", 1)),
-                 "prefill_chunks": int(m.get("prefill_chunks", 1))}
+                 "prefill_chunks": int(m.get("prefill_chunks", 1))})
 
     if pin:
         extra["trusted"] = trusted
@@ -465,9 +508,6 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     if tail_floor > 0:
         extra["tail_floor"] = tail_floor
 
-    host_map = {i: str(nodes[i].get("host_id") or nodes[i].get("public_ip") or "") for i in range(n)}
-    if any(host_map.values()):
-        extra["host_id"] = host_map
 
     # 6) the TAIL stage also holds the final norm + lm_head (measured 1.15 GiB bf16 on
     #    M2.5 — a 13-layer tail OOM'd loading it on a 32 GB 5090, live 2026-07-09, while
@@ -542,6 +582,7 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
         "step_ms": spec["step_ms"],
         "tok_s_per_g": spec["tok_s_per_g"],
         "k": spec["k"],
+        "isolation": isolation,
     }
     if aware:
         out["request_ms"] = spec.get("request_ms")
@@ -619,7 +660,7 @@ def _main() -> int:
         return 2
     try:
         plan = plan_ring(req["nodes"], req["rtt"], req.get("model"), slack=req.get("slack"),
-                         privacy=req.get("privacy"))
+                         privacy=req.get("privacy"), isolation=req.get("isolation"))
     except KeyError as e:
         json.dump({"error": f"missing field: {e}"}, sys.stdout)
         return 2

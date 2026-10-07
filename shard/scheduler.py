@@ -20,6 +20,12 @@ class JoinedNode:
     pinnable_ram_gb: float = 0.0     # Pinned RAM headroom (GB)
     h2d_gbps: float = 20.0           # Measured H2D PCIe bandwidth (GB/s)
     gpu_model: str = "rtx_5090"
+    host_id: str | None = None
+    gpu_uuid: str | None = None
+    gpu_uuids: tuple[str, ...] = ()
+    subnet: str | None = None
+    public_ip: str | None = None  # transport information, never physical-host identity
+    memory_domain_id: str | None = None
 
 
 def _distribute(total: int, caps: list[tuple[str, int]]) -> dict[str, int]:
@@ -85,7 +91,7 @@ class Scheduler:
 
     def plan(self, gb_per_layer: float | None = None, kv_gb_per_layer: float = 0.0,
              headroom_gb: float = 2.0, boundary_gb: float = 1.0,
-             model_id: str | None = None, placement: str = "gpu") -> dict:
+             model_id: str | None = None, placement: str = "gpu", isolation: str = "none") -> dict:
         """ONE joint placement: pipeline order and contiguous blocks decided together."""
         from .plan import plan_ring, profile_for
         ids = list(self.nodes)
@@ -95,7 +101,12 @@ class Scheduler:
             "free_ram_mb": self.nodes[nid].ram_gb * 1024.0 if self.nodes[nid].ram_gb else None,
             "pinnable_ram_mb": self.nodes[nid].pinnable_ram_gb * 1024.0 if self.nodes[nid].pinnable_ram_gb else None,
             "h2d_gbps": self.nodes[nid].h2d_gbps,
-            "subnet": nid,
+            "subnet": self.nodes[nid].subnet,
+            "host_id": self.nodes[nid].host_id,
+            "gpu_uuid": self.nodes[nid].gpu_uuid,
+            "gpu_uuids": self.nodes[nid].gpu_uuids,
+            "public_ip": self.nodes[nid].public_ip,
+            "memory_domain_id": self.nodes[nid].memory_domain_id,
         } for nid in ids]
         rtt = [[0.0 if a == b else float(self.nodes[a].rtt_ms[b]) for b in ids] for a in ids]
 
@@ -122,7 +133,7 @@ class Scheduler:
                 "cap_layers": self.total_layers,
                 "head_layer_ms_mult": 1.0,
             }
-        out = plan_ring(nodes, rtt, model)
+        out = plan_ring(nodes, rtt, model, isolation=isolation)
         if out is None:
             raise ValueError(f"insufficient resources: pool cannot hold {self.total_layers} layers "
                              f"under placement policy {placement!r}")
