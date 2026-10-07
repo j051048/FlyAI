@@ -418,6 +418,15 @@ part that matters, and it is already a test rather than a convention.
   training included. That is a separate execution core — honestly years past the inference
   fabric — named here as the direction, not a claim.
 
+## 🚀 Cluster Deployment Runbook
+
+For a complete, step-by-step operational guide on renting machines (e.g., **Vast.ai** / **AutoDL**) or setting up **self-hosted GPU rigs** to serve DeepSeek-V4-Flash:
+👉 **[DeepSeek-V4 Cluster Deployment & Runbook (docs/V4_CLUSTER_DEPLOY_GUIDE.md)](docs/V4_CLUSTER_DEPLOY_GUIDE.md)**
+- OS & CUDA recommendations, Python venv, PyTorch, and TileLang installation;
+- Single-box 4-GPU & multi-node WAN/LAN pipeline topologies and per-stage CLI startup commands;
+- Environment variable profiles for dual-resource hybrid RAM expert cache;
+- Pipeline health checks and Phase 0 hardware acceptance validation.
+
 Full design & execution spec: [docs/V4_HYBRID_RUNTIME.md](docs/V4_HYBRID_RUNTIME.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License

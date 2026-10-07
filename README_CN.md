@@ -158,6 +158,14 @@ docs/        ARCHITECTURE、ROADMAP、MODEL_RUNTIME、NETWORK、INTEGRATION、PR
 - **统一引擎架构（进行中）：** 将所有服务路径抽象收敛于统一的 `ModelRuntime` 接口（[`shard/node.py`](shard/node.py)），使网络能运行*任意*开源模型；模型层接入生态标准，核心壁垒（环拓扑、高效传输、投机验证）保持自研。规划见 [docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md)。
 - **远景目标 —— 超越推理：** 利用相同的无许可基础底座（节点身份、安全传输、内容寻址权重分发、去中心化验证与结算通道）承载通用算力与分布式大模型训练。
 
+## 🚀 集群部署与运行实操 (Runbook)
+
+针对在 **Vast.ai / AutoDL 租用 GPU** 或 **自有物理机** 上从零配置、组网并启动 4 卡 / 6 卡 DeepSeek-V4 集群，请直接阅读：
+👉 **[DeepSeek-V4 多机与多卡集群部署实操指南 (docs/V4_CLUSTER_DEPLOY_GUIDE.md)](docs/V4_CLUSTER_DEPLOY_GUIDE.md)**
+- 包含 Ubuntu 镜像选型、Python / CUDA / TileLang 一键安装命令；
+- 包含 4 卡单机（单机 4x 5090/4090）与多机分布式网络（Tailscale 虚拟局域网直连）逐机启动命令对照表；
+- 包含双资源池环境变量配置、协调节点发测与硬件验收套件。
+
 完整设计与执行规格见：[docs/V4_HYBRID_RUNTIME.md](docs/V4_HYBRID_RUNTIME.md) 与 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ## 开源协议
