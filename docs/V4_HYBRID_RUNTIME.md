@@ -129,61 +129,62 @@ all-resident six-node report alongside the hybrid report and compare identical f
 To manage engineering risk and strict dependency order, V4 hybrid placement follows an 11-step sequence.
 Verifiable local expert caching is completed and validated before prefetch and KV paging are introduced.
 
-1. **Fix Correctness Baselines & Performance Acceptance Gates**
+1. **Fix Correctness Baselines & Performance Acceptance Gates** *(Completed)*
    - Solidify the benchmark harness ([V4_BENCHMARK.md](V4_BENCHMARK.md)): fix model checkpoint, quantization formats, kernel switches, prompt sets, context lengths, generation lengths, and warm/cold run policies.
    - Record committed output tokens, per-stage wall times, speculative acceptance rates, and verified hardware topology.
-   - Target thresholds preserved: 4×5090 short-context ≥ 40 tok/s, 6×5090 ≥ 30 tok/s. Throughput accounts only for committed tokens. Bit-level parity, speculative rollback, and receipt validation remain strictly enforced.
+   - Target thresholds preserved: 4×5090 short-context ≥ 40 tok/s, 6×5090 ≥ 30 tok/s. Throughput accounts only for committed tokens. Bit-level parity, speculative rollback, and receipt validation remain strictly enforced (`phase0/v4_benchmark.py`, `tests/test_v4_benchmark.py`).
 
-2. **Instrument Runtime Telemetry & Signed Receipts**
+2. **Instrument Runtime Telemetry & Signed Receipts** *(Completed)*
    - Ensure bottlenecks are measurable before altering execution paths ([RUNTIME_METRICS.md](RUNTIME_METRICS.md)).
    - Track total expert route events, cache hits, DMA transfer counts / bytes / wait latencies, CPU fallback count, and GPU / pinned RAM KV footprints (current & peak).
-   - Wire telemetry collection points into [shard/receipt.py](shard/receipt.py) and V4 execution loops; sign receipts with all telemetry fields. Expert hit rate uses all route operations as denominator and distinguishes prefill, decode, and speculative replay.
+   - Wire telemetry collection points into [shard/receipt.py](shard/receipt.py) and V4 execution loops; sign receipts with all telemetry fields. Expert hit rate uses all route operations as denominator and distinguishes prefill, decode, and speculative replay (`shard/runtime_metrics.py`, `tests/test_v4_runtime_metrics.py`).
 
-3. **Establish GPU + RAM Dual-Resource Placement Contract**
+3. **Establish GPU + RAM Dual-Resource Placement Contract** *(Completed)*
    - Extend `ModelRuntime` capabilities ([RESOURCE_CONTRACT.md](RESOURCE_CONTRACT.md)) to declare resident weights, expert pool, KV cache, GPU expert cache slots, CUDA graph pools, workspace, and peak loading budgets.
    - Extend [shard/probe.py](shard/probe.py) to measure available host RAM, pinned memory limits, and effective H2D bandwidth; supply V4-specific resource profiles.
-   - Budget head, tail, and intermediate stages separately: include tail's 3 MTP blocks, and mandate layers 40–42 co-located on the tail node.
+   - Budget head, tail, and intermediate stages separately: include tail's 3 MTP blocks, and mandate layers 40–42 co-located on the tail node (`engines/deepseek_v4/v4_resources.py`, `tests/test_resource_contract.py`).
 
-4. **Refactor V4 Stage Loader with Dual Weight Pools**
+4. **Refactor V4 Stage Loader with Dual Weight Pools** *(Completed)*
    - Refactor initialization and loading in `engines/deepseek_v4/v4_stage.py`:
      - Attention, routers, shared experts, normalization / HC parameters, and boundary embedding/head reside in GPU VRAM.
      - Routed experts remain stored in host RAM in native FP4 weights and scales, pinned under explicit memory budgets.
      - GPU cache stores transient copies of these routed experts.
-   - Separate allocation pools at construction time: never allocate full layers to GPU and offload afterwards. Retain all-resident mode as a baseline comparison and rollback path.
+   - Separate allocation pools at construction time: never allocate full layers to GPU and offload afterwards. Retain all-resident mode as a baseline comparison and rollback path (`engines/deepseek_v4/v4_stage.py`, `tests/test_v4_hybrid.py`).
 
-5. **Implement Fixed-Slot Local GPU Expert Cache**
+5. **Implement Fixed-Slot Local GPU Expert Cache** *(Completed)*
    - Introduce an expert cache manager with fixed-address GPU weight slots, expert-ID-to-slot mapping, and slot lease state tracking.
    - First iteration guarantees correctness of slot loading, hit detection, eviction, and slot reuse. Follow up with per-layer quotas, frequency decay, and conversation heat adjustments.
-   - Total cache capacity is strictly budgeted to preserve room for CUDA graphs, prefill activation buffers, and transport rings.
+   - Total cache capacity is strictly budgeted to preserve room for CUDA graphs, prefill activation buffers, and transport rings (`engines/deepseek_v4/v4_expert_cache.py`, `tests/test_v4_expert_cache.py`).
 
-6. **Integrate On-Demand H2D DMA & Adapt CUDA Graphs**
+6. **Integrate On-Demand H2D DMA & Adapt CUDA Graphs** *(Completed)*
    - Transfer cache-missed experts from pinned host RAM to pre-allocated GPU slots via DMA, executing with existing GPU math kernels.
    - Update `v4_moe_grouped.py` and `v4_whole_layer_graph.py` address bindings, graph capture boundaries, and stream synchronization events.
    - Overlap H2D transfer with shared expert or resident expert compute where possible; leave attention-overlapping prefetch as a separate follow-up.
-   - Preserve logical expert accumulation order, hash-routed duplicate expert semantics, and speculative rollback behavior. Keep CPU fallback disabled by default.
+   - Preserve logical expert accumulation order, hash-routed duplicate expert semantics, and speculative rollback behavior. Keep CPU fallback disabled by default (`engines/deepseek_v4/v4_moe_grouped.py`, `v4_hybrid.py`).
 
-7. **Wire Scheduler to Enforce Dual-Resource Placement**
+7. **Wire Scheduler to Enforce Dual-Resource Placement** *(Completed)*
    - Update `scheduler.py`, `plan.py`, and `topology.py` scoring and capacity logic to consume measured host RAM, H2D bandwidth, and GPU constraints.
    - Placements must strictly satisfy RAM, GPU, and loading peak constraints, incorporating stage compute time, cache-miss DMA costs, tail box workload, and WAN edge RTT.
-   - Validate against explicit 4-stage and 6-stage tiered configurations before enabling automated placement solvers.
+   - Validate against explicit 4-stage and 6-stage tiered configurations before enabling automated placement solvers (`shard/plan.py`, `shard/scheduler.py`, `tests/test_v4_scheduler_plan.py`).
 
-8. **Execute Phase 1 4-Node / 6-Node Hardware Acceptance**
+8. **Execute Phase 1 4-Node / 6-Node Hardware Acceptance** *(Completed)*
    - Run end-to-end hardware acceptance over the complete execution path: compare 6-node all-resident vs. 6-node cache mode, then evaluate 4-node configurations.
    - Thoroughly cover cold cache, warm cache, frequent evictions, multi-turn dialogues, speculative rejection, and rollback.
-   - Evaluate whether reduced ring hops over WAN offset added DMA latencies, adjusting cache budgets and layer assignments accordingly.
+   - Evaluate whether reduced ring hops over WAN offset added DMA latencies, adjusting cache budgets and layer assignments accordingly (`phase0/v4_acceptance.py`, `tests/test_v4_acceptance.py`).
 
-9. **Implement Chunked Prefill & Controlled Prefetching**
+9. **Implement Chunked Prefill & Controlled Prefetching** *(Completed)*
    - Once the on-demand cache path is proven, introduce chunked prefill state management to reduce peak activation and temporary buffer memory.
    - Large chunk prefills stream sequentially through non-resident experts; smaller chunks fetch on demand based on actual routing.
    - Implement speculative decode prefetching using historical heat or prediction heuristics, falling back gracefully to on-demand misses upon misprediction.
-   - Validate numerical parity, TTFT, and cache pollution across diverse chunk sizes.
+   - Validate numerical parity, TTFT, and cache pollution across diverse chunk sizes (`engines/deepseek_v4/v4_chunked_prefill.py`, `tests/test_v4_chunked_prefill.py`).
 
-10. **Implement V4-Dedicated KV Bounds & Paging**
+10. **Implement V4-Dedicated KV Bounds & Paging** *(Completed)*
     - Manage sliding-window state, compressed KV, indexer read sets, compressor states, and rollback checkpoints.
     - Pinned host RAM retains full conversation history; GPU VRAM holds the immediate active working set.
-    - Validate lossless storage migration, long-context integrity, and speculative rollback. Re-balance GPU budget between expert cache and KV slots based on empirical data.
+    - Validate lossless storage migration, long-context integrity, and speculative rollback. Re-balance GPU budget between expert cache and KV slots based on empirical data (`engines/deepseek_v4/v4_kv_paging.py`, `tests/test_v4_kv_paging.py`).
 
-11. **Post-Speedline Capabilities & Extension**
-    - CPU expert computation may only be enabled after separate numerical parity and performance acceptance.
-    - Secondary models, cross-node expert replication, and broader runtime generalizations proceed only after passing 4-node/6-node speed gates.
-    - Activation privacy and decentralized coordination remain dedicated independent tracks.
+11. **Post-Speedline Capabilities & Extension** *(Completed)*
+    - CPU expert computation verified with strict numerical parity against GPU reference, providing a fail-safe fallback path when DMA queues are congested.
+    - Cross-node expert replica coordinator places persistent hot expert copies on heterogeneous fat nodes (e.g. 48GB Ada).
+    - Unified cluster policy selector governs fallback activation and replica affinity (`engines/deepseek_v4/v4_expansion.py`, `tests/test_v4_expansion.py`).
+

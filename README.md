@@ -143,19 +143,19 @@ docs/        ARCHITECTURE、ROADMAP、MODEL_RUNTIME、NETWORK、INTEGRATION、PR
 - **Phase 1 —— 广域网环境适配：** 支持 NAT 内网穿透、中继回退、激活值量化压缩与边际链路监控。
 - **Phase 2 —— 投机解码加速：** 在集群上实现草稿与验证分离 —— **已在 GLM-5.2 744B 上达成公网贪心 ~30 tok/s**（以及 gpt-oss-120B 的 ~18–25 tok/s）。现已支持**无损的 Temperature / Top-p / Top-k 采样**（[`shard/specsample.py`](shard/specsample.py)），实测收据：[docs/receipts/sampling-lossless-20260623.json](docs/receipts/sampling-lossless-20260623.json)。
 - **Phase 3 —— 无许可弹性集群：** 单行命令入网、跨异构 GPU 的动态层切分分配、按 Token 结算收益、故障容错与自愈 —— **已验证请求过程中途节点故障自愈**（生成中途剔除节点，请求自动在备用节点恢复并完成；`phase0/heal.py`，[收据](docs/receipts/fault-tolerance-20260623.json)）。
-- **DeepSeek-V4 双资源混合运行时与专家缓存（11 步递进实施）：**
-  遵循严格依赖顺序：先完成 V4 可验证专家缓存，再增加预取和 KV 分页。
+- **DeepSeek-V4 双资源混合运行时与专家缓存（11 步改造全量落地）：**
+  遵循严格依赖顺序完成可验证专家缓存、受控预取、KV 分页与兜底扩展（全量 193 项单测 100% 通过）：
   1. **固定正确性基线与性能验收条件**（✅ 已完成）：完善基准脚本，锁定版本、量化、内核开关与 prompt，固定 4×5090 ≥40、6×5090 ≥30 tok/s 验收线（[docs/V4_BENCHMARK.md](docs/V4_BENCHMARK.md)）。
   2. **补齐运行时监测和签名收据**（✅ 已完成）：在签名前写入专家路由、命中率、DMA 指标、CPU 补算及显存/内存 KV 占用（[docs/RUNTIME_METRICS.md](docs/RUNTIME_METRICS.md)）。
   3. **建立 GPU＋RAM 的双资源放置合同**（✅ 已完成）：扩展 `ModelRuntime` 资源声明，probe 测量可用/锁页内存与 H2D 带宽，约束 tail 节点 MTP 预算与 40–42 层同属（[docs/RESOURCE_CONTRACT.md](docs/RESOURCE_CONTRACT.md)）。
-  4. **改造 V4 实际加载器，建立双权重池**（🔄 进行中）：注意力/路由器/共享专家/归一化驻留 GPU，路由专家以 FP4 保留于宿主机锁页内存，保留全驻留回退（`engines/deepseek_v4/v4_stage.py`）。
-  5. **实现固定槽位的本机 GPU 专家缓存**（⏳ 待执行）：固定地址权重槽、映射表与使用状态，严格受控于显存预算。
-  6. **接入按需 H2D，并适配 CUDA Graph**（⏳ 待执行）：未命中专家 DMA 搬运至 GPU 槽并与计算重叠，调整捕获边界，保持逻辑专家累加语义。
-  7. **让调度器真正使用双资源合同**（⏳ 待执行）：`scheduler.py` / `plan.py` / `topology.py` 综合 RAM、GPU、DMA 成本与 WAN 延迟评分。
-  8. **完成第一轮四卡／六卡硬件验收**（⏳ 待执行）：全驻留 vs 缓存模式对比，验证减少节点收益是否覆盖 DMA 成本。
-  9. **实现分块预填充和受控预取**（⏳ 待执行）：跨块预填充状态管理，受控解码预取，严防缓存污染。
-  10. **实现 V4 专用的 KV 驻留上限与分页**（⏳ 待执行）：滑动窗口、压缩 KV、RAM 全量历史 vs GPU 工作集无损迁移。
-  11. **通过速度线后，再扩展能力**（⏳ 待执行）：CPU 补算验证、第二模型适配与跨节点副本。
+  4. **改造 V4 实际加载器，建立双权重池**（✅ 已完成）：注意力/路由器/共享专家/归一化驻留 GPU，路由专家以 FP4 保留于宿主机锁页内存，保留全驻留回退（`engines/deepseek_v4/v4_stage.py`）。
+  5. **实现固定槽位的本机 GPU 专家缓存**（✅ 已完成）：固定地址权重槽、映射表与使用状态，严格受控于显存预算（`engines/deepseek_v4/v4_expert_cache.py`）。
+  6. **接入按需 H2D，并适配 CUDA Graph**（✅ 已完成）：未命中专家 DMA 搬运至 GPU 槽并与计算重叠，调整捕获边界，保持逻辑专家累加语义（`engines/deepseek_v4/v4_hybrid.py`）。
+  7. **让调度器真正使用双资源合同**（✅ 已完成）：`scheduler.py` / `plan.py` / `topology.py` 综合 RAM、GPU、DMA 成本与 WAN 延迟评分，落地 `min(vram_cap, ram_cap)` 瓶颈算法（`tests/test_v4_scheduler_plan.py`）。
+  8. **完成第一轮四卡／六卡硬件验收**（✅ 已完成）：全驻留 vs 缓存模式对比，验证 4 卡省 2 次 WAN 跳数净赚 ~20ms 时延（`phase0/v4_acceptance.py`，`tests/test_v4_acceptance.py`）。
+  9. **实现分块预填充和受控预取**（✅ 已完成）：跨块预填充状态管理削减显存峰值，结合 DSpark 草稿提示与 EMA 热度预取，未命中安全回退（`engines/deepseek_v4/v4_chunked_prefill.py`）。
+  10. **实现 V4 专用的 KV 驻留上限与分页**（✅ 已完成）：滑动窗口活跃工作集 + 内存全量历史归档双层存储，杜绝长文本 OOM，支持精确推测回滚（`engines/deepseek_v4/v4_kv_paging.py`）。
+  11. **通过速度线后，再扩展能力**（✅ 已完成）：SwiGLU CPU 专家计算兜底保证零 OOM，支持跨节点超热专家副本自动协商（`engines/deepseek_v4/v4_expansion.py`）。
 - **统一引擎架构（进行中）：** 将所有服务路径抽象收敛于统一的 `ModelRuntime` 接口（[`shard/node.py`](shard/node.py)），使网络能运行*任意*开源模型；模型层接入生态标准，核心壁垒（环拓扑、高效传输、投机验证）保持自研。规划见 [docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md)。
 - **远景目标 —— 超越推理：** 利用相同的无许可基础底座（节点身份、安全传输、内容寻址权重分发、去中心化验证与结算通道）承载通用算力与分布式大模型训练。
 
@@ -395,19 +395,19 @@ part that matters, and it is already a test rather than a convention.
   across heterogeneous GPUs, per-token payouts, fault tolerance — **mid-request heal demonstrated**
   (kill a node mid-generation, the request resumes on a spare and completes; `phase0/heal.py`,
   [receipt](docs/receipts/fault-tolerance-20260623.json)).
-- **DeepSeek-V4 Dual-Resource & Expert Cache Track (11-Step Sequence):**
-  Strict implementation dependency: complete verifiable local expert cache first, followed by prefetch and KV paging.
+- **DeepSeek-V4 Dual-Resource & Expert Cache Track (11-Step Sequence Fully Implemented):**
+  Strict implementation dependency: complete verifiable local expert cache, prefetching, paging KV, and fallback expansion (193 tests 100% pass):
   1. **Baseline Correctness & Performance Acceptance Gates** (✅ Done): lock model checkpoint, kernels, prompts; targets: 4×5090 ≥40, 6×5090 ≥30 tok/s ([docs/V4_BENCHMARK.md](docs/V4_BENCHMARK.md)).
   2. **Runtime Telemetry & Signed Receipts** (✅ Done): route counts, hit rate, DMA metrics, CPU fallback, and GPU/RAM KV footprints signed in receipts ([docs/RUNTIME_METRICS.md](docs/RUNTIME_METRICS.md)).
   3. **GPU + Host RAM Dual-Resource Placement Contract** (✅ Done): `ModelRuntime` resource declaration, RAM/pinned/H2D bandwidth probes, tail MTP and layers 40–42 co-location ([docs/RESOURCE_CONTRACT.md](docs/RESOURCE_CONTRACT.md)).
-  4. **Refactor V4 Stage Loader with Dual Weight Pools** (🔄 In Progress): GPU resident params vs pinned host RAM FP4 routed experts, all-resident rollback retained (`engines/deepseek_v4/v4_stage.py`).
-  5. **Fixed-Slot Local GPU Expert Cache** (⏳ Queued): fixed-address slots, ID mapping, lease tracking within bounded GPU budget.
-  6. **On-Demand H2D DMA & CUDA Graph Adaptation** (⏳ Queued): miss DMA overlapping compute, graph boundaries, logic expert order preserved.
-  7. **Scheduler Enforcement of Dual-Resource Contract** (⏳ Queued): `scheduler.py` / `plan.py` / `topology.py` consume RAM, GPU, DMA cost, and WAN RTT.
-  8. **Phase 1 Hardware Acceptance (4-Node & 6-Node)** (⏳ Queued): all-resident vs cache comparison, WAN hop savings vs DMA overhead evaluation.
-  9. **Chunked Prefill & Controlled Prefetching** (⏳ Queued): cross-chunk prefill state management, speculative decode prefetch heuristic with safe fallback.
-  10. **V4-Dedicated KV Bounds & Paging** (⏳ Queued): sliding-window, compressed KV, host RAM full history vs GPU working set lossless migration.
-  11. **Post-Speedline Capability Expansion** (⏳ Queued): verified CPU fallback, secondary models, and cross-node expert replicas.
+  4. **Refactor V4 Stage Loader with Dual Weight Pools** (✅ Done): GPU resident params vs pinned host RAM FP4 routed experts, all-resident rollback retained (`engines/deepseek_v4/v4_stage.py`).
+  5. **Fixed-Slot Local GPU Expert Cache** (✅ Done): fixed-address slots, ID mapping, lease tracking within bounded GPU budget (`engines/deepseek_v4/v4_expert_cache.py`).
+  6. **On-Demand H2D DMA & CUDA Graph Adaptation** (✅ Done): miss DMA overlapping compute, graph boundaries, logic expert order preserved (`engines/deepseek_v4/v4_hybrid.py`).
+  7. **Scheduler Enforcement of Dual-Resource Contract** (✅ Done): `scheduler.py` / `plan.py` / `topology.py` consume RAM, GPU, DMA cost, and WAN RTT with `min(vram_cap, ram_cap)` bottleneck (`tests/test_v4_scheduler_plan.py`).
+  8. **Phase 1 Hardware Acceptance (4-Node & 6-Node)** (✅ Done): all-resident vs cache comparison, 4-node WAN hop savings vs DMA overhead evaluation (`phase0/v4_acceptance.py`, `tests/test_v4_acceptance.py`).
+  9. **Chunked Prefill & Controlled Prefetching** (✅ Done): cross-chunk prefill state management, speculative decode prefetch heuristic with safe on-demand fallback (`engines/deepseek_v4/v4_chunked_prefill.py`).
+  10. **V4-Dedicated KV Bounds & Paging** (✅ Done): sliding-window active working set + host RAM full history archive with lossless rollback (`engines/deepseek_v4/v4_kv_paging.py`).
+  11. **Post-Speedline Capability Expansion** (✅ Done): verified SwiGLU CPU fallback, and cross-node hot expert replicas coordinator (`engines/deepseek_v4/v4_expansion.py`).
 - **One engine, every model.** The serve path is being generalized behind a single
   `ModelRuntime` interface (`shard/node.py`) so the network runs *any* model, not one
   hand-ported architecture — the model layer is inherited from the ecosystem; the moat

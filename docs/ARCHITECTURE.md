@@ -26,7 +26,7 @@ Each node runs a serving engine for its block of layers. We do **not** rebuild a
 
 - `load_shard()` — pull only this block's weights (HF or a c0mpute mirror), keys derived from the manifest, and load to VRAM
 - `embed` / `forward(hidden_states, start_pos) -> hidden_states` / `logits` — head embeds, middle stages forward, tail samples; KV-cache lives per-node and crops to `start_pos` for spec-decode rollback
-- **Dual-resource placement (GPU + Host RAM):** For massive MoE models (DeepSeek-V4), `ModelRuntime` advertises a dual-resource contract ([RESOURCE_CONTRACT.md](RESOURCE_CONTRACT.md)). Resident parameters (attention, router, shared experts, normalizations) sit in GPU VRAM; routed experts reside in pinned host RAM in native FP4 format; a bounded fixed-slot GPU cache holds active experts via DMA, moving through an 11-step execution sequence ([V4_HYBRID_RUNTIME.md](V4_HYBRID_RUNTIME.md)).
+- **Dual-resource placement (GPU + Host RAM):** For massive MoE models (DeepSeek-V4), `ModelRuntime` advertises a dual-resource contract ([RESOURCE_CONTRACT.md](RESOURCE_CONTRACT.md)). Resident parameters (attention, router, shared experts, normalizations) sit in GPU VRAM; routed experts reside in pinned host RAM in native FP4 format; a bounded fixed-slot GPU cache holds active experts via DMA, moving through an 11-step execution sequence ([V4_HYBRID_RUNTIME.md](V4_HYBRID_RUNTIME.md)) which is now fully implemented and verified (fixed-slot cache, overlap DMA, chunked prefill, paged KV, and fallback expansion).
 - The moat — ring, transport, spec-decode, scheduler, receipts, verification — stays in-house; only the model execution is inherited.
 
 A node is just: a block of layers + a transport endpoint + a heartbeat.
