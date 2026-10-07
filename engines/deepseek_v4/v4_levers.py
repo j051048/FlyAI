@@ -184,6 +184,20 @@ def _agree(req, obs):
 
 # ── per-lever checks ──────────────────────────────────────────────────────────────────────────────
 
+def _check_expert_placement(ctx):
+    """Requested = resolved expert placement mode (gpu / ram); observed = stage live placement and cache binding."""
+    st = _mod("v4_stage")
+    req = getattr(st, "V4_EXPERT_PLACEMENT", "gpu") if st is not None else "absent"
+    if ctx.stage is None:
+        return req, "no-stage", None
+    obs = getattr(ctx.stage, "_expert_placement", "gpu")
+    if req == "ram":
+        has_cache = getattr(ctx.stage, "_expert_cache", None) is not None
+        obs_desc = "ram" if has_cache else "ram/nocache"
+        return req, obs_desc, (obs == "ram" and has_cache)
+    return req, obs, (obs == req)
+
+
 def _check_cuda_graph(ctx):
     """Requested = the resolved MODE; observed = whether the stage really holds captured graphs.
 
@@ -501,6 +515,8 @@ LEVERS = (
     Lever("V4_MOE_MULTI", STAGE, "v4_moe_multi",
           _moe_check("multi", "v4_moe_multi", "V4_MOE_MULTI"),
           "sync-free MoE dispatch at the DSpark drafter's small block shape"),
+    Lever("V4_EXPERT_PLACEMENT", STAGE, "v4_stage", _check_expert_placement,
+          "expert residency placement: gpu / ram"),
     Lever("V4_CUDA_GRAPH", STAGE, "v4_stage", _check_cuda_graph,
           "decode-step CUDA graphs: off / island / whole"),
     Lever("V4_MOE_IN_GRAPH", STAGE, "v4_whole_layer_graph", _check_moe_in_graph,
@@ -565,6 +581,9 @@ NON_LEVER_ENV = {
     "V4_TIMING": "instrumentation",
     "V4_TIMING_EVERY": "instrumentation period",
     "V4_RUNTIME_METRICS": "opt-in signed per-job work/residency observations; no math or wire change",
+    "V4_EXPERT_CACHE_SLOTS": "expert cache slot count per pool when V4_EXPERT_PLACEMENT=ram",
+    "V4_EXPERT_CACHE_MIB": "expert cache total budget in MiB when V4_EXPERT_PLACEMENT=ram",
+    "V4_EXPERT_CACHE_RESERVE_MIB": "VRAM reservation in MiB preserved before allocating expert cache",
     "V4_DSPARK_CONF_MIN": "conf-gate knob, consumed with V4_DSPARK_CONF_GATE",
     "V4_DSPARK_CONF_THRESH": "conf-gate knob, consumed with V4_DSPARK_CONF_GATE",
     "V4_DSPARK_GRAPH": "drafter head graph, rides on V4_DSPARK_FAST and is CUDA-only",
@@ -718,6 +737,7 @@ ENGINE_MODULES = (
     "v4_moe_multi.py", "v4_fp8_gemv.py", "v4_dspark_fast.py", "v4_dspark_moe.py",
     "v4_dspark_draft.py", "v4_ref_slim.py", "v4_ref_cpu.py", "v4_whole_layer_graph.py",
     "v4_kernels_cpu.py", "v4_sparse_attn_sm120.py", "v4_resources.py",
+    "v4_expert_cache.py", "v4_hybrid.py",
 )
 
 _ENV_RE = re.compile(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""")

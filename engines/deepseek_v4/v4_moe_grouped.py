@@ -631,31 +631,24 @@ def _keep_last_of_each(ids):
     return ~same.triu(1).any(dim=1)
 
 
-def grouped_forward(self, x, input_ids):
-    """MoE.forward for a single-token, single-rank step — two grouped launches, no host sync.
-    Every other shape falls through to the captured reference forward. See module doc."""
-    shape = x.size()
-    xv = x.view(-1, self.dim)
-    if xv.size(0) != 1:
-        return _decline(self, "s>1", x, input_ids)
-    if _WORLD_SIZE > 1:
-        return _decline(self, "world_size>1", x, input_ids)
+def grouped_routed_sum(self, model, xv, weights, ids, bank, bank_indices=None):
+    """The existing single-row routed math with an independent physical bank mapping.
 
-    weights, indices = self.gate(xv, input_ids.flatten())
-    ids = indices[0].to(torch.int32)                       # [G] on device — no .tolist()
-    bank = _expert_bank(self)
-    if bank is None:                                       # the bank would not fit — decline, loudly
-        return _decline(self, "bank-would-not-fit", x, input_ids)
-
+    `ids` remain LOGICAL expert ids for duplicate handling and the ascending fold.
+    Only the weight gather uses `bank_indices`, allowing a local fixed-slot cache to
+    reuse the same kernels and arithmetic without changing their implementation.
+    Returns the FP32 routed sum before the shared expert is added.
+    """
+    gather_ids = ids if bank_indices is None else bank_indices
     # Gather the six routed experts into contiguous [G, N, K] banks (device-side, no host sync — see
     # `_gather_fp` on why a torch gather rather than a device-side kernel index). One gather per
     # bank — w1 and w3 share theirs — then the kernel is a plain grid-indexed batched GEMM.
-    w13, w13_s = _gather_fp(bank["w13"], ids), _gather_fp(bank["w13_s"], ids)
-    w2, w2_s = _gather_fp(bank["w2"], ids), _gather_fp(bank["w2_s"], ids)
+    w13, w13_s = _gather_fp(bank["w13"], gather_ids), _gather_fp(bank["w13_s"], gather_ids)
+    w2, w2_s = _gather_fp(bank["w2"], gather_ids), _gather_fp(bank["w2_s"], gather_ids)
 
-    scale_fmt, scale_dtype = _MOD.scale_fmt, _MOD.scale_dtype
-    block = _MOD.block_size
-    act_quant = _MOD.act_quant
+    scale_fmt, scale_dtype = model.scale_fmt, model.scale_dtype
+    block = model.block_size
+    act_quant = model.act_quant
 
     # w1 / w3: one act_quant of the token, broadcast to the G expert slots, ONE grouped GEMM over the
     # fused [G, 2*inter, dim] bank. The token is quantized ONCE and its G identical rows are what
@@ -704,6 +697,24 @@ def grouped_forward(self, x, input_ids):
     y = torch.zeros_like(xv, dtype=torch.float32)
     for slot in range(out_sorted.size(0)):
         y += out_sorted[slot:slot + 1]
+    return y
+
+
+def grouped_forward(self, x, input_ids):
+    """MoE.forward for a single-token, single-rank step — two grouped launches, no host sync.
+    Every other shape falls through to the captured reference forward. See module doc."""
+    shape = x.size()
+    xv = x.view(-1, self.dim)
+    if xv.size(0) != 1:
+        return _decline(self, "s>1", x, input_ids)
+    if _WORLD_SIZE > 1:
+        return _decline(self, "world_size>1", x, input_ids)
+    weights, indices = self.gate(xv, input_ids.flatten())
+    ids = indices[0].to(torch.int32)
+    bank = _expert_bank(self)
+    if bank is None:
+        return _decline(self, "bank-would-not-fit", x, input_ids)
+    y = grouped_routed_sum(self, _MOD, xv, weights, ids, bank)
     y += self.shared_experts(xv)
     self._grouped_steps = getattr(self, "_grouped_steps", 0) + 1
     return y.type_as(xv).view(shape)
@@ -829,9 +840,6 @@ def real_dims_args(mod):
                          expert_dtype="fp4")
 
 
-def _load_model_module():
-    import importlib.util
-    import sys
 def _vendored(name):
     """Locate a vendored reference tree, in the repo AND on a deployed box.
 
@@ -848,6 +856,9 @@ def _vendored(name):
     return os.path.join(here, name)
 
 
+def _load_model_module():
+    import importlib.util
+    import sys
     inf = os.path.join(_vendored("deepseek_v4_ref"), "inference")
     if inf not in sys.path:
         sys.path.insert(0, inf)

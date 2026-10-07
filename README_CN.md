@@ -142,10 +142,23 @@ docs/        ARCHITECTURE、ROADMAP、MODEL_RUNTIME、NETWORK、INTEGRATION、PR
 - **Phase 1 —— 广域网环境适配：** 支持 NAT 内网穿透、中继回退、激活值量化压缩与边际链路监控。
 - **Phase 2 —— 投机解码加速：** 在集群上实现草稿与验证分离 —— **已在 GLM-5.2 744B 上达成公网贪心 ~30 tok/s**（以及 gpt-oss-120B 的 ~18–25 tok/s）。现已支持**无损的 Temperature / Top-p / Top-k 采样**（[`shard/specsample.py`](shard/specsample.py)），实测收据：[docs/receipts/sampling-lossless-20260623.json](docs/receipts/sampling-lossless-20260623.json)。
 - **Phase 3 —— 无许可弹性集群：** 单行命令入网、跨异构 GPU 的动态层切分分配、按 Token 结算收益、故障容错与自愈 —— **已验证请求过程中途节点故障自愈**（生成中途剔除节点，请求自动在备用节点恢复并完成；`phase0/heal.py`，[收据](docs/receipts/fault-tolerance-20260623.json)）。
+- **DeepSeek-V4 双资源混合运行时与专家缓存（11 步递进实施）：**
+  遵循严格依赖顺序：先完成 V4 可验证专家缓存，再增加预取和 KV 分页。
+  1. **固定正确性基线与性能验收条件**（✅ 已完成）：完善基准脚本，锁定版本、量化、内核开关与 prompt，固定 4×5090 ≥40、6×5090 ≥30 tok/s 验收线（[docs/V4_BENCHMARK.md](docs/V4_BENCHMARK.md)）。
+  2. **补齐运行时监测和签名收据**（✅ 已完成）：在签名前写入专家路由、命中率、DMA 指标、CPU 补算及显存/内存 KV 占用（[docs/RUNTIME_METRICS.md](docs/RUNTIME_METRICS.md)）。
+  3. **建立 GPU＋RAM 的双资源放置合同**（✅ 已完成）：扩展 `ModelRuntime` 资源声明，probe 测量可用/锁页内存与 H2D 带宽，约束 tail 节点 MTP 预算与 40–42 层同属（[docs/RESOURCE_CONTRACT.md](docs/RESOURCE_CONTRACT.md)）。
+  4. **改造 V4 实际加载器，建立双权重池**（🔄 进行中）：注意力/路由器/共享专家/归一化驻留 GPU，路由专家以 FP4 保留于宿主机锁页内存，保留全驻留回退（`engines/deepseek_v4/v4_stage.py`）。
+  5. **实现固定槽位的本机 GPU 专家缓存**（⏳ 待执行）：固定地址权重槽、映射表与使用状态，严格受控于显存预算。
+  6. **接入按需 H2D，并适配 CUDA Graph**（⏳ 待执行）：未命中专家 DMA 搬运至 GPU 槽并与计算重叠，调整捕获边界，保持逻辑专家累加语义。
+  7. **让调度器真正使用双资源合同**（⏳ 待执行）：`scheduler.py` / `plan.py` / `topology.py` 综合 RAM、GPU、DMA 成本与 WAN 延迟评分。
+  8. **完成第一轮四卡／六卡硬件验收**（⏳ 待执行）：全驻留 vs 缓存模式对比，验证减少节点收益是否覆盖 DMA 成本。
+  9. **实现分块预填充和受控预取**（⏳ 待执行）：跨块预填充状态管理，受控解码预取，严防缓存污染。
+  10. **实现 V4 专用的 KV 驻留上限与分页**（⏳ 待执行）：滑动窗口、压缩 KV、RAM 全量历史 vs GPU 工作集无损迁移。
+  11. **通过速度线后，再扩展能力**（⏳ 待执行）：CPU 补算验证、第二模型适配与跨节点副本。
 - **统一引擎架构（进行中）：** 将所有服务路径抽象收敛于统一的 `ModelRuntime` 接口（[`shard/node.py`](shard/node.py)），使网络能运行*任意*开源模型；模型层接入生态标准，核心壁垒（环拓扑、高效传输、投机验证）保持自研。规划见 [docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md)。
 - **远景目标 —— 超越推理：** 利用相同的无许可基础底座（节点身份、安全传输、内容寻址权重分发、去中心化验证与结算通道）承载通用算力与分布式大模型训练。
 
-完整里程碑规划、测试标准与风险评估见：[docs/ROADMAP.md](docs/ROADMAP.md)。
+完整设计与执行规格见：[docs/V4_HYBRID_RUNTIME.md](docs/V4_HYBRID_RUNTIME.md) 与 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ## 开源协议
 

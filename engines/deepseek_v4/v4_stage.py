@@ -102,6 +102,10 @@ except ImportError:
     from shard.runtime_metrics import RuntimeMetrics
 
 V4_RUNTIME_METRICS = os.environ.get("V4_RUNTIME_METRICS", "0") not in ("", "0")
+V4_EXPERT_PLACEMENT = os.environ.get("V4_EXPERT_PLACEMENT", "gpu")
+V4_EXPERT_CACHE_SLOTS = int(os.environ.get("V4_EXPERT_CACHE_SLOTS", "0"))
+V4_EXPERT_CACHE_MIB = int(os.environ.get("V4_EXPERT_CACHE_MIB", "0"))
+V4_EXPERT_CACHE_RESERVE_MIB = int(os.environ.get("V4_EXPERT_CACHE_RESERVE_MIB", "2048"))
 
 # Nothing here reads the checkpoint at import time (k3_stage's rule): resolving lazily costs one
 # memoized call and lets `import v4_stage` work on a box with no model on disk -- which is every box
@@ -637,7 +641,9 @@ class Stage:
     is for: it loads the embedding on a stage that would otherwise have no use for it."""
 
     def __init__(self, lo, hi, args=None, *, head=False, tail=False, dspark=False,
-                 device=None, dtype=None, spec_depth=None, fast_verify=None, runtime_metrics=None):
+                 device=None, dtype=None, spec_depth=None, fast_verify=None, runtime_metrics=None,
+                 expert_placement=None, expert_cache_slots=None, expert_cache_bytes=None,
+                 expert_cache_reserve_bytes=None, expert_cache_reference=False):
         self.lo, self.hi = lo, hi
         self.args = args if args is not None else config()
         self.device = device or dev
@@ -651,7 +657,45 @@ class Stage:
         a = self.args
         if not 0 <= lo < hi <= a.n_layers:
             raise RuntimeError(f"v4 stage[{lo}:{hi}) is not a range inside 0..{a.n_layers}")
+        self._expert_placement = V4_EXPERT_PLACEMENT if expert_placement is None else expert_placement
+        if self._expert_placement not in ("gpu", "ram"):
+            raise ValueError("expert_placement must be 'gpu' or 'ram'")
+        self._expert_cache_reference = bool(expert_cache_reference)
+        if self._expert_cache_reference and (self._expert_placement != "ram" or str(self.device) != "cpu"):
+            raise ValueError("expert cache reference emulation requires RAM placement on CPU")
+        self._expert_cache = None
+        self._hybrid_ring_drafter = None
+        self._hybrid_blocks = []
+        self._hybrid_pending_timings = []
+        self._expert_cache_slots = V4_EXPERT_CACHE_SLOTS if expert_cache_slots is None else expert_cache_slots
+        self._expert_cache_bytes = V4_EXPERT_CACHE_MIB * 1024**2 if expert_cache_bytes is None else expert_cache_bytes
+        self._expert_cache_reserve_bytes = (V4_EXPERT_CACHE_RESERVE_MIB * 1024**2
+                                           if expert_cache_reserve_bytes is None else expert_cache_reserve_bytes)
+        for name in ("_expert_cache_slots", "_expert_cache_bytes", "_expert_cache_reserve_bytes"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
+                raise ValueError(f"{name[1:]} must be a nonnegative integer")
+        if self._expert_placement == "ram":
+            if not str(self.device).startswith("cuda") and not self._expert_cache_reference:
+                raise ValueError("RAM expert placement requires CUDA; CPU reference emulation must be explicit")
+            if self._expert_cache_slots and self._expert_cache_bytes:
+                raise ValueError("choose either expert_cache_slots or expert_cache_bytes")
+            if self._expert_cache_reference and not (self._expert_cache_slots or self._expert_cache_bytes):
+                raise ValueError("CPU reference emulation needs an explicit cache budget")
+            if os.environ.get("V4_MOE_IN_GRAPH", "0") not in ("", "0"):
+                raise ValueError("RAM experts require the graph pre/post seam; set V4_MOE_IN_GRAPH=0")
+            if os.environ.get("V4_DSPARK_MOE", "0") not in ("", "0"):
+                raise ValueError("RAM experts own MTP dispatch; set V4_DSPARK_MOE=0")
+            import v4_expert_cache
+            self._expert_cache = v4_expert_cache.StageBudgetManager(
+                slots_per_pool=self._expert_cache_slots or None,
+                budget_bytes=None if self._expert_cache_slots else self._expert_cache_bytes,
+                device=self.device, emulation=self._expert_cache_reference)
         block_cls = chunk_block_cls(M) if self._fast else M.Block
+        if self._expert_cache is not None:
+            import v4_hybrid
+            block_cls = v4_hybrid.hybrid_block_cls(
+                block_cls, M, self._expert_cache, device=self.device,
+                emulation=self._expert_cache_reference, role="main", metrics=self._observe_hybrid)
         # `with torch.device(...)` + the reference's own set_dtype contextmanager is generate.py's
         # construction environment (generate.py:77,87) reproduced exactly. Both matter: the dtype
         # decides what the bare `torch.empty`/`torch.zeros` parameters and kv buffers come out as,
@@ -670,6 +714,8 @@ class Stage:
                     self.hc_head_fn = torch.nn.Parameter(torch.empty(a.hc_mult, a.hc_mult * a.dim))
                     self.hc_head_base = torch.nn.Parameter(torch.empty(a.hc_mult))
                     self.hc_head_scale = torch.nn.Parameter(torch.empty(1))
+        self._hybrid_blocks = list(self.layers) if self._expert_cache is not None else []
+        self._hybrid_cache_ready = False
         # Re-lay the routed experts as ONE contiguous bank per layer, so the grouped fp4 MoE kernel
         # can gather them without holding a second copy of the weights. HERE, between construction and
         # `load()`, is the only place it is free: it repoints each expert Linear's parameter at a
@@ -684,7 +730,8 @@ class Stage:
         # between a peak of 27.98 GiB and 31.17 GiB on an 8-layer stage -- see v4_moe_grouped.
         # No-op under V4_MOE_GROUPED=0 (the default): nothing allocated, nothing repointed.
         import v4_moe_grouped
-        self._moe_banked = banked = v4_moe_grouped.bank_layout(self.layers, preserve=False)
+        self._moe_banked = banked = (0 if self._expert_cache is not None else
+                                    v4_moe_grouped.bank_layout(self.layers, preserve=False))
         if banked:
             print(f"[v4] stage[{lo}:{hi}): grouped-MoE bank layout on {banked} layer(s) — the routed "
                   f"experts ARE the bank, no duplicate", flush=True)
@@ -716,7 +763,9 @@ class Stage:
         self._pos = 0
         self._replaying = False
         enabled = V4_RUNTIME_METRICS if runtime_metrics is None else bool(runtime_metrics)
-        self._runtime_metrics = RuntimeMetrics(self.device, torch_module=torch) if enabled else None
+        self._runtime_metrics = (RuntimeMetrics(self.device, torch_module=torch,
+            mode="gpu_expert_cache" if self._expert_cache is not None and not self._expert_cache_reference else None)
+            if enabled else None)
         self._runtime_draft = None
         self._runtime_draft_hooks = []
         self.reset()
@@ -824,6 +873,7 @@ class Stage:
         in place also keeps the lazily-bound aliases valid: `compressor.kv_cache` is a VIEW of
         `attn.kv_cache[:, win:]` (model.py:497) and `indexer.compressor.kv_cache` IS
         `indexer.kv_cache`, so both follow the buffer they were bound to."""
+        self._flush_hybrid_timings()
         with torch.no_grad():
             for L in self.layers:
                 L.attn.kv_cache.zero_()
@@ -873,6 +923,7 @@ class Stage:
         advance_and_draft's input length, this measures the MoEs actually executed when the
         fast path advances intermediate positions using attention alone. No tensor readback.
         """
+        self._resource_drafter = getattr(drafter, "tail", drafter)
         if self._runtime_metrics is None:
             return
         tail = getattr(drafter, "tail", None)
@@ -882,6 +933,11 @@ class Stage:
             handle.remove()
         self._runtime_draft_hooks = []
         self._runtime_draft = tail
+        if self._expert_cache is not None:
+            # The local cache reports actual hit/miss paths itself. A Gate
+            # hook would double-count them as fully resident execution.
+            self._runtime_metrics.sample_kv(self._runtime_kv_tensors())
+            return
 
         def observe_gate(gate, inputs, output):
             if self._runtime_metrics.mode == "gpu_resident" and torch.cuda.is_current_stream_capturing():
@@ -897,8 +953,87 @@ class Stage:
         """Detached per-job observations, collected before ReceiptSigner signs them."""
         if self._runtime_metrics is None:
             return None
+        self._flush_hybrid_timings()
         self._runtime_metrics.sample_kv(self._runtime_kv_tensors())
+        if self._expert_cache is not None:
+            manager = self._expert_cache
+            self._runtime_metrics.expert_cache = {
+                "device": str(manager.device), "cache_bytes": manager.allocated_bytes,
+                "host_experts_bytes": manager.host_bytes,
+                "pinned_host_experts_bytes": sum(p.host_bytes for p in manager.pools.values() if p.pinned),
+                "slots_per_pool": {f"{role}:{layer}": cache.capacity
+                                   for (role, layer), cache in manager.caches.items()}}
         return self._runtime_metrics.snapshot()
+
+    def _observe_hybrid(self, event):
+        metrics = getattr(self, "_runtime_metrics", None)
+        if metrics is None:
+            return
+        role, phase = event["role"], event["phase"]
+        if event.get("kind") == "prefetch":
+            if metrics.mode == "gpu_expert_cache":
+                metrics.prefetch(event["dma_bytes"], event.get("dma_wait_ms", 0.0))
+        else:
+            keys = ("routed_entries", "resident_hits", "dma_misses", "dma_bytes",
+                    "dma_wait_ms", "cpu_misses", "reference_routes")
+            metrics.expert_routes({key: event[key] for key in keys}, role=role, phase=phase)
+        for timing in event.get("dma_timings", ()):
+            if timing.get("kind") == "wait":
+                self._hybrid_pending_timings.append((role, phase, event.get("kind") == "prefetch", timing))
+
+    def _flush_hybrid_timings(self):
+        """Resolve actual CUDA consumer waits at a job barrier, not on every token."""
+        metrics = getattr(self, "_runtime_metrics", None)
+        pending = getattr(self, "_hybrid_pending_timings", [])
+        if metrics is None or not pending:
+            return
+        for role, phase, prefetch, timing in pending:
+            timing["end_event"].synchronize()
+            elapsed = float(timing["start_event"].elapsed_time(timing["end_event"]))
+            metrics.dma_wait(elapsed, role=role, phase=phase, prefetch=prefetch)
+        pending.clear()
+
+    def _hybrid_draft_class(self, base_cls):
+        import v4_hybrid
+        return v4_hybrid.hybrid_block_cls(base_cls, self._M, self._expert_cache,
+            device=self.device, emulation=self._expert_cache_reference,
+            role="draft", metrics=self._observe_hybrid)
+
+    def _register_hybrid_draft(self, draft):
+        if self._expert_cache is not None:
+            if self._hybrid_cache_ready:
+                raise RuntimeError("register MTP experts before allocating fixed cache slots")
+            self._hybrid_blocks.extend(draft.mtp)
+            self._resource_drafter = draft
+
+    def ensure_expert_cache(self):
+        """Allocate all registered main/MTP slots once, after complete weight loading."""
+        if self._expert_cache is None or self._hybrid_cache_ready:
+            return
+        if self._dspark and self.tail and self._hybrid_ring_drafter is None:
+            raise RuntimeError("load the RAM stage and its MTP weights before allocating expert caches")
+        if any(not pool.loaded for pool in self._expert_cache.pools.values()):
+            raise RuntimeError("all local main/MTP expert pools must be loaded before serving the expert cache")
+        if not self._expert_cache_reference:
+            # Only at load: release unused allocator segments, then reserve
+            # explicit headroom for prefill and lazy graphs before filling slots.
+            torch.cuda.empty_cache()
+            free, _ = torch.cuda.mem_get_info(self.device)
+            available = max(0, free - self._expert_cache_reserve_bytes)
+            if not self._expert_cache_slots:
+                budget = self._expert_cache_bytes or available
+                if budget > available:
+                    raise RuntimeError("expert cache budget exceeds measured free VRAM after runtime reserve")
+                self._expert_cache.budget_bytes = budget
+            else:
+                need = sum(self._expert_cache_slots * pool.bytes_per_expert
+                           for pool in self._expert_cache.pools.values())
+                if need > available:
+                    raise RuntimeError("expert cache slot budget exceeds measured free VRAM after runtime reserve")
+        caches = self._expert_cache.allocate()
+        import v4_hybrid
+        v4_hybrid.bind_caches(self._hybrid_blocks, caches)
+        self._hybrid_cache_ready = True
 
     def placement_requirements(self, calibration=None):
         """An explicit measured resource contract, never a guess from checkpoint bytes."""
@@ -1092,8 +1227,12 @@ class Stage:
         bg = self._block_graphs
         graphed = bg is not None and not self._replaying and start_pos > 0 and h.shape[1] == 1
         for i, (li, L) in enumerate(zip(range(self.lo, self.hi), self.layers)):
+            hybrid = getattr(L.ffn, "_hybrid_runtime", None)
+            phase = "replay" if self._replaying else "prefill" if start_pos == 0 else "decode"
+            if hybrid is not None:
+                hybrid.set_phase(phase, "main")
             h = bg[i].run(h, ids, start_pos) if graphed else L(h, start_pos, ids)
-            if self._runtime_metrics is not None:
+            if self._runtime_metrics is not None and hybrid is None:
                 # Outside the graph: count this executed layer once, not its capture/warmups.
                 # world_size=1 is enforced at construction, so each row owns the full top-k.
                 phase = "replay" if self._replaying else "prefill" if start_pos == 0 else "decode"
@@ -1174,7 +1313,8 @@ class Stage:
         s = h.shape[1]
         if ids.shape[:2] != h.shape[:2]:
             raise RuntimeError(f"v4 stage[{self.lo}:{self.hi}]: ids {tuple(ids.shape)} do not match "
-                               f"the payload's [b, s] = {tuple(h.shape[:2])}")
+                                f"the payload's [b, s] = {tuple(h.shape[:2])}")
+        self.ensure_expert_cache()
         self._seek(start_pos)
         if self._spec and start_pos > 0:
             # Taken BEFORE anything is touched: the whole point is to be able to put the stage back
@@ -1280,6 +1420,15 @@ class Stage:
                 with torch.no_grad():
                     p.data.copy_(t)
         self._resource_checkpoint_dir = os.path.abspath(d)
+        if self._expert_cache is not None:
+            if self._dspark and self.tail:
+                if self._hybrid_ring_drafter is None:
+                    import v4_dspark_draft
+                    self._hybrid_ring_drafter = v4_dspark_draft.ring_drafter(self, d)
+                else:
+                    self._hybrid_ring_drafter.tail.load(d)
+                self.observe_runtime_drafter(self._hybrid_ring_drafter)
+            self.ensure_expert_cache()
         return self
 
     def __repr__(self):
@@ -1289,6 +1438,7 @@ class Stage:
         return (f"<V4Stage [{self.lo}:{self.hi}) {kinds} head={self.head} tail={self.tail} "
                 f"{self.dtype} on {self.device} pos={self._pos} "
                 f"kernels={v4_kernels_cpu.backend()} "
+                f"experts={self._expert_placement} "
                 f"dspark={'on' if self._dspark else 'off'} taps={list(self._tap_ids)} "
                 f"spec={'on' if self._spec else 'off'}/{self._spec_depth} "
                 f"graph={self._graph_mode if self._block_graphs is not None else 'off'} "
@@ -1318,6 +1468,10 @@ class Stage:
         6-layer profile caught: `grouped/6` in the repr, and four of the six on the reference path
         all night. Banked is a load-time fact; whether a layer grouped is a run-time one, and the
         run-time answer is `v4_moe_grouped.coverage(self.layers)`."""
+        if self._expert_cache is not None:
+            adapters = [L.ffn._hybrid_runtime for L in self.layers]
+            return (f"local-cache/grouped-{sum(r.grouped_steps for r in adapters)}"
+                    f"/generic-{sum(r.generic_steps for r in adapters)}")
         chain = v4_levers.moe_chain(ref())
         s = ">".join(chain) or "?"
         return f"{s}/{self._moe_banked}" if "grouped" in chain else s

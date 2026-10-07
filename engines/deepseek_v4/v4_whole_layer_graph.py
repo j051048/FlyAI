@@ -477,6 +477,8 @@ def _moe_refusal(L, dev, dt, ids, mod):
 
     Every branch here is a way a graph could replay STALE ROUTING or read freed memory, and each one
     is cheaper to refuse than to detect afterwards -- a wrong-expert token is a plausible token."""
+    if getattr(L.ffn, "_hybrid_runtime", None) is not None:
+        return "local RAM expert cache uses demand routing and leased slots outside the graph"
     if not grouped_at_one_token(mod):
         import v4_levers
         return (f"a single-token step does not reach the grouped MoE (live chain: "
@@ -752,6 +754,9 @@ class WholeBlockGraphs:
             return
         _MOE_REFUSED += 1
         self.moe_mode = "eager"
+        if getattr(self.L.ffn, "_hybrid_runtime", None) is not None and \
+                os.environ.get("V4_LEVERS_STRICT", "0") not in ("", "0"):
+            raise RuntimeError(f"V4_MOE_IN_GRAPH cannot capture a local expert cache: {why}")
         print(f"[v4] V4_MOE_IN_GRAPH: layer {self.L.layer_id} keeps its routed MoE EAGER — {why}",
               flush=True)
 
@@ -794,7 +799,12 @@ class WholeBlockGraphs:
             with torch.no_grad():
                 self._feed_capture(compress, bucket)
                 g.replay()
-                self.ffn_out_buf.copy_(real_moe(self.L, self.ho[0], self.ids_buf))
+                hybrid = getattr(self.L.ffn, "_hybrid_runtime", None)
+                if hybrid is None:
+                    self.ffn_out_buf.copy_(real_moe(self.L, self.ho[0], self.ids_buf))
+                else:
+                    with hybrid.capture_warmup():
+                        self.ffn_out_buf.copy_(real_moe(self.L, self.ho[0], self.ids_buf))
             gp, out = self._warm_and_capture(
                 lambda: block_post_cs(self.L, self.ffn_out_buf, self.ho[1], self.ho[2], self.ho[3]),
                 restore=False)

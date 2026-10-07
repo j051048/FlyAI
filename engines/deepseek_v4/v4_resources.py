@@ -259,6 +259,11 @@ def runtime_config_identity(stage):
     body = {"args": args, "lo": stage.lo, "hi": stage.hi, "head": stage.head,
             "tail": stage.tail, "dspark": stage._dspark, "dtype": str(stage.dtype),
             "runtime_metrics_enabled": getattr(stage, "_runtime_metrics", None) is not None,
+            "expert_placement": getattr(stage, "_expert_placement", "gpu"),
+            "expert_cache_reference": getattr(stage, "_expert_cache_reference", False),
+            "expert_cache_slots": getattr(stage, "_expert_cache_slots", 0),
+            "expert_cache_bytes": getattr(stage, "_expert_cache_bytes", 0),
+            "expert_cache_reserve_bytes": getattr(stage, "_expert_cache_reserve_bytes", 0),
             "environment": {key: value for key, value in sorted(os.environ.items()) if key.startswith("V4_")}}
     import sys
     torch_module = sys.modules.get("torch")
@@ -353,6 +358,11 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
             record(f"{name}.{parameter_name}", tensor, f"{scope}_{kind}")
     for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
         record(name, getattr(stage, name, None), "boundary_resident")
+    manager = getattr(stage, "_expert_cache", None)
+    if manager is not None:
+        for key, cache in manager.caches.items():
+            for bank_name, tensor in cache.banks.items():
+                record(f"expert_cache.{key}.{bank_name}", tensor, "expert_cache")
     for name, module, _ in modules:
         for buffer_name, tensor in module.named_buffers():
             record(f"{name}.{buffer_name}", tensor, "state")

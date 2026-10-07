@@ -201,9 +201,50 @@ K3_PROFILE = {
 # calls plan_ring (its catalog holds a model_id and a manifest ref; the calibration is ours). Keys
 # are the manifest model_id, which NAMES THE QUANT: two quantizations of one model are two entries,
 # never one, because layer_vram_mb (and the weight_map behind it) differ.
+# ── DeepSeek-V4-Flash-0731 ────────────────────────────────────────────────────
+# 43 backbone layers, 256 routed experts (FP4, ~12.75 MiB each = 3264 MiB/layer), 6 activated experts.
+# 3 MTP draft blocks, 7168 hidden dimension.
+_V4_N_LAYERS = 43
+_V4_EXPERT_BYTES = 13369344          # ~12.75 MiB per FP4 routed expert
+_V4_EXPERTS_PER_LAYER = 256
+_V4_ROUTED_HOST_MB = (_V4_EXPERTS_PER_LAYER * _V4_EXPERT_BYTES) / (1024 * 1024)  # 3264.0 MB
+
+V4_ALL_RESIDENT_PROFILE = {
+    "n_layers": _V4_N_LAYERS,
+    "layer_vram_mb": 3614.0,         # ~350 MB resident (attn+shared+gate) + 3264 MB routed experts
+    "kv_mb_per_layer": 150.0,        # baseline sliding + compressed working KV
+    "layer_ms_base": 0.70,
+    "reserve_mb": 2048.0,            # CUDA context + graph + allocator slack
+    "head_reserve_mb": 3500.0,       # coordinator + token embedding + prefill buffer
+    "tail_reserve_mb": 5500.0,       # LM Head + 3 MTP draft blocks
+    "cap_layers": 8,                 # 32 GB GPU ceiling all-resident: max 8 layers
+    "head_layer_ms_mult": 1.2,
+    "placement": "gpu",
+}
+
+V4_DUAL_RESOURCE_PROFILE = {
+    "n_layers": _V4_N_LAYERS,
+    "layer_vram_mb": 758.0,          # ~350 MB resident + 32 expert cache slots (~408 MB)
+    "layer_host_ram_mb": _V4_ROUTED_HOST_MB,  # 3264.0 MB pinned host RAM per layer
+    "kv_mb_per_layer": 150.0,
+    "layer_ms_base": 0.75,           # includes DMA overlap execution
+    "reserve_mb": 2048.0,
+    "head_reserve_mb": 3500.0,
+    "tail_reserve_mb": 5500.0,
+    "cap_layers": 15,                # GPU permits up to 15 layers on 32 GB card in hybrid mode
+    "head_layer_ms_mult": 1.2,
+    "placement": "ram",
+    "expert_slot_bytes": _V4_EXPERT_BYTES,
+    "expert_count_per_layer": _V4_EXPERTS_PER_LAYER,
+    "default_expert_cache_slots": 32,
+}
+
 PROFILES = {
     "nvidia/MiniMax-M2.5-NVFP4": M25_PROFILE,
     "moonshotai/Kimi-K3-MXFP4": K3_PROFILE,
+    "deepseek-ai/DeepSeek-V4-Flash-0731": V4_DUAL_RESOURCE_PROFILE,
+    "deepseek-ai/DeepSeek-V4-Flash-0731-Dual": V4_DUAL_RESOURCE_PROFILE,
+    "deepseek-ai/DeepSeek-V4-Flash-0731-Resident": V4_ALL_RESIDENT_PROFILE,
 }
 
 
@@ -322,7 +363,17 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
         if nodes[i].get("cap_layers") is not None:
             return int(nodes[i]["cap_layers"])                    # probe-verdict ceiling wins outright
         total = float(nodes[i].get("total_vram_mb") or 0.0)
-        return density_cap_layers(cap_layers, total) if total > 0 else cap_layers
+        vram_cap = density_cap_layers(cap_layers, total) if total > 0 else cap_layers
+        # Dual-resource check: host RAM / pinnable RAM bottleneck
+        host_ram_per_layer = float(m.get("layer_host_ram_mb") or 0.0)
+        if host_ram_per_layer > 0.0:
+            free_ram = nodes[i].get("free_ram_mb")
+            pinnable_ram = nodes[i].get("pinnable_ram_mb")
+            avail_ram = pinnable_ram if pinnable_ram is not None else free_ram
+            if avail_ram is not None:
+                ram_cap = int(float(avail_ram) // host_ram_per_layer)
+                return min(vram_cap, ram_cap)
+        return vram_cap
 
     free = {i: min(max(nodes[i]["free_vram_mb"] - float(m["reserve_mb"])
                        - float(nodes[i].get("load_peak_extra_mb")
@@ -370,6 +421,14 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
                     else float(m["layer_ms_base"]) * float(nodes[i].get("cpu_factor", 1.0)))
                 for i in range(n)}
     layer_ms[head] *= float(m["head_layer_ms_mult"])
+    if m.get("placement") == "ram":
+        for i in range(n):
+            h2d_gbps = float(nodes[i].get("h2d_gbps", 20.0))
+            if h2d_gbps > 0:
+                slot_bytes = float(m.get("expert_slot_bytes", 13369344))
+                # ~1.8 expected misses per step; 30% of transfer exposed outside shared expert overlap
+                dma_overhead_ms = (1.8 * slot_bytes * 8.0) / (h2d_gbps * 1e9) * 1000.0 * 0.3
+                layer_ms[i] += dma_overhead_ms
 
     # 4) coordinator entry/return hops are measured relative to the chosen head.
     c_out = [rtt[head][i] if i != head else 1.0 for i in range(n)]
@@ -450,6 +509,10 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
         lo, hi = spec["blocks"][i]
         st = {"id": ids[i], "index": k, "lo": lo, "hi": hi,
               "head": k == 0, "tail": k == last, "layers": hi - lo}
+        if m.get("placement") == "ram":
+            st["placement"] = "ram"
+            st["expert_cache_slots"] = int(m.get("default_expert_cache_slots", 32))
+            st["host_pinned_mb"] = (hi - lo) * float(m.get("layer_host_ram_mb", 0.0))
         if pin:
             st["boundary"] = i in boundary
         stages.append(st)

@@ -1103,7 +1103,8 @@ def _tail_drafter(st, ckpt_dir, cache):
     if TAIL_DRAFTER is not None:
         return TAIL_DRAFTER
     if cache.get("drafter") is None:
-        cache["drafter"] = _dspark().ring_drafter(st, ckpt_dir)
+        cache["drafter"] = (getattr(st, "_hybrid_ring_drafter", None)
+                            or _dspark().ring_drafter(st, ckpt_dir))
         print(f"[tail] dspark drafter {cache['drafter'].tail}", flush=True)
     return cache["drafter"]
 
@@ -2420,6 +2421,8 @@ ENG_ENV = [
     "V4_DIAL_CONNECT_TIMEOUT", "V4_DIAL_RETRY_S",                               # inter-stage dial
     "V4_TIMING", "V4_TIMING_EVERY",                                             # instrumentation
     "V4_RUNTIME_METRICS",                                                       # signed work/residency observations
+    "V4_EXPERT_PLACEMENT", "V4_EXPERT_CACHE_SLOTS", "V4_EXPERT_CACHE_MIB",         # local experts
+    "V4_EXPERT_CACHE_RESERVE_MIB",                                               # measured free VRAM headroom
     "V4_LEVERS_STRICT",                                                         # lever audit
 ]
 

@@ -267,8 +267,12 @@ class DSparkTail:
         # the same one Stage builds its Blocks in: the dtype decides what the bare torch.empty
         # parameters and the kv_cache zeros come out as, the device keeps them off the host.
         with torch.device(self.device), M.set_dtype(self.dtype):
+            block_cls = (stage._hybrid_draft_class(M.DSparkBlock)
+                         if getattr(stage, "_expert_cache", None) is not None else M.DSparkBlock)
             self.mtp = torch.nn.ModuleList(
-                [M.DSparkBlock(a.n_layers + k, a) for k in range(a.n_mtp_layers)])
+                [block_cls(a.n_layers + k, a) for k in range(a.n_mtp_layers)])
+        if getattr(stage, "_expert_cache", None) is not None:
+            stage._register_hybrid_draft(self)
         for blk in self.mtp:
             blk.embed = stage.embed_tokens        # registered submodules, not plain attributes --
             blk.head = stage.lm_head              # hence ALIAS_KEYS in every state_dict below
@@ -825,7 +829,8 @@ def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
     # here for the same reason V4_DSPARK_FAST is — the tail is built long after the startup lever
     # audit, so this is the first moment the rebind is knowable.
     import v4_dspark_moe
-    took = v4_dspark_moe.install_drafter(tail)
+    took = (0 if getattr(stage, "_expert_cache", None) is not None else
+            v4_dspark_moe.install_drafter(tail))
     v4_levers.note("V4_DSPARK_MOE", took == len(tail.mtp) and took > 0)
     print(f"[dspark] V4_DSPARK_MOE requested={v4_dspark_moe.V4_DSPARK_MOE} "
           f"observed={took}/{len(tail.mtp)} drafter MoEs on the pair path",

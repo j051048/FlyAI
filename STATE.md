@@ -12,6 +12,25 @@ the PROVE primitives are now in; only PAY (c0mpute rails) and the live integrati
 
 Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these five, done right.
 
+## DeepSeek-V4 Dual-Resource & Expert Cache Track (11-Step Phased Sequence)
+
+The active development track transitions DeepSeek-V4-Flash from an all-resident GPU allocation to an opt-in, verifiable dual-resource (GPU + host RAM) placement and local expert cache. Execution follows strict implementation dependencies:
+
+| Step | Scope & Milestone | Status | Key Deliverables & Code |
+|------|-------------------|--------|-------------------------|
+| **1** | Baseline correctness & acceptance gates | ✅ **DONE** | [V4_BENCHMARK.md](docs/V4_BENCHMARK.md), `phase0/v4_benchmark.py`, target: 4×5090 ≥40, 6×5090 ≥30 tok/s |
+| **2** | Runtime metrics & signed receipts | ✅ **DONE** | [RUNTIME_METRICS.md](docs/RUNTIME_METRICS.md), `shard/runtime_metrics.py`, `shard/receipt.py` signature extensions |
+| **3** | GPU + RAM dual-resource placement contract | ✅ **DONE** | [RESOURCE_CONTRACT.md](docs/RESOURCE_CONTRACT.md), `shard/resources.py`, `probe.py` RAM/pinned/H2D probes, tail MTP budget |
+| **4** | Refactor V4 loader with dual weight pools | ✅ **DONE** | `engines/deepseek_v4/v4_stage.py`, `v4_expert_cache.py`: separate host RAM FP4 routed pool vs GPU resident params, strict checkpoint loading, expert cache slots, retain all-resident fallback |
+| **5** | Fixed-slot local GPU expert cache | ✅ **DONE** | `engines/deepseek_v4/v4_expert_cache.py`: FixedSlotCache, CacheLease locks, LFU decay eviction, atomic capacity fallback |
+| **6** | On-demand H2D DMA & kernel adaptation | ✅ **DONE** | `engines/deepseek_v4/v4_moe_grouped.py`, `v4_hybrid.py`: grouped_routed_sum slot gather with logical-id sort fold, async H2D copy, shared expert overlap |
+| **7** | Scheduler enforcement of dual-resource contract | ✅ **DONE** | `shard/scheduler.py`, `shard/plan.py`: Dual-resource bottleneck min(vram_cap, ram_cap), H2D latency bias, 4-card & 6-card tiered placement, heterogenous fat-node support, `tests/test_v4_scheduler_plan.py` |
+| **8** | Phase 1 hardware acceptance (4-node & 6-node) | ✅ **DONE** | `phase0/v4_acceptance.py`, `tests/test_v4_acceptance.py`: 6-node vs 4-node WAN/DMA tradeoff, 5 stress scenarios, CLI report |
+| **9** | Chunked prefill & controlled prefetching | ✅ **DONE** | `engines/deepseek_v4/v4_chunked_prefill.py`, `tests/test_v4_chunked_prefill.py`: PrefillChunkState, ChunkedPrefillExecutor, ControlledPrefetcher |
+| **10** | V4-dedicated KV bounds & paging | ✅ **DONE** | `engines/deepseek_v4/v4_kv_paging.py`, `tests/test_v4_kv_paging.py`: V4DualTierKVPool, KVPage, SlidingWindowKVCache, bounded VRAM |
+| **11** | Post-speedline capability expansion | ✅ **DONE** | `engines/deepseek_v4/v4_expansion.py`, `tests/test_v4_expansion.py`: CPU fallback parity, cross-node replicas, cluster policy |
+
+
 ## 2026-06-24 (session 4) — the REAL WARM libp2p number (parity) + the full stack over the real transport
 Fresh N=4 scattered US ring (MN·IL·MI·TX, 4 distinct 4090 hosts, even 9-layer split) + a 48GB WA hot
 spare. Closes the libp2p OPEN THREAD — the warm, realistic libp2p speed (the 2.86 cold floor was

@@ -16,6 +16,10 @@ class JoinedNode:
     node_id: str
     vram_gb: float
     rtt_ms: dict  # node_id -> measured rtt to other nodes
+    ram_gb: float = 0.0              # Host RAM (GB)
+    pinnable_ram_gb: float = 0.0     # Pinned RAM headroom (GB)
+    h2d_gbps: float = 20.0           # Measured H2D PCIe bandwidth (GB/s)
+    gpu_model: str = "rtx_5090"
 
 
 def _distribute(total: int, caps: list[tuple[str, int]]) -> dict[str, int]:
@@ -64,37 +68,64 @@ class Scheduler:
         return {nid: max(0, int((n.vram_gb - headroom_gb - boundary_gb) / per))
                 for nid, n in self.nodes.items()}
 
-    def plan(self, gb_per_layer: float, kv_gb_per_layer: float = 0.0,
-             headroom_gb: float = 2.0, boundary_gb: float = 1.0) -> dict:
-        """ONE joint placement: pipeline order and contiguous blocks decided together.
+    def capacities_dual(self, gb_per_layer_vram: float, gb_per_layer_host: float = 0.0,
+                        kv_gb_per_layer: float = 0.0, headroom_gb: float = 2.0,
+                        boundary_gb: float = 1.0) -> dict[str, int]:
+        """Dual-resource capacity: takes the minimum of VRAM and Host RAM (or pinned RAM) limits."""
+        vram_caps = self.capacities(gb_per_layer_vram, kv_gb_per_layer, headroom_gb, boundary_gb)
+        if gb_per_layer_host <= 0.0:
+            return vram_caps
+        caps = {}
+        for nid, n in self.nodes.items():
+            v_cap = vram_caps[nid]
+            avail_ram = n.pinnable_ram_gb if n.pinnable_ram_gb > 0 else n.ram_gb
+            r_cap = max(0, int(avail_ram / gb_per_layer_host)) if avail_ram > 0 else v_cap
+            caps[nid] = min(v_cap, r_cap)
+        return caps
 
-        allocate() + topology() compose incorrectly as a pair: allocate() hands the coordinator
-        a block and lays ranges fat-first while topology() excludes the coordinator and orders by
-        latency, so zipping the two can put layers [20,30) BEFORE [0,20) in the pipeline. This
-        delegates to shard.plan.plan_ring, which picks the head (the coordinator runs ON it), the
-        ring order and the per-stage blocks in one solve; the returned stages tile
-        [0, total_layers) IN ring order. `boundary_gb` maps to the head/tail reserves (embed on
-        the head, lm_head on the tail); node ids double as subnet keys because this facade carries
-        no subnet info (no co-location constraint). Raises ValueError when the joined pool can't
-        hold the model — the same contract as allocate()."""
-        from .plan import plan_ring
+    def plan(self, gb_per_layer: float | None = None, kv_gb_per_layer: float = 0.0,
+             headroom_gb: float = 2.0, boundary_gb: float = 1.0,
+             model_id: str | None = None, placement: str = "gpu") -> dict:
+        """ONE joint placement: pipeline order and contiguous blocks decided together."""
+        from .plan import plan_ring, profile_for
         ids = list(self.nodes)
-        nodes = [{"id": nid, "free_vram_mb": self.nodes[nid].vram_gb * 1024.0, "subnet": nid}
-                 for nid in ids]
+        nodes = [{
+            "id": nid,
+            "free_vram_mb": self.nodes[nid].vram_gb * 1024.0,
+            "free_ram_mb": self.nodes[nid].ram_gb * 1024.0 if self.nodes[nid].ram_gb else None,
+            "pinnable_ram_mb": self.nodes[nid].pinnable_ram_gb * 1024.0 if self.nodes[nid].pinnable_ram_gb else None,
+            "h2d_gbps": self.nodes[nid].h2d_gbps,
+            "subnet": nid,
+        } for nid in ids]
         rtt = [[0.0 if a == b else float(self.nodes[a].rtt_ms[b]) for b in ids] for a in ids]
-        model = {"n_layers": self.total_layers,
-                 "layer_vram_mb": gb_per_layer * 1024.0,
-                 "kv_mb_per_layer": kv_gb_per_layer * 1024.0,
-                 "layer_ms_base": 0.65,
-                 "reserve_mb": headroom_gb * 1024.0,
-                 "head_reserve_mb": boundary_gb * 1024.0,
-                 "tail_reserve_mb": boundary_gb * 1024.0,
-                 "cap_layers": self.total_layers,       # no proven-density ceiling in this facade
-                 "head_layer_ms_mult": 1.0}
+
+        if model_id is not None or self.model in ("deepseek-ai/DeepSeek-V4-Flash-0731", "v4"):
+            mid = model_id or "deepseek-ai/DeepSeek-V4-Flash-0731"
+            base_model = profile_for(mid)
+            if placement == "ram":
+                base_model = profile_for("deepseek-ai/DeepSeek-V4-Flash-0731-Dual")
+            elif placement == "gpu":
+                base_model = profile_for("deepseek-ai/DeepSeek-V4-Flash-0731-Resident")
+            model = dict(base_model)
+            if gb_per_layer is not None:
+                model["layer_vram_mb"] = gb_per_layer * 1024.0
+        else:
+            gb_val = gb_per_layer if gb_per_layer is not None else 1.0
+            model = {
+                "n_layers": self.total_layers,
+                "layer_vram_mb": gb_val * 1024.0,
+                "kv_mb_per_layer": kv_gb_per_layer * 1024.0,
+                "layer_ms_base": 0.65,
+                "reserve_mb": headroom_gb * 1024.0,
+                "head_reserve_mb": boundary_gb * 1024.0,
+                "tail_reserve_mb": boundary_gb * 1024.0,
+                "cap_layers": self.total_layers,
+                "head_layer_ms_mult": 1.0,
+            }
         out = plan_ring(nodes, rtt, model)
         if out is None:
-            raise ValueError(f"insufficient VRAM: pool can't hold {self.total_layers} layers "
-                             f"at {gb_per_layer:.2f} GB/layer")
+            raise ValueError(f"insufficient resources: pool cannot hold {self.total_layers} layers "
+                             f"under placement policy {placement!r}")
         return out
 
     def allocate(self, gb_per_layer: float, kv_gb_per_layer: float = 0.0,

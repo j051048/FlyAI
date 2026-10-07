@@ -18,6 +18,7 @@ COUNTS = ("routed_entries", "resident_hits", "dma_misses", "dma_bytes",
 KV_FIELDS = ("gpu_bytes", "host_bytes", "gpu_peak_bytes", "host_peak_bytes")
 GPU_FIELDS = ("scope", "allocated_bytes", "reserved_bytes", "allocated_peak_bytes",
               "reserved_peak_bytes")
+GPU_MODES = ("gpu_resident", "gpu_expert_cache")
 _GPU_OBSERVERS = {}
 
 
@@ -42,10 +43,14 @@ def validate_runtime_metrics(value):
     keys = {"schema", "mode", "work", "totals", "resident_hit_rate", "kv"}
     if isinstance(value, dict) and "gpu_memory" in value:
         keys.add("gpu_memory")
+    if isinstance(value, dict) and "expert_prefetch" in value:
+        keys.add("expert_prefetch")
+    if isinstance(value, dict) and "expert_cache" in value:
+        keys.add("expert_cache")
     _keys(value, keys, "runtime_metrics")
     if value["schema"] != SCHEMA:
         raise ValueError(f"unknown runtime metrics schema {value['schema']!r}")
-    if value["mode"] not in ("gpu_resident", "reference_cpu"):
+    if value["mode"] not in (*GPU_MODES, "reference_cpu"):
         raise ValueError(f"unknown runtime residency mode {value['mode']!r}")
     _keys(value["work"], ROLES, "work")
     total = _counts()
@@ -60,7 +65,7 @@ def validate_runtime_metrics(value):
             if c["routed_entries"] != sum(c[k] for k in
                     ("resident_hits", "dma_misses", "cpu_misses", "reference_routes")):
                 raise ValueError("expert route counts do not share one denominator")
-            if value["mode"] == "gpu_resident" and c["reference_routes"]:
+            if value["mode"] in GPU_MODES and c["reference_routes"]:
                 raise ValueError("GPU residency cannot claim unclassified CPU reference routes")
             if value["mode"] == "reference_cpu" and any(c[k] for k in
                     ("resident_hits", "dma_misses", "dma_bytes", "dma_wait_ms", "cpu_misses")):
@@ -82,7 +87,7 @@ def validate_runtime_metrics(value):
         if value["kv"][f"{tier}_peak_bytes"] < value["kv"][f"{tier}_bytes"]:
             raise ValueError("KV peak is smaller than current allocation")
     if "gpu_memory" in value:
-        if value["mode"] != "gpu_resident":
+        if value["mode"] not in GPU_MODES:
             raise ValueError("CPU reference metrics cannot claim CUDA allocator observations")
         g = value["gpu_memory"]
         _keys(g, GPU_FIELDS, "gpu_memory")
@@ -94,6 +99,30 @@ def validate_runtime_metrics(value):
                 g["reserved_peak_bytes"] < g["reserved_bytes"] or \
                 g["allocated_bytes"] > g["reserved_bytes"]:
             raise ValueError("inconsistent GPU allocator observations")
+    if "expert_prefetch" in value:
+        p = value["expert_prefetch"]
+        _keys(p, ("dma_bytes", "dma_wait_ms"), "expert_prefetch")
+        _nonnegative(p["dma_bytes"], "expert_prefetch.dma_bytes")
+        _nonnegative(p["dma_wait_ms"], "expert_prefetch.dma_wait_ms", real=True)
+        if value["mode"] == "reference_cpu" and any(p.values()):
+            raise ValueError("CPU reference execution cannot claim prefetched DMA")
+    if "expert_cache" in value:
+        cache = value["expert_cache"]
+        _keys(cache, ("device", "cache_bytes", "host_experts_bytes", "pinned_host_experts_bytes",
+                      "slots_per_pool"), "expert_cache")
+        if not isinstance(cache["device"], str) or not (
+                cache["device"].startswith("cuda") if value["mode"] in GPU_MODES else cache["device"] == "cpu"):
+            raise ValueError("expert cache device disagrees with runtime execution")
+        for key in ("cache_bytes", "host_experts_bytes", "pinned_host_experts_bytes"):
+            _nonnegative(cache[key], f"expert_cache.{key}")
+        if cache["pinned_host_experts_bytes"] > cache["host_experts_bytes"]:
+            raise ValueError("pinned expert bytes exceed the host pool")
+        if value["mode"] == "gpu_expert_cache" and cache["pinned_host_experts_bytes"] != cache["host_experts_bytes"]:
+            raise ValueError("GPU expert caching requires a fully pinned canonical host pool")
+        slots = cache["slots_per_pool"]
+        if not isinstance(slots, dict) or any(not isinstance(k, str) or type(v) is not int or v <= 0
+                                             for k, v in slots.items()):
+            raise ValueError("expert cache slots must name positive per-pool capacities")
     return deepcopy(value)
 
 
@@ -135,12 +164,15 @@ class RuntimeMetrics:
     They are not per-stage ownership estimates or simulated hardware figures.
     """
 
-    def __init__(self, device, *, torch_module=None):
+    def __init__(self, device, *, torch_module=None, mode=None):
         self.device = str(device)
-        self.mode = "gpu_resident" if self.device.startswith("cuda") else "reference_cpu"
+        self.mode = mode or ("gpu_resident" if self.device.startswith("cuda") else "reference_cpu")
+        if self.mode not in (*GPU_MODES, "reference_cpu") or \
+                (self.mode in GPU_MODES) != self.device.startswith("cuda"):
+            raise ValueError("runtime metrics residency mode disagrees with its device")
         self.torch = torch_module
         self._gpu_owners = None
-        if self.mode == "gpu_resident" and self.torch is not None:
+        if self.mode in GPU_MODES and self.torch is not None:
             # An unindexed CUDA device means the CURRENT GPU, which may be
             # nonzero in a multi-GPU process. Share the same owner set as its
             # explicit cuda:N spelling, and keep allocator reads on that GPU.
@@ -161,6 +193,8 @@ class RuntimeMetrics:
         self.work = {role: {phase: _counts() for phase in PHASES} for role in ROLES}
         self.kv = {key: 0 for key in KV_FIELDS}
         self.gpu_memory = None
+        self.expert_prefetch = None
+        self.expert_cache = None
         self._gpu_peak_exclusive = self._gpu_owners is not None and len(self._gpu_owners) == 1
         if self._gpu_peak_exclusive:
             # Host allocator metadata, no synchronize() and no per-token resets.
@@ -173,7 +207,46 @@ class RuntimeMetrics:
             raise ValueError("unknown runtime work role/phase")
         c = self.work[role][phase]
         c["routed_entries"] += entries
-        c["resident_hits" if self.mode == "gpu_resident" else "reference_routes"] += entries
+        c["resident_hits" if self.mode in GPU_MODES else "reference_routes"] += entries
+
+    def expert_routes(self, counts, *, role="main", phase="decode"):
+        """Actual demand paths from a local cache; counts share one route denominator."""
+        if role not in ROLES or phase not in PHASES or set(counts) != set(COUNTS):
+            raise ValueError("unknown runtime work role/phase or incomplete route counts")
+        for key in COUNTS:
+            _nonnegative(counts[key], key, real=key == "dma_wait_ms")
+        if counts["routed_entries"] != sum(counts[k] for k in
+                ("resident_hits", "dma_misses", "cpu_misses", "reference_routes")):
+            raise ValueError("expert route counts do not share one denominator")
+        if self.mode == "reference_cpu" and any(counts[k] for k in
+                ("resident_hits", "dma_misses", "dma_bytes", "dma_wait_ms", "cpu_misses")):
+            raise ValueError("CPU emulation cannot claim GPU hits or DMA")
+        if self.mode in GPU_MODES and counts["reference_routes"]:
+            raise ValueError("GPU caching cannot claim reference execution")
+        for key, value in counts.items():
+            self.work[role][phase][key] += value
+
+    def dma_wait(self, elapsed_ms, *, role="main", phase="decode", prefetch=False):
+        """CUDA consumer wait measured at the job barrier, not copy duration."""
+        _nonnegative(elapsed_ms, "dma_wait_ms", real=True)
+        if self.mode not in GPU_MODES:
+            raise ValueError("CPU reference execution cannot measure a CUDA wait")
+        if prefetch:
+            self.prefetch(0, elapsed_ms)
+        else:
+            if role not in ROLES or phase not in PHASES:
+                raise ValueError("unknown runtime work role/phase")
+            self.work[role][phase]["dma_wait_ms"] += elapsed_ms
+
+    def prefetch(self, dma_bytes, elapsed_ms=0.0):
+        _nonnegative(dma_bytes, "prefetch DMA bytes")
+        _nonnegative(elapsed_ms, "prefetch DMA wait", real=True)
+        if self.mode not in GPU_MODES:
+            raise ValueError("CPU reference execution cannot claim prefetched DMA")
+        if self.expert_prefetch is None:
+            self.expert_prefetch = {"dma_bytes": 0, "dma_wait_ms": 0.0}
+        self.expert_prefetch["dma_bytes"] += dma_bytes
+        self.expert_prefetch["dma_wait_ms"] += elapsed_ms
 
     def sample_kv(self, tensors):
         sizes = storage_residency(tensors)
@@ -207,4 +280,8 @@ class RuntimeMetrics:
                 if totals["routed_entries"] else None, "kv": self.kv}
         if self.gpu_memory is not None:
             body["gpu_memory"] = self.gpu_memory
+        if self.expert_prefetch is not None:
+            body["expert_prefetch"] = self.expert_prefetch
+        if self.expert_cache is not None:
+            body["expert_cache"] = self.expert_cache
         return validate_runtime_metrics(body)

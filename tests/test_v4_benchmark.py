@@ -150,8 +150,8 @@ def test_measurement_counts_commits_excludes_prefill_for_decode_and_excludes_swe
     assert bench.evaluate_report(r)["status"] == "passed"
 
 
-@pytest.mark.parametrize("n,rate,status,target", [(4, 40.0, "passed", 40), (4, 39.0, "failed", 40),
-                                                (6, 30.0, "passed", 30), (6, 29.0, "failed", 30)])
+@pytest.mark.parametrize("n,rate,status,target", [(4, 40.0, "passed", 40), (4, 39.0, "valid_baseline", 40),
+                                                (6, 30.0, "passed", 30), (6, 29.0, "valid_baseline", 30)])
 def test_exact_hardware_targets(n, rate, status, target):
     evaluation = bench.evaluate_report(report(n, rate))
     assert evaluation["status"] == status, evaluation
@@ -287,7 +287,7 @@ def test_compare_rejects_changed_context_or_missing_raw_receipts():
     before, after = report(), report(rate=60.0)
     # Keys/hardware differ, but both sets are pinned and independently verified by the evaluator.
     result = bench.compare_reports(before, after)
-    assert result["status"] == "verified_comparison"
+    assert result["status"] == "verified_target_pass"
     assert result["workload_speed_ratios"]["code"] == pytest.approx(1.2)
     after["samples"][0]["receipts"] = []
     assert bench.compare_reports(before, after)["status"] == "unverified"

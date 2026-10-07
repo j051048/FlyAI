@@ -123,7 +123,7 @@ def test_engine_modules_accounts_for_every_v4_module_on_disk():
                   # measurement/pricing tools, never imported by a serving process: the workload-class
                   # acceptance harness, the round-replay economics, and the discrete-event ring sim
                   "v4_ngram_accept.py", "v4_ngram_econ.py", "v4_pipe_sim.py",
-                  "v4_benchmark.py"}
+                  "v4_benchmark.py", "v4_acceptance.py"}
     unclassified = on_disk - set(VL.ENGINE_MODULES) - bench_only
     assert not unclassified, (
         f"{sorted(unclassified)} is neither in v4_levers.ENGINE_MODULES (scraped for levers, and the "
