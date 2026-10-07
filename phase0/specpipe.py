@@ -202,6 +202,11 @@ def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=Fal
                             if not direct: recv_msg(nxt_sock)     # wait downstream ack (relay only)
                         if not direct: send_msg(conn, "ok")       # ack predecessor (relay only)
                         continue
+                    if msg.get("op") == "abort":
+                        # P2-1 Early Abort: skip computing stale in-flight frames on divergence
+                        if nxt_sock:
+                            send_msg(nxt_sock, msg)
+                        continue
                     if msg.get("gather") is not None:      # tree: keep last round's accepted-path KV
                         gather_cache(cache, msg["gather"], dev)
                     elif msg.get("crop") is not None:      # linear: roll back the prior round's rejects
@@ -360,6 +365,11 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                             if not direct: recv_msg(nxt_sock)
                         if not direct: send_msg(conn, "ok")
                         continue
+                    if msg.get("op") == "abort":
+                        # P2-1: Early abort — skip computing stale divergence frames
+                        if nxt_sock:
+                            fwd_send(msg)
+                        continue
                     if msg["op"] == "receipt":           # job done: sign + accumulate down the ring
                         if RECEIPTS and signer is not None:
                             msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
@@ -497,6 +507,9 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                         signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                msg.get("job_id", "job"), parts["lo"], parts["hi"])
                     send_msg(ret, "ok"); continue
+                if msg.get("op") == "abort":
+                    # P2-1 Early Abort: Tail skips computing LM Head for aborted round
+                    continue
                 if msg["op"] == "receipt":                  # job done: sign + return the full ring's receipts
                     if RECEIPTS and signer is not None:
                         msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
@@ -820,6 +833,8 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
                 if ds[j] == r[j]: n += 1
                 else: break
             valid += 1; accepted += n
+            if hasattr(local_draft, "note_accepted"):
+                local_draft.note_accepted(n)
             if n == K:
                 out.extend(ds); pos += K; cur = ds[-1]
                 committed = ds
@@ -827,6 +842,12 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
                 committed = ds[:n] + [r[n]]
                 out.extend(committed); cur = r[n]; pos += n + 1
                 discard = len(inflight)                                # every chunk still in flight is stale
+                if discard > 0:
+                    try:
+                        # P2-1: Early abort signal to downstream stages
+                        send_msg(pipe_sock, {"op": "abort", "discard": discard})
+                    except Exception:
+                        pass
                 d_fetch()                                             # outstanding draft is stale -> drop it
                 dprefix = prompt_ids + out; send_pos = pos             # re-draft from the corrected prefix
                 d_request(dq(), K)                                    # re-prime from the corrected prefix

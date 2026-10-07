@@ -614,7 +614,12 @@ class HybridDrafter:
         (a fresh job builds a fresh HybridDrafter around the shared EAGLE singleton)."""
         self._eagle_off = True
 
+    def rearm(self):
+        """P1-3 Watchdog re-arm: re-enables EAGLE at job boundaries so transient step jitter does not latch forever."""
+        self._eagle_off = False
+
     def reset(self):
+        self.rearm()
         self.eagle.reset()
 
     def extend(self, tokens, auxes, base_pos):

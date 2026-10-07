@@ -25,6 +25,9 @@ Interface mirrors the async draft-socket the pipelined coordinator already speak
 """
 
 
+import os
+
+
 class NgramDrafter:
     """Incrementally-indexed prompt-lookup. `table` maps an ng-token suffix -> the latest
     earlier position whose continuation we copy. The index is grown forward as the committed
@@ -34,26 +37,69 @@ class NgramDrafter:
     dict lookup, so it stays ~O(1) per round even at 100k context, fully hidden behind the
     WAN verify."""
 
-    def __init__(self, ng=3, max_ext=64, max_cand=48, margin=256, min_match=1):
+    def __init__(self, ng=3, max_ext=64, max_cand=48, margin=256, min_match=1, adaptive=None):
         self.ng = ng                 # anchor suffix length to index on (the lookup key)
         self.max_ext = max_ext       # cap how far back we extend a match (bounds per-round cost)
         self.max_cand = max_cand     # only weigh the most-recent N occurrences of an anchor
-        # `matched` (the HybridDrafter n-gram-vs-EAGLE router) requires best_len >= min_match: a bare
-        # ng-token anchor recurrence with ZERO preceding-context agreement is a coincidence on novel/
-        # reasoning text, and claiming it starved EAGLE of exactly the rounds it exists for (garbage
-        # n-gram draft -> accept 0 -> wasted traversal). min_match=0 restores the old any-anchor routing.
-        # The n-gram PROPOSAL itself is unchanged either way — only the routing signal moves.
         self.min_match = min_match
-        # only index positions older than `margin` from the end: the recent tail is the pipeline's
-        # SPECULATIVE region (in-flight drafts, rewritten on a divergence), so indexing it would
-        # create stale entries and force rebuilds. Everything older is committed + immutable, so the
-        # index only ever GROWS (no rebuild) and stays O(1)/round after the one-time prompt scan.
-        # margin must exceed the speculative lookahead (~2*depth*K); 256 covers depth<=8,K<=16.
-        self.margin = margin
+        
+        # P0-1: Adaptive margin handling to prevent index starvation on short context (<=256 tok).
+        # When margin is the default 256 or NGRAM_MARGIN is 'auto', dynamic derive min(cap, ctx // 4).
+        # Explicit non-default margin (like margin=64 in fake-ring regression suites) is preserved fixed.
+        env_margin = os.environ.get("NGRAM_MARGIN", "").strip().lower()
+        if env_margin:
+            if env_margin == "auto":
+                self.margin_cap = 256
+                self.adaptive = True
+            else:
+                try:
+                    self.margin_cap = int(env_margin)
+                    self.adaptive = False
+                except ValueError:
+                    self.margin_cap = margin
+                    self.adaptive = (adaptive if adaptive is not None else (margin == 256))
+        else:
+            self.margin_cap = margin
+            self.adaptive = (adaptive if adaptive is not None else (margin == 256))
+
+        self.margin = self.margin_cap
         self.indexed = 0             # committed positions < this are in `table`
         self.table = {}              # ng-token anchor -> LIST of continuation-start positions (chronological)
         self._pending = None         # snapshotted (ids, k) between request() and fetch()
         self.matched = False         # did the LAST propose() find a real longest-match? (HybridDrafter routing)
+        
+        # P1-1: Workload telemetry to quantify copy-only vs novel text efficacy
+        self.ngram_rounds = 0        # total propose rounds
+        self.ngram_silent = 0        # fallback placeholder rounds (no match)
+        self.ngram_matched = 0       # valid proposals
+        self.accepted_history = []   # feedback record of accepted tokens
+
+    def effective_margin(self, seq_len: int) -> int:
+        """Derive active margin from current sequence length to avoid table starvation."""
+        if not self.adaptive:
+            return self.margin_cap
+        if seq_len <= self.margin_cap:
+            return min(self.margin_cap, max(0, seq_len // 4))
+        return self.margin_cap
+
+    @property
+    def silent_ratio(self) -> float:
+        return self.ngram_silent / max(1, self.ngram_rounds)
+
+    def note_accepted(self, count: int):
+        """Record accepted token count from verification round."""
+        self.accepted_history.append(int(count))
+
+    def metrics(self) -> dict:
+        return {
+            "ngram_rounds": self.ngram_rounds,
+            "ngram_silent": self.ngram_silent,
+            "ngram_matched": self.ngram_matched,
+            "silent_ratio": round(self.silent_ratio, 4),
+            "table_entries": len(self.table),
+            "mean_accept": (round(sum(self.accepted_history) / max(1, len(self.accepted_history)), 3)
+                            if self.accepted_history else 0.0),
+        }
 
     # ---- async-draft-socket shim ------------------------------------------------
     def request(self, ids, k):
@@ -68,11 +114,9 @@ class NgramDrafter:
 
     # ---- the drafter ------------------------------------------------------------
     def _sync(self, seq):
-        """Index newly-committed anchors only — positions in [indexed, len-margin). The recent
-        `margin` tail is the speculative region (rewritten on a divergence) so we never index it;
-        everything older is immutable. So the table only grows: O(committed prompt) once on the
-        first call, then ~K positions/round. No prefix compare, no rebuild — O(1)/round at any ctx."""
-        stable = len(seq) - self.margin
+        """Index newly-committed anchors only — positions in [indexed, len-eff_margin)."""
+        eff_margin = self.effective_margin(len(seq))
+        stable = len(seq) - eff_margin
         if stable <= self.indexed:
             return
         ng, tbl = self.ng, self.table
@@ -84,10 +128,14 @@ class NgramDrafter:
         self._sync(seq)
         n = len(seq)
         self.matched = False                     # default: no real match (HybridDrafter -> EAGLE on a miss)
+        self.ngram_rounds += 1
+
         if n < self.ng:                          # not enough context yet -> plain decode
+            self.ngram_silent += 1
             return [seq[-1] if seq else 0] * k
         cands = self.table.get(tuple(seq[n - self.ng:n]))
         if not cands:                            # the suffix never occurred in committed text -> plain decode
+            self.ngram_silent += 1
             return [seq[-1]] * k
         # LONGEST-MATCH: among all earlier occurrences of the anchor, pick the one whose preceding
         # context matches the current position the longest -> at large context this disambiguates
@@ -105,8 +153,10 @@ class NgramDrafter:
                 if L == me:
                     break
         if best_p is None:
+            self.ngram_silent += 1
             return [seq[-1]] * k
         self.matched = best_len >= self.min_match   # real longest-match -> draftable (see min_match)
+        self.ngram_matched += 1
         cont = seq[best_p:best_p + k]
         if len(cont) < k:                        # ran off the end -> pad (pads get rejected, harmless)
             cont = cont + [cont[-1] if cont else seq[-1]] * (k - len(cont))

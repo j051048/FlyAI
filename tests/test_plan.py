@@ -478,3 +478,26 @@ def test_k3_plans_identically_through_the_model_id_seam():
                        input=json.dumps({"nodes": nodes, "rtt": rtt, "model": "no/such-model"}),
                        capture_output=True, text=True, cwd=REPO, timeout=120)
     assert r.returncode != 0 and "no engine profile" in json.loads(r.stdout)["error"]
+
+
+def test_plan_rejects_over_sharding_when_compact_feasible():
+    """P1-4: When a 10-node pool is provided, the planner must NOT produce a 10-stage ring
+    when a compact <=6-stage ring is feasible, preventing idle nodes and WAN latency buildup."""
+    nodes, rtt = _pool(10, free_gb=32.0, rtt_ms=25.0)  # 10 fat nodes
+    plan = plan_ring(nodes, rtt)
+    assert plan is not None
+    # 62 layers fits in 5-6 cards (each 12-13 layers). It must NOT expand to 10 stages!
+    assert plan["k"] <= 6, f"Planner over-sharded to {plan['k']} stages on a 10-node pool!"
+    assert len(plan["dropped"]) >= 4, "Planner did not drop unnecessary surplus nodes"
+
+
+def test_plan_recommends_in_region_coordinator():
+    """P2-2: Verify coordinator placement selects closest node to head/tail."""
+    nodes, rtt = _pool(6, free_gb=32.0, rtt_ms=10.0)
+    plan = plan_ring(nodes, rtt)
+    assert plan is not None
+    assert "coordinator_placement" in plan
+    cp = plan["coordinator_placement"]
+    assert "preferred_host" in cp
+    assert cp["min_roundtrip_ms"] >= 0.0
+    assert cp["in_region"] is True

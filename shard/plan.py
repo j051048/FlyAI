@@ -451,6 +451,9 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
         extra["boundary_in"] = int(privacy.get("boundary_in", 0))
         extra["boundary_out"] = int(privacy.get("boundary_out", 0))
 
+    if "max_stages" in m:
+        extra["max_stages"] = int(m["max_stages"])
+
     # 6) the TAIL stage also holds the final norm + lm_head (measured 1.15 GiB bf16 on
     #    M2.5 — a 13-layer tail OOM'd loading it on a 32 GB 5090, live 2026-07-09, while
     #    the same 13 layers warmed fine as a middle). The reserve applies to WHICHEVER
@@ -532,6 +535,21 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     if pin:
         out["privacy"] = {"boundary_in": extra["boundary_in"], "boundary_out": extra["boundary_out"],
                           "boundary_stages": [ids[i] for i in spec["order"] if i in boundary]}
+
+    # P2-2: Automatic in-region coordinator placement selection
+    tail_stage_idx = spec["order"][-1]
+    best_c_id = None
+    min_c_rtt = float("inf")
+    for idx, node in enumerate(nodes):
+        c_rtt = rtt[idx][head] + rtt[tail_stage_idx][idx]
+        if c_rtt < min_c_rtt:
+            min_c_rtt = c_rtt
+            best_c_id = ids[idx]
+    out["coordinator_placement"] = {
+        "preferred_host": best_c_id,
+        "min_roundtrip_ms": round(min_c_rtt, 2),
+        "in_region": min_c_rtt < 35.0,
+    }
     return out
 
 

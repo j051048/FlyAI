@@ -339,7 +339,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 n_layers, layer_vram_mb, kv_mb_per_layer=0, slack=2, exclude=None, require=None,
                 up_mbps=None, prefill_bytes=0.0, decode_bytes=0.0, decode_steps=1,
                 prefill_chunks=1, prefill_layer_ms=None, relegate=True,
-                trusted=None, boundary_in=0, boundary_out=0):
+                trusted=None, boundary_in=0, boundary_out=0, max_stages=6):
     """The self-optimizer's pure core. From a candidate POOL, choose the subset + ring order +
     per-node layer split that MINIMIZES predicted request time, subject to:
       * VRAM feasibility — the chosen nodes must hold the whole model (+ KV),
@@ -596,10 +596,14 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                     found = (rank, order, alloc, k, step, pf)
         return found
 
-    kmax = k_min + slack
+    # P1-4: Reject over-sharding. Restrict ring width to max_stages (default 6) unless model requires more.
+    eff_max = max(k_min, int(max_stages) if max_stages is not None else 6)
+    kmax = min(k_min + slack, eff_max)
     best = _search(k_min, kmax)
-    if best is None:                                             # co-location can push the true minimum k above k_min+slack
-        best = _search(kmax + 1, len(usable))                    # -> widen rather than falsely report infeasible
+    if best is None and kmax < len(usable):                      # co-location can push the true minimum k above k_min+slack
+        best = _search(kmax + 1, min(eff_max, len(usable)))      # -> widen up to eff_max first
+    if best is None and eff_max < len(usable):
+        best = _search(eff_max + 1, len(usable))                 # ultimate fallback if pool truly needs wider ring
     if best is None:
         return None
     rank, order, alloc, k, step, pf = best

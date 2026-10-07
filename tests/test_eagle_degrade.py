@@ -133,3 +133,15 @@ def test_l1_inert_without_eagle(monkeypatch):
     assert res["output_ids"] == T[P:P + len(res["output_ids"])]
     assert not res["eagle_degraded"]
     assert ring.backlog >= 1, "plain-path pipelining regressed"
+
+
+def test_l1_rearm_per_job():
+    """P1-3 Watchdog re-arm: verify that a degraded drafter is re-armed at job boundary/reset."""
+    hyb, _ = _hybrid()
+    # Force degrade
+    hyb.disable_eagle()
+    assert hyb._eagle_off is True
+
+    # Re-arm via reset() or explicit rearm()
+    hyb.reset()
+    assert hyb._eagle_off is False, "EAGLE did not re-arm after reset()"
