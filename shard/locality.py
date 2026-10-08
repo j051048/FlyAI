@@ -6,6 +6,97 @@ import time
 UNREACHABLE = 9000.0
 
 
+def shortlist_candidates(nodes, model, policy=None, measurements=None, *, now=None):
+    """O(N log N + E) inventory pass BEFORE dense solver adaptation, hard bounded.
+
+    Retain small capacity covers from regional groups plus high-capacity global
+    offers. This is a heuristic frontier, never proof that omitted nodes cannot
+    form a ring. Callers may widen the explicit bound (maximum 256) or retry a
+    region; the network service need not measure every pair in the open pool.
+    """
+    policy = {"mode": policy} if isinstance(policy, str) else dict(policy or {})
+    bound = policy.get("max_candidates", 32)
+    if type(bound) is not int or not 1 <= bound <= 256:
+        raise ValueError("max_candidates must be an integer in [1,256]")
+    report = {"total_nodes": len(nodes), "examined_nodes": min(len(nodes), bound),
+              "max_candidates": bound, "truncated": len(nodes) > bound,
+              "method": "bounded capacity/locality frontier; no global optimality claim"}
+    if len(nodes) <= bound:
+        return list(range(len(nodes))), report
+    now = time.time() if now is None else timestamp(now)
+    m = model or {}
+    depth = int(m.get("n_layers", 43))
+    per = float(m.get("layer_vram_mb", 1)) + float(m.get("kv_mb_per_layer", 0))
+    def capacity(index):
+        node = nodes[index]
+        lv = (float(node["layer_vram_mb"]) + float(m.get("kv_mb_per_layer", 0))
+              if node.get("layer_vram_mb") else per)
+        raw = max(0, float(node["free_vram_mb"]) - float(m.get("reserve_mb", 0)))
+        cap = int(raw // max(lv, 1e-9))
+        if node.get("cap_layers") is not None:
+            cap = min(cap, int(node["cap_layers"]))
+        else:
+            ceiling = int(m.get("cap_layers", depth))
+            if node.get("total_vram_mb"):
+                ceiling = max(0, round(ceiling * float(node["total_vram_mb"]) / 32768))
+            cap = min(cap, ceiling)
+        if m.get("layer_host_ram_mb"):
+            ram, pin = node.get("free_ram_mb"), node.get("pinnable_ram_mb")
+            cap = min(cap, int(min(ram, pin) // m["layer_host_ram_mb"])) if ram is not None and pin is not None else 0
+        return max(0, cap)
+    caps = {i: capacity(i) for i in range(len(nodes))}
+    groups = {}
+    for i, node in enumerate(nodes):
+        region = node.get("region") or node.get("region_id")
+        groups.setdefault(region, []).append(i)
+    ordered = sorted(range(len(nodes)), key=lambda i: (-caps[i], float(nodes[i].get("layer_ms") or 1), str(nodes[i]["id"])))
+    chosen = []
+    def add(index):
+        if index not in chosen and len(chosen) < bound:
+            chosen.append(index)
+    target = policy.get("region")
+    regions = sorted(groups, key=lambda region: (region != target if target else False,
+        -sum(caps[i] for i in groups[region]), str(region)))
+    # Do not spend the entire frontier on a crowded, insufficient local group.
+    # Regional covers get at most half the budget; expansion keeps global offers.
+    for region in regions:
+        covered = 0
+        for i in sorted(groups[region], key=lambda i: (-caps[i], str(nodes[i]["id"]))):
+            if len(chosen) >= max(1, bound // 2):
+                break
+            add(i); covered += caps[i]
+            if covered >= depth:
+                break
+        if len(chosen) >= max(1, bound // 2):
+            break
+    anchor = policy.get("anchor_id")
+    if anchor and measurements:
+        proximity = {}
+        for row in measurements.get("edges", []):
+            if row.get("src") != anchor:
+                continue
+            try:
+                age = now - timestamp(row["measured_at"])
+                if -30 <= age <= number(row["ttl_s"], "ttl_s", minimum=1e-9):
+                    proximity[row["dst"]] = number(row["rtt_ms"], "rtt_ms")
+            except (KeyError, ValueError, TypeError):
+                continue  # Full snapshot validation follows on the bounded frontier.
+        for i in sorted(range(len(nodes)), key=lambda i: proximity.get(nodes[i]["id"], math.inf)):
+            if nodes[i]["id"] in proximity and len(chosen) < bound * 3 // 4:
+                add(i)
+    # Trusted candidates can supply the two privacy boundary roles. Preserve
+    # only a bounded handful, not unbounded extra cover after the hard cap.
+    for i in ordered:
+        if (nodes[i].get("trusted") is True or nodes[i].get("staked") is True) and len(chosen) < bound * 3 // 4:
+            add(i)
+    for i in ordered:
+        add(i)
+        if len(chosen) == bound:
+            break
+    report["examined_nodes"] = len(chosen)
+    return chosen, report
+
+
 def number(value, name, *, minimum=0):
     if type(value) not in (int, float) or not math.isfinite(value) or value < minimum:
         raise ValueError(f"{name} must be finite and >= {minimum}")
@@ -100,7 +191,8 @@ def candidate_tiers(nodes, snapshot, policy=None):
             return True
         return all((x, y) in edges and edges[x, y]["rtt_ms"] <= limit
                    for x, y in ((a, b), (b, a)))
-    if mode == "global" or (not any(regions.values()) and anchor is None and not requested_region):
+    fresh_mesh = any(row.get("source") == "fresh_sparse" for row in edges.values())
+    if mode == "global" or (not any(regions.values()) and anchor is None and not requested_region and not policy and not fresh_mesh):
         return [{"name": "global", "pools": [ids], "legacy": not policy,
                  "reason": "global_policy" if mode == "global" else "locality_metadata_unavailable"}]
     region_names = [requested_region] if requested_region else sorted({r for r in regions.values() if r})

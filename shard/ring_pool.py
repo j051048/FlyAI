@@ -51,6 +51,8 @@ class Ring:
     lease_expires_at: float = 0.0
     reason: str = "planned"
     on_stopped: object = None
+    guard_stop: object = field(default_factory=threading.Event, repr=False)
+    guard_thread: object = field(default=None, repr=False)
 
 
 @dataclass
@@ -65,11 +67,15 @@ class RingBinding:
 
 
 class RingPool:
-    def __init__(self):
+    def __init__(self, *, max_rings=256, max_history=256):
+        if any(type(value) is not int or value < 1 for value in (max_rings, max_history)):
+            raise ValueError("ring capacity and history must be positive integers")
         self._lock = threading.RLock()
         self._rings = {}
         self._aliases = {}
         self._accepting = True
+        self.max_rings = max_rings
+        self.max_history = max_history
 
     def add(self, ring_id, backend, *, model_id, cohort_id, gpu_uuids, region=None, on_stopped=None):
         if not isinstance(ring_id, str) or not ring_id or len(ring_id) > 128:
@@ -84,11 +90,22 @@ class RingPool:
         if region is not None and (not isinstance(region, str) or not region):
             raise ValueError("region must be a nonempty string or unknown")
         with self._lock:
-            if not self._accepting or ring_id in self._rings:
-                raise ValueError("pool is closed or ring_id already registered")
+            self._prune_history()
+            live = sum(r.state != RingState.STOPPED for r in self._rings.values())
+            if not self._accepting or ring_id in self._rings or live >= self.max_rings:
+                raise ValueError("pool is closed, ring_id already registered, or live ring capacity reached")
+            if any(r.backend is backend and r.state != RingState.STOPPED for r in self._rings.values()):
+                raise ValueError("one backend connection owner cannot belong to multiple rings")
             ring = Ring(ring_id, backend, model_id, cohort_id, ids, region, on_stopped=on_stopped)
             self._rings[ring_id] = ring
             return ring
+
+    def _prune_history(self):
+        stopped = [r.ring_id for r in self._rings.values() if r.state == RingState.STOPPED]
+        for ring_id in stopped[:max(0, len(stopped) - self.max_history)]:
+            # Jobs/bindings retain their own object and tokenizer. Removing lookup
+            # history cannot mutate or redirect a completed client's SSE resume.
+            self._rings.pop(ring_id, None)
 
     def _assert_guards(self, ring):
         if not ring.guards:
@@ -116,7 +133,6 @@ class RingPool:
                 raise RingUnavailable("only a planned ring can reserve resources")
             ring.guards = tuple(lease_guards)
             try:
-                self._assert_guards(ring)
                 for other in self._rings.values():
                     if other is ring or other.state == RingState.PLANNED:
                         continue
@@ -127,28 +143,51 @@ class RingPool:
             except Exception:
                 ring.guards = ()
                 raise
-            ring.state, ring.reason = RingState.RESERVED, "committed_leases"
+            ring.state, ring.reason = RingState.RESERVED, "verifying_committed_leases"
+        try:
+            self._assert_guards(ring)  # remote RPC never holds the global pool lock
+            with self._lock:
+                if ring.state != RingState.RESERVED:
+                    raise RingUnavailable("reservation was drained during verification")
+                ring.reason = "committed_leases"
+                self._start_guard_monitor(ring)
             return ring
+        except Exception:
+            with self._lock:
+                if ring.state == RingState.RESERVED:
+                    ring.state, ring.reason, ring.guards = RingState.PLANNED, "reservation_rejected", ()
+            raise
 
     def mark_loading(self, ring_id):
         with self._lock:
             ring = self._rings[ring_id]
             if ring.state != RingState.RESERVED:
                 raise RingUnavailable("loading requires committed reservations")
-            self._assert_guards(ring)
+        self._assert_guards(ring)
+        with self._lock:
+            if ring.state != RingState.RESERVED:
+                raise RingUnavailable("reservation changed during loading verification")
             ring.state, ring.reason = RingState.LOADING, "loading"
 
     def _begin(self, ring, work_id):
-        self._assert_guards(ring)
         works = []
         try:
+            self._assert_guards(ring)
             for guard in ring.guards:
                 works.append((guard, guard.begin_work(work_id)))
-            ring.local_work += 1
             return works
         except Exception:
+            cleanup_errors = []
             for guard, work in reversed(works):
-                guard.end_work(work)
+                try:
+                    guard.end_work(work)
+                except Exception as error:
+                    cleanup_errors.append(error)
+            if cleanup_errors:
+                self.fail(ring.ring_id, "partial_lease_work_cleanup_failed")
+            else:
+                self._finished_local(ring)
+                self.fail(ring.ring_id, "lease_work_begin_failed")
             raise
 
     def _end(self, ring, works):
@@ -163,6 +202,9 @@ class RingPool:
             # capacity whose node-local active-work record is still outstanding.
             self.fail(ring.ring_id, "lease_work_cleanup_failed")
             raise errors[0]
+        self._finished_local(ring)
+
+    def _finished_local(self, ring):
         with self._lock:
             ring.local_work -= 1
             if ring.state == RingState.DRAINING and ring.bound_jobs == 0 and ring.local_work == 0:
@@ -174,7 +216,8 @@ class RingPool:
             if ring.state not in (RingState.LOADING, RingState.WARMING) or ring.bound_jobs:
                 raise RingUnavailable("warmup requires an idle loaded ring")
             ring.state, ring.reason, ring.signed_warmup = RingState.WARMING, "signed_warmup", False
-            works = self._begin(ring, "warmup-" + str(time.time_ns()))
+            ring.local_work += 1
+        works = self._begin(ring, "warmup-" + str(time.time_ns()))
         done, invalid = threading.Event(), []
         watcher = threading.Thread(target=self._watch_guards, args=(ring, done, invalid), daemon=True)
         watcher.start()
@@ -183,8 +226,8 @@ class RingPool:
             proof = ring.backend.warmup(timeout_s=timeout_s)
             if invalid:
                 raise invalid[0]
+            self._assert_guards(ring)
             with self._lock:
-                self._assert_guards(ring)
                 if proof.get("proof_verified") is not True or not ring.backend.ready()[0]:
                     raise RingUnavailable("signed warmup/readiness verification failed")
                 if ring.state != RingState.WARMING:
@@ -203,6 +246,46 @@ class RingPool:
             done.set(); watcher.join(0.2)
             self._end(ring, works)
 
+    def recover(self, ring_id, timeout_s=300.0):
+        """Explicit idle rewarm under the SAME valid leases, never move old jobs."""
+        with self._lock:
+            ring = self._rings[ring_id]
+            if (ring.state not in (RingState.FAILED, RingState.WARMING) or
+                    ring.bound_jobs or ring.local_work or not self._accepting):
+                raise RingUnavailable("recovery requires an idle failed/unverified ring")
+        self._assert_guards(ring)
+        with self._lock:
+            if ring.bound_jobs or ring.local_work or ring.state not in (RingState.FAILED, RingState.WARMING):
+                raise RingUnavailable("ring changed during recovery verification")
+            ring.state, ring.reason, ring.signed_warmup = RingState.WARMING, "recovering", False
+            self._start_guard_monitor(ring)
+        return self.warmup(ring_id, timeout_s=timeout_s)
+
+    def _start_guard_monitor(self, ring):
+        if ring.guard_thread is not None and ring.guard_thread.is_alive():
+            return
+        ring.guard_stop = threading.Event()
+        def monitor():
+            interval = min(getattr(guard, "watch_interval_s", 0.05) for guard in ring.guards)
+            interval = max(0.01, min(5.0, interval))
+            while not ring.guard_stop.wait(interval):
+                with self._lock:
+                    if ring.state == RingState.STOPPED:
+                        return
+                    if ring.local_work:
+                        continue  # execution has its own owner/watchdog
+                try:
+                    self._assert_guards(ring)
+                except Exception as error:
+                    self.fail(ring.ring_id, type(error).__name__)
+                    ring.backend.abort()
+                    # Keep the same monitor alive for explicit idle recovery;
+                    # replacing a thread that is just exiting can lose renewal
+                    # observation. Only STOPPED terminates this monitor.
+                    continue
+        ring.guard_thread = threading.Thread(target=monitor, name="ring-guard-" + ring.ring_id, daemon=True)
+        ring.guard_thread.start()
+
     def _watch_guards(self, ring, done, invalid):
         interval = min(getattr(guard, "watch_interval_s", 0.05) for guard in ring.guards)
         interval = max(0.01, min(5.0, interval))
@@ -220,7 +303,8 @@ class RingPool:
         if ring.state != RingState.READY or not ring.signed_warmup:
             return False
         try:
-            self._assert_guards(ring)
+            if ring.lease_expires_at <= time.time():
+                raise RingUnavailable("cached committed lease has expired")
             if not ring.backend.ready()[0]:
                 # An established connection losing proof cannot accept new jobs.
                 ring.state, ring.reason = RingState.WARMING, "connection_reverification_required"
@@ -297,7 +381,8 @@ class RingPool:
         with self._lock:
             if binding.released or ring.state in (RingState.FAILED, RingState.STOPPED):
                 raise RingUnavailable("bound ring is no longer executable")
-            works = self._begin(ring, job.id)
+            ring.local_work += 1
+        works = self._begin(ring, job.id)
         done, invalid = threading.Event(), []
         watcher = threading.Thread(target=self._watch_guards, args=(ring, done, invalid), daemon=True)
         watcher.start()
@@ -314,8 +399,8 @@ class RingPool:
             checked()
             if result.get("proof", {}).get("verified") is not True or result["proof"].get("scope") != "complete_final_attempt":
                 raise RingUnavailable("complete final-attempt signed proof required")
+            self._assert_guards(ring)
             with self._lock:
-                self._assert_guards(ring)
                 if not ring.backend.ready()[0]:
                     raise RingUnavailable("successful result has no live verified ring")
                 # A previously bound request may reconnect/reverify this SAME ring.
@@ -326,7 +411,7 @@ class RingPool:
                                "cohort_id": ring.cohort_id, "region": ring.region}
             return result
         except Exception as error:
-            if not ring.backend.ready()[0]:
+            if isinstance(error, RingUnavailable) or not ring.backend.ready()[0]:
                 self.fail(ring.ring_id, type(error).__name__)
             raise
         finally:
@@ -340,10 +425,12 @@ class RingPool:
                 ring.state, ring.reason, ring.signed_warmup = RingState.FAILED, str(reason), False
 
     def _stop(self, ring):
+        ring.guard_stop.set()
         ring.backend.close()
         ring.state, ring.reason, ring.signed_warmup = RingState.STOPPED, "drained", False
         if ring.on_stopped is not None:
             ring.on_stopped(ring.ring_id)
+        self._prune_history()
 
     def drain(self, ring_id):
         with self._lock:
@@ -384,5 +471,5 @@ class RingPool:
     def shutdown(self):
         with self._lock:
             self._accepting = False
-            for ring in self._rings.values():
+            for ring in tuple(self._rings.values()):
                 self.drain(ring.ring_id)

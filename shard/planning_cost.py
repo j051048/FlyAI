@@ -26,14 +26,17 @@ def workload_spec(value):
     cancel = value.get("cancel_rate")
     if cancel is not None and number(cancel, "cancel_rate") > 1:
         raise ValueError("cancel_rate must be <=1")
+    frame_tokens = _integer(value.get("frame_tokens", 1), "frame_tokens", maximum=256)
+    if frame_tokens != 1:
+        raise ValueError("this cost model requires frame_tokens=1; chunk service needs separate measured geometry")
     return {"depth": depth, "block_tokens": block, "acceptance_gain": gain,
             "generated_tokens": _integer(value.get("generated_tokens", 256), "generated_tokens"),
-            "frame_tokens": _integer(value.get("frame_tokens", 1), "frame_tokens", maximum=256),
+            "frame_tokens": frame_tokens,
             "cancel_rate": cancel, "refill_ms": number(value.get("refill_ms", 0), "refill_ms"),
             "replay_frames_per_cancel": number(value.get("replay_frames_per_cancel", 0), "replay_frames_per_cancel")}
 
 
-def stage_observation(node, layers, fallback_ms, *, now):
+def stage_observation(node, layers, fallback_ms, *, now, start=None):
     trace = node.get("stage_trace")
     warning = []
     if trace is not None:
@@ -47,6 +50,8 @@ def stage_observation(node, layers, fallback_ms, *, now):
         if hi <= lo:
             raise ValueError("trace layer range must be nonempty")
         frame = number(trace["frame_ms"], "frame_ms", minimum=1e-9)
+        if "frame_tokens" in trace:
+            _integer(trace["frame_tokens"], "trace frame_tokens", maximum=256)
         shared = number(trace.get("shared_busy_ms", 0), "shared_busy_ms")
         if shared > frame:
             raise ValueError("shared busy time must be included in frame_ms")
@@ -54,14 +59,31 @@ def stage_observation(node, layers, fallback_ms, *, now):
         prefill = trace.get("prefill_ms")
         if prefill is not None:
             prefill = number(prefill, "prefill_ms")
-        if -30 <= age <= ttl:
+        expected = {"node_id": node["id"], "gpu_uuid": node.get("gpu_uuid"),
+                    "cohort_id": node.get("cohort_id"), "frame_tokens": 1,
+                    "runtime_config_sha256": node.get("runtime_config_sha256")}
+        bound = True
+        for key, value in expected.items():
+            if value is None or trace.get(key) is None:
+                bound = False
+                warning.append(f"{node['id']}: trace {key} binding unavailable")
+            elif trace[key] != value:
+                raise ValueError(f"stage trace {key} differs from node/cohort/frame configuration")
+        if trace.get("shared_resource_id") is not None and (
+                not isinstance(trace["shared_resource_id"], str) or not trace["shared_resource_id"].strip()):
+            raise ValueError("shared resource identity must be a nonempty string")
+        if shared and not isinstance(trace.get("shared_resource_id"), str):
+            raise ValueError("observed shared busy time needs an explicit resource identity")
+        if -30 <= age <= ttl and bound:
             scale = layers / (hi - lo)
+            matches = scale == 1 and (start is None or lo == start)
             return {"service_ms": frame * scale, "queue_ms": queue,
                     "shared_ms": shared * scale, "shared_id": trace.get("shared_resource_id"),
                     "prefill_ms": prefill * scale if prefill is not None else None,
-                    "source": "fresh_stage_trace" if scale == 1 else "scaled_stage_trace",
-                    "uncertainty": [] if scale == 1 else [f"{node['id']}: stage trace scaled to another block size"]}
-        warning.append(f"{node['id']}: expired stage trace")
+                    "source": "fresh_stage_trace" if matches else "scaled_stage_trace",
+                    "uncertainty": [] if matches else [f"{node['id']}: stage trace reused for another block/range"]}
+        if not -30 <= age <= ttl:
+            warning.append(f"{node['id']}: expired stage trace")
     warning.append(f"{node['id']}: scalar stage service estimate; no fresh matching stage trace")
     return {"service_ms": layers * fallback_ms, "queue_ms": 0, "shared_ms": 0,
             "shared_id": None, "prefill_ms": None, "source": "scalar_estimate", "uncertainty": warning}
@@ -98,19 +120,32 @@ def simulate_frames(stages, hops, transfer, entry_ms, return_ms, depth, frames):
 def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
              *, edges=None, now, objective="pipeline"):
     w = workload_spec(workload)
-    stages = [stage_observation(nodes[n], alloc[n], layer_ms[n], now=now) for n in order]
+    stages, start = [], 0
+    for n in order:
+        stages.append(stage_observation(nodes[n], alloc[n], layer_ms[n], now=now, start=start))
+        start += alloc[n]
     warnings = [warning for stage in stages for warning in stage["uncertainty"]]
+    if not isinstance(workload, dict) or workload.get("context_tokens") is None:
+        warnings.append("context/cache warmness is not bound to the stage service observation")
+    else:
+        context = _integer(workload["context_tokens"], "context_tokens")
+        for n in order:
+            trace = nodes[n].get("stage_trace")
+            if trace and trace.get("context_tokens") != context:
+                warnings.append(f"{nodes[n]['id']}: trace context differs/unknown; service extrapolation is unverified")
     payload = number(model.get("decode_bytes", 0), "decode_bytes") * w["frame_tokens"]
-    hops, transfers = [], []
+    hops, transfers, bandwidths = [], [], []
     for a, b in zip(order, order[1:]):
         hops.append(L[a][b])
         row = (edges or {}).get((nodes[a]["id"], nodes[b]["id"]), {})
         bw = row.get("bandwidth_mbps") or nodes[a].get("up_mbps")
         if bw is None:
-            warnings.append(f"{nodes[a]['id']} -> {nodes[b]['id']}: transfer bandwidth unknown")
-            transfers.append(0.0)
-        else:
-            transfers.append(payload * 8 / (number(bw, "bandwidth_mbps", minimum=1e-9) * 1000))
+            # Match the legacy residential selector's cautious unknown-uplink
+            # floor. Missing bandwidth is not free transport or proof of LAN.
+            bw = .5
+            warnings.append(f"{nodes[a]['id']} -> {nodes[b]['id']}: transfer bandwidth unknown; conservative 0.5Mbps assumption")
+        bandwidths.append(bw)
+        transfers.append(payload * 8 / (number(bw, "bandwidth_mbps", minimum=1e-9) * 1000))
     entry, back = c_out[order[0]], c_in[order[-1]]
     serial = sum(s["service_ms"] for s in stages) + sum(hops) + sum(transfers) + entry + back
     prefill_values = [s["prefill_ms"] for s in stages]
@@ -118,18 +153,19 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
         warnings.append("prefill compute has no complete stage trace")
     prefill = sum(value or 0 for value in prefill_values) + sum(hops) + entry + back
     pfbytes = number(model.get("prefill_bytes", 0), "prefill_bytes")
-    for i, (a, b) in enumerate(zip(order, order[1:])):
-        if payload:
-            prefill += transfers[i] * pfbytes / payload
+    for bw in bandwidths:
+        if bw is not None:
+            prefill += pfbytes * 8 / (number(bw, "bandwidth_mbps", minimum=1e-9) * 1000)
+    decode_needed = max(0, w["generated_tokens"] - 1)  # prefill emits the first committed token
     if objective == "serial":
-        elapsed = serial * w["generated_tokens"] + prefill
+        elapsed = serial * decode_needed + prefill
         first = serial
     elif objective == "pipeline":
-        rounds = math.ceil(w["generated_tokens"] / w["acceptance_gain"])
+        rounds = math.ceil(decode_needed / w["acceptance_gain"])
         # Full acceptance can continue without a cancellation drain. Otherwise
         # explicitly model complete bounded-window drain plus observed replay.
         if w["acceptance_gain"] == w["block_tokens"] and not w["cancel_rate"]:
-            total = math.ceil(w["generated_tokens"] / w["frame_tokens"])
+            total = max(1, math.ceil(decode_needed / w["frame_tokens"]))
             sample = min(total, max(64, w["depth"] * 4))
             replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], sample)
             elapsed = replies[-1]
@@ -145,15 +181,29 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
             elapsed = rounds * (replies[-1] + replay + w["refill_ms"])
             if w["cancel_rate"] is None:
                 warnings.append("acceptance distribution absent; conservative drain-per-round estimate")
-        first = replies[0]
+        first = replies[0] if decode_needed else 0.0
+        if not decode_needed:
+            elapsed = 0.0
         elapsed += prefill
     else:
         raise ValueError("objective must be serial or pipeline")
-    worst = max(range(len(stages)), key=lambda i: stages[i]["service_ms"])
+    constraints = [{"kind": "stage", "node_id": nodes[n]["id"], "service_ms": stages[i]["service_ms"]}
+                   for i, n in enumerate(order)]
+    constraints += [{"kind": "link_serialization", "src": nodes[a]["id"], "dst": nodes[b]["id"], "service_ms": transfers[i]}
+                    for i, (a, b) in enumerate(zip(order, order[1:]))]
+    domains = {}
+    for stage in stages:
+        if stage["shared_id"]:
+            domains[stage["shared_id"]] = domains.get(stage["shared_id"], 0) + stage["shared_ms"]
+    constraints += [{"kind": "shared_resource", "resource_id": domain, "service_ms": busy} for domain, busy in domains.items()]
+    constraints.append({"kind": "feedback_window", "service_ms": serial / w["depth"]})
+    same_host = [nodes[n].get("host_id") for n in order]
+    if len({h for h in same_host if h}) < len([h for h in same_host if h]) and not domains:
+        warnings.append("colocated GPU shared-I/O contention has no observed resource service trace")
     return {"prediction_only": True, "objective": objective, "predicted_request_ms": elapsed,
             "predicted_serial_step_ms": serial, "predicted_first_frame_ms": first,
             "predicted_committed_tok_s": 1000 * w["generated_tokens"] / elapsed if elapsed else None,
             "finite_depth": w["depth"], "acceptance_gain": w["acceptance_gain"],
-            "bottleneck": {"node_id": nodes[order[worst]]["id"], "service_ms": stages[worst]["service_ms"]},
+            "bottleneck": max(constraints, key=lambda row: row["service_ms"]),
             "stages": stages, "uncertainty": sorted(set(warnings)),
             "scope": "resource-calendar prediction; hardware acceptance requires a live verified run"}

@@ -5,6 +5,10 @@ acceptance is deferred until the operator supplies a rented cluster. Local CPU,
 real-socket and reference-model regressions are not GPU throughput measurements.
 Use a complete repository checkout for the new deployment/gateway workflow.
 
+The subsequent open-contribution work adds signed public offers, node leases,
+locality-first heterogeneous planning, multi-ring serving and version-sticky
+lifecycle management. See [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md).
+
 ## Execution paths and limits
 
 | Area | Actual integration | Limit |

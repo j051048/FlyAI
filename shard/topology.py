@@ -441,7 +441,8 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 trusted=None, boundary_in=0, boundary_out=0, max_stages=6,
                 tail_floor=0, host_id=None, isolation="none", device_id=None,
                 host_layer_caps=None, host_memory_domain=None, tail_host_layer_caps=None,
-                node_layer_caps=None, tail_reserve_mb=0, objective="serial", cost_model=None):
+                node_layer_caps=None, tail_reserve_mb=0, objective="serial", cost_model=None,
+                hard_max_stages=None):
     """The self-optimizer's pure core. From a candidate POOL, choose the subset + ring order +
     per-node layer split that MINIMIZES predicted request time, subject to:
       * VRAM feasibility — the chosen nodes must hold the whole model (+ KV),
@@ -494,6 +495,10 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
     Trust is a CONSTRAINT, never a score: among trust-valid rings the objective is unchanged."""
     if require is not None and exclude and require in set(exclude):
         raise ValueError("`require` and `exclude` name the same node")
+    if objective not in ("serial", "pipeline"):
+        raise ValueError("objective must be serial or pipeline")
+    if hard_max_stages is not None and (type(hard_max_stages) is not int or hard_max_stages < 1):
+        raise ValueError("hard_max_stages must be a positive integer")
     if isolation not in ("none", "subnet", "host", "adjacent_host"):
         raise ValueError("isolation must be none, subnet, host or adjacent_host")
     if len(set(nodes)) != len(nodes):
@@ -829,11 +834,15 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
 
     # P1-4: Reject over-sharding. Restrict ring width to max_stages (default 6) unless model requires more.
     eff_max = max(k_min, int(max_stages) if max_stages is not None else 6)
+    if hard_max_stages is not None:
+        if k_min > hard_max_stages:
+            return None
+        eff_max = min(eff_max, hard_max_stages)
     kmax = min(k_min + slack, eff_max)
     best = _search(k_min, kmax)
     if best is None and kmax < len(usable):                      # co-location can push the true minimum k above k_min+slack
         best = _search(kmax + 1, min(eff_max, len(usable)))      # -> widen up to eff_max first
-    if best is None and eff_max < len(usable):
+    if best is None and eff_max < len(usable) and hard_max_stages is None:
         best = _search(eff_max + 1, len(usable))                 # ultimate fallback if pool truly needs wider ring
     if best is None:
         return None

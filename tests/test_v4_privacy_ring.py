@@ -13,7 +13,7 @@ NONCE = "a9" * 32
 
 
 class _PrivacyRing:
-    def __init__(self, checkpoint, args, *, codecs=None, dspark=False):
+    def __init__(self, checkpoint, args, *, codecs=None, dspark=False, guards=None):
         # Hash layers span two trusted stages; the third is an opaque middle.
         self.ranges = [(0, 1), (1, 2), (2, 5), (5, args.n_layers)]
         self.args = args
@@ -35,6 +35,8 @@ class _PrivacyRing:
                           dspark=dspark, ready=events[i], timeout=5.0)
             if codecs is not None:
                 kwargs["token_privacy"] = codecs[i]
+            if guards is not None:
+                kwargs["lease_guard"] = guards[i]
             thread = threading.Thread(target=run, args=(kwargs,), daemon=True)
             thread.start()
             self.threads.append(thread)

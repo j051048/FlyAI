@@ -187,7 +187,8 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
         raise OfferError("models must be a bounded list")
     cohorts = set()
     for entry in models:
-        if not isinstance(entry, dict) or set(entry) != {"cohort", "profile", "measured_at"}:
+        if (not isinstance(entry, dict) or not {"cohort", "profile", "measured_at"} <= set(entry)
+                or set(entry) - {"cohort", "profile", "measured_at", "calibrations"}):
             raise OfferError("invalid model capability")
         cohort = ModelCohort.from_dict(entry["cohort"])
         if cohort.cohort_id in cohorts:
@@ -198,11 +199,14 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
             raise OfferError("model measurement is from the future")
         profile = entry["profile"]
         permitted = {"layer_ms", "cap_layers", "layer_vram_mb", "total_vram_mb", "h2d_gbps", "up_mbps",
-                     "dma_exposed_ms_per_layer", "expert_misses_per_layer", "dma_overlap_fraction", "stage_trace"}
+                     "dma_exposed_ms_per_layer", "expert_misses_per_layer", "dma_overlap_fraction", "stage_trace",
+                     "runtime_config_sha256"}
         if not isinstance(profile, dict) or set(profile) - permitted:
             raise OfferError("invalid measured profile fields")
         for key, value in profile.items():
-            if key == "stage_trace":
+            if key == "runtime_config_sha256":
+                _hash(value, key)
+            elif key == "stage_trace":
                 if not isinstance(value, dict):
                     raise OfferError("stage_trace must be an object")
             elif key == "cap_layers":
@@ -210,10 +214,50 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
                 if value > cohort.n_layers:
                     raise OfferError("layer capacity exceeds model")
             elif value is not None:
-                _number(value, key, positive=key in {"layer_vram_mb", "h2d_gbps", "up_mbps"})
+                _number(value, key, positive=key in {"layer_ms", "layer_vram_mb", "h2d_gbps", "up_mbps"})
         overlap = profile.get("dma_overlap_fraction")
         if overlap is not None and overlap > 1:
             raise OfferError("DMA overlap must be within [0,1]")
+        if profile.get("stage_trace") is not None:
+            # Validate at admission so one signed malformed observation cannot
+            # make planning fail for every honest node in the same cohort.
+            try:
+                from .planning_cost import stage_observation
+                trace = profile["stage_trace"]
+                stage_observation({"id": body["node_id"], "gpu_uuid": body["gpu_uuid"],
+                    "cohort_id": cohort.cohort_id, "runtime_config_sha256": profile.get("runtime_config_sha256"),
+                    "stage_trace": trace}, 1, profile.get("layer_ms") or 1,
+                    now=now, start=trace.get("layer_start"))
+                if trace["layer_end"] > cohort.n_layers:
+                    raise ValueError("trace lies outside the model")
+            except (ValueError, TypeError, KeyError) as exc:
+                raise OfferError("invalid or mismatched stage trace") from exc
+        calibrations = entry.get("calibrations", [])
+        if not isinstance(calibrations, list) or len(calibrations) > 64:
+            raise OfferError("bounded stage calibrations required")
+        seen_ranges = set()
+        for record in calibrations:
+            try:
+                from .resources import PlacementRequirements
+                if not isinstance(record, dict) or set(record) != {"requirements", "runtime_config"}:
+                    raise ValueError("invalid calibration record")
+                req = PlacementRequirements.from_dict(record["requirements"])
+                cfg = record["runtime_config"]
+                if (req.model_id != cohort.model_id or req.provenance.checkpoint_id != cohort.checkpoint_id
+                        or req.provenance.node_id != body["node_id"] or req.layer_end > cohort.n_layers
+                        or not isinstance(cfg, dict) or cfg.get("lo") != req.layer_start or cfg.get("hi") != req.layer_end
+                        or type(cfg.get("head")) is not bool or type(cfg.get("tail")) is not bool
+                        or cfg["head"] != (req.layer_start == 0) or cfg["tail"] != (req.layer_end == cohort.n_layers)
+                        or hashlib.sha256(canonical(cfg)).hexdigest() != req.provenance.runtime_config_sha256):
+                    raise ValueError("calibration identity or runtime differs from offer")
+                if any(k.startswith("SHARD_") for k in cfg.get("environment", {})):
+                    raise ValueError("private provisioning cannot appear in a public calibration")
+                bounds = req.layer_start, req.layer_end
+                if bounds in seen_ranges:
+                    raise ValueError("duplicate stage calibration")
+                seen_ranges.add(bounds)
+            except (ValueError, TypeError, KeyError) as exc:
+                raise OfferError("invalid stage calibration") from exc
     try:
         pub = base64.b64decode(body["public_key"], validate=True)
         peer_id = peer_id_from_public_key(pub)
@@ -228,10 +272,12 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
 
 class OfferRegistry:
     """Durable bounded reference registry; replay tombstones survive offer expiry."""
-    def __init__(self, path=":memory:", *, clock=time.time, max_nodes=10000, max_ttl_s=300):
+    def __init__(self, path=":memory:", *, clock=time.time, max_nodes=10000, max_ttl_s=300,
+                 sequence_retention_s=86400):
         if type(max_nodes) is not int or max_nodes < 1:
             raise ValueError("positive registry capacity required")
         self.clock, self.max_nodes, self.max_ttl_s = clock, max_nodes, max_ttl_s
+        self.sequence_retention_s = _number(sequence_retention_s, "sequence retention", positive=True)
         self._lock = threading.RLock()
         self._db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=10)
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -244,15 +290,24 @@ class OfferRegistry:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                old = self._db.execute("SELECT sequence,digest FROM offers WHERE node_id=?", (offer["node_id"],)).fetchone()
+                now = self.clock()
+                self._db.execute("UPDATE offers SET body='' WHERE expires<=? AND body!=''", (now,))
+                self._db.execute("DELETE FROM offers WHERE expires<=?", (now - self.sequence_retention_s,))
+                old = self._db.execute("SELECT sequence,digest,expires FROM offers WHERE node_id=?", (offer["node_id"],)).fetchone()
                 if old:
                     if offer["sequence"] < old[0] or (offer["sequence"] == old[0] and digest != old[1]):
                         raise OfferError("replayed or conflicting offer sequence")
                     if offer["sequence"] == old[0]:
                         self._db.execute("COMMIT")
                         return {"node_id": offer["node_id"], "unchanged": True}
-                elif self._db.execute("SELECT count(*) FROM offers").fetchone()[0] >= self.max_nodes:
+                if (old is None or old[2] <= now) and self._db.execute("SELECT count(*) FROM offers WHERE expires>?", (now,)).fetchone()[0] >= self.max_nodes:
                     raise OfferError("registry capacity reached")
+                # Bound replay metadata independently of live registrations.
+                # Evicted packets are already expired and cannot be replayed.
+                excess = self._db.execute("SELECT count(*) FROM offers").fetchone()[0] - self.max_nodes * 4 + 1
+                if excess > 0:
+                    self._db.execute("DELETE FROM offers WHERE node_id IN (SELECT node_id FROM offers WHERE expires<=? AND node_id!=? ORDER BY expires LIMIT ?)",
+                                     (now, offer["node_id"], excess))
                 self._db.execute("INSERT INTO offers VALUES(?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET sequence=excluded.sequence,digest=excluded.digest,expires=excluded.expires,body=excluded.body",
                                  (offer["node_id"], offer["sequence"], digest, offer["issued_at"] + offer["ttl_s"], raw.decode()))
                 self._db.execute("COMMIT")
@@ -281,10 +336,19 @@ class OfferRegistry:
                 # A fresh signed announcement is not a calibration of an absent speed.
                 if profile.get("layer_ms") is None and profile.get("stage_trace") is None:
                     continue
+                if profile.get("layer_ms") is None:
+                    from .planning_cost import stage_observation
+                    trace = profile["stage_trace"]
+                    observed = stage_observation({"id": offer["node_id"], "gpu_uuid": offer["gpu_uuid"],
+                        "cohort_id": cohort_id, "runtime_config_sha256": profile.get("runtime_config_sha256"),
+                        "stage_trace": trace}, trace["layer_end"] - trace["layer_start"], 1,
+                        now=now, start=trace["layer_start"])
+                    if observed["source"] != "fresh_stage_trace":
+                        continue
                 def mib(name):
                     value = resources[name]
                     return None if value is None else value / (1024 * 1024)
-                nodes.append({**profile, "id": offer["node_id"], "peer_id": offer["peer_id"],
+                nodes.append({**profile, "id": offer["node_id"], "cohort_id": cohort_id, "peer_id": offer["peer_id"],
                               "gpu_uuid": offer["gpu_uuid"], "memory_domain_id": offer["memory_domain_id"],
                               "host_id": offer.get("host_id"), "public_ip": offer.get("public_ip"),
                               "region": offer.get("region"), "zone": offer.get("zone"),
@@ -315,7 +379,19 @@ def main(argv=None):
     sign.add_argument("--out", required=True)
     verify = commands.add_parser("verify")
     verify.add_argument("--offer", required=True)
+    export = commands.add_parser("export-receipt-key", help="export the same sidecar identity in the Python receipt key format")
+    export.add_argument("--sidecar-key", required=True)
+    export.add_argument("--out", required=True)
     args = parser.parse_args(argv)
+    if args.command == "export-receipt-key":
+        from .manifest import save_key
+        target = Path(args.out)
+        if target.exists() or target.is_symlink():
+            parser.error("receipt key output already exists")
+        key = load_sidecar_key(args.sidecar_key)
+        save_key(key, str(target))
+        print(json.dumps({"peer_id": peer_id_from_public_key(key.public_key().public_bytes_raw()), "path": str(target)}))
+        return
     body = json.loads(Path(args.offer).read_text(encoding="utf-8-sig"))
     if args.command == "sign":
         body = sign_offer(body, load_sidecar_key(args.sidecar_key))

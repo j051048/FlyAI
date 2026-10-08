@@ -30,6 +30,14 @@ class JoinedNode:
     dma_exposed_ms_per_layer: float | None = None
     expert_misses_per_layer: float | None = None
     dma_overlap_fraction: float | None = None
+    region: str | None = None
+    zone: str | None = None
+    up_mbps: float | None = None
+    total_vram_gb: float | None = None
+    cap_layers: int | None = None
+    stage_trace: dict | None = None
+    cohort_id: str | None = None
+    runtime_config_sha256: str | None = None
 
 
 def _distribute(total: int, caps: list[tuple[str, int]]) -> dict[str, int]:
@@ -95,9 +103,11 @@ class Scheduler:
 
     def plan(self, gb_per_layer: float | None = None, kv_gb_per_layer: float = 0.0,
              headroom_gb: float = 2.0, boundary_gb: float = 1.0,
-             model_id: str | None = None, placement: str = "gpu", isolation: str = "none") -> dict:
+             model_id: str | None = None, placement: str = "gpu", isolation: str = "none",
+             locality=None, objective="serial", workload=None, measurements=None, now=None,
+             profile: dict | None = None, diagnostics=None) -> dict:
         """ONE joint placement: pipeline order and contiguous blocks decided together."""
-        from .plan import plan_ring, profile_for
+        from .plan import plan_ring, profile_for, PROFILES
         ids = list(self.nodes)
         nodes = [{
             "id": nid,
@@ -112,23 +122,37 @@ class Scheduler:
             "public_ip": self.nodes[nid].public_ip,
             "memory_domain_id": self.nodes[nid].memory_domain_id,
             "layer_ms": self.nodes[nid].layer_ms,
+            "region": self.nodes[nid].region, "zone": self.nodes[nid].zone,
+            "up_mbps": self.nodes[nid].up_mbps,
+            "total_vram_mb": self.nodes[nid].total_vram_gb * 1024 if self.nodes[nid].total_vram_gb is not None else None,
+            "cap_layers": self.nodes[nid].cap_layers, "stage_trace": self.nodes[nid].stage_trace,
+            "cohort_id": self.nodes[nid].cohort_id,
+            "runtime_config_sha256": self.nodes[nid].runtime_config_sha256,
             **{key: getattr(self.nodes[nid], key) for key in
                ("dma_exposed_ms_per_layer", "expert_misses_per_layer", "dma_overlap_fraction")
                if getattr(self.nodes[nid], key) is not None},
         } for nid in ids]
-        rtt = [[0.0 if a == b else float(self.nodes[a].rtt_ms[b]) for b in ids] for a in ids]
+        rtt = [[0.0 if a == b else self.nodes[a].rtt_ms.get(b, float("inf")) for b in ids] for a in ids]
 
-        if model_id is not None or self.model in ("deepseek-ai/DeepSeek-V4-Flash-0731", "v4"):
-            mid = model_id or "deepseek-ai/DeepSeek-V4-Flash-0731"
+        if profile is not None:
+            model = dict(profile)
+        elif model_id is not None or self.model in PROFILES or self.model == "v4":
+            mid = model_id or ("deepseek-ai/DeepSeek-V4-Flash-0731" if self.model == "v4" else self.model)
             base_model = profile_for(mid)
-            if placement == "ram":
-                base_model = profile_for("deepseek-ai/DeepSeek-V4-Flash-0731-Dual")
-            elif placement == "gpu":
-                base_model = profile_for("deepseek-ai/DeepSeek-V4-Flash-0731-Resident")
+            if mid in {"deepseek-ai/DeepSeek-V4-Flash-0731", "deepseek-ai/DeepSeek-V4-Flash-0731-Dual",
+                       "deepseek-ai/DeepSeek-V4-Flash-0731-Resident"}:
+                if placement == "ram":
+                    base_model = profile_for("deepseek-ai/DeepSeek-V4-Flash-0731-Dual")
+                elif placement == "gpu":
+                    base_model = profile_for("deepseek-ai/DeepSeek-V4-Flash-0731-Resident")
+            elif base_model.get("placement", "gpu") != placement:
+                raise ValueError("explicit model has no calibrated profile for the requested placement")
             model = dict(base_model)
             if gb_per_layer is not None:
                 model["layer_vram_mb"] = gb_per_layer * 1024.0
         else:
+            if gb_per_layer is None:
+                raise ValueError("generic scheduling needs an explicit model profile or gb_per_layer")
             gb_val = gb_per_layer if gb_per_layer is not None else 1.0
             model = {
                 "n_layers": self.total_layers,
@@ -141,10 +165,22 @@ class Scheduler:
                 "cap_layers": self.total_layers,
                 "head_layer_ms_mult": 1.0,
             }
-        out = plan_ring(nodes, rtt, model, isolation=isolation)
+        if placement not in ("gpu", "ram"):
+            raise ValueError("placement must be gpu or ram")
+        if profile is not None and model_id is not None:
+            if model.get("model_id") not in (None, model_id):
+                raise ValueError("explicit profile model identity differs from model_id")
+            model["model_id"] = model_id
+        if int(model["n_layers"]) != self.total_layers:
+            raise ValueError("model profile layer count differs from Scheduler.total_layers")
+        details = diagnostics if diagnostics is not None else {}
+        out = plan_ring(nodes, rtt, model, isolation=isolation, locality=locality, objective=objective,
+                        workload=workload, measurements=measurements, now=now, diagnostics=details)
         if out is None:
+            if details.get("status") == "bounded_search_exhausted":
+                raise ValueError("no plan found in bounded candidates; this is not proof of global infeasibility; widen locality/search bounds")
             raise ValueError(f"insufficient resources: pool cannot hold {self.total_layers} layers "
-                             f"under placement policy {placement!r}")
+                             f"under placement/locality/stage constraints {placement!r}")
         return out
 
     def allocate(self, gb_per_layer: float, kv_gb_per_layer: float = 0.0,

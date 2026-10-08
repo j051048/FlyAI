@@ -204,7 +204,7 @@ K3_PROFILE = {
 # never one, because layer_vram_mb (and the weight_map behind it) differ.
 # ── DeepSeek-V4-Flash-0731 ────────────────────────────────────────────────────
 # 43 backbone layers, 256 routed experts (FP4, ~12.75 MiB each = 3264 MiB/layer), 6 activated experts.
-# 3 MTP draft blocks, 7168 hidden dimension.
+# 3 MTP draft blocks, 4096 hidden dimension with four HC streams.
 _V4_N_LAYERS = 43
 _V4_EXPERT_BYTES = 13369344          # ~12.75 MiB per FP4 routed expert
 _V4_EXPERTS_PER_LAYER = 256
@@ -339,7 +339,8 @@ def ram_dma_overhead_ms(node, model):
 
 
 def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=None,
-                    head_choice=None, joint_roles=False, objective="serial", cost_model=None):
+                    head_choice=None, joint_roles=False, objective="serial", cost_model=None,
+                    hard_max_stages=None):
     """Place a deployable sharded ring from announced capabilities + a measured RTT mesh.
 
     nodes: [{"id": <hashable>, "free_vram_mb": float, "subnet": str,
@@ -398,7 +399,14 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
     generic = dict(kv_mb_per_layer=0.0, layer_ms_base=1.0, reserve_mb=0.0,
                    head_reserve_mb=0.0, tail_reserve_mb=0.0, head_layer_ms_mult=1.0,
                    prefill_bytes=0.0, decode_bytes=0.0, decode_steps=1, prefill_chunks=1)
-    m = dict(M25_PROFILE) if model is None else {**generic, **model}
+    if model is not None and "n_layers" not in model:
+        if model.get("model_id"):
+            raise ValueError("an explicit model profile must declare n_layers")
+        # Historical API: {tail_reserve_mb: ...} is an M2.5 override,
+        # not an independently identified model descriptor.
+        m = {**M25_PROFILE, **model}
+    else:
+        m = dict(M25_PROFILE) if model is None else {**generic, **model}
     m.setdefault("cap_layers", m["n_layers"])
     isolation = m.get("isolation", "none") if isolation is None else isolation
     if isolation not in ("none", "subnet", "host", "adjacent_host"):
@@ -460,7 +468,7 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
     node_caps = {i: _node_cap(i) for i in range(n)}
     free = (dict(raw_free) if joint_roles else
             {i: min(raw_free[i], node_caps[i] * per_layer[i]) for i in range(n)})
-    cap_ok = [i for i in range(n) if free[i] >= per_layer[i]]
+    cap_ok = [i for i in range(n) if free[i] >= per_layer[i] and node_caps[i] > 0]
     if isolation == "subnet":
         cap_ok = [i for i in cap_ok if nodes[i].get("subnet") not in (None, "")]
     elif isolation in ("host", "adjacent_host"):
@@ -514,7 +522,7 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
         capacity = {}
         for j in reachable:
             group = memory_map[j]
-            capacity[group] = capacity.get(group, 0) + int(free[j] // per_layer[j])
+            capacity[group] = capacity.get(group, 0) + min(node_caps[j], int(free[j] // per_layer[j]))
         return sum(min(count, host_caps.get(group, count)) for group, count in capacity.items())
     head_pool = [i for i in head_pool if _connected_cap(i) >= int(m["n_layers"])]
     if not head_pool:
@@ -554,7 +562,10 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
              "tail_host_layer_caps": tail_host_caps}
     if joint_roles:
         extra.update(node_layer_caps=node_caps, tail_reserve_mb=float(m["tail_reserve_mb"]),
-                     objective=objective, cost_model=cost_model)
+                     objective=objective, cost_model=(lambda order, alloc: cost_model(
+                         order, alloc, layer_ms, c_out, c_in)) if cost_model else None)
+        if hard_max_stages is not None:
+            extra["hard_max_stages"] = hard_max_stages
     if aware:
         extra.update({"up_mbps": {i: float(ups[i]) for i in range(n)},
                  "prefill_bytes": float(m.get("prefill_bytes", 0.0)),
@@ -671,9 +682,11 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
             min_c_rtt = c_rtt
             best_c_id = ids[idx]
     out["coordinator_placement"] = {
-        "preferred_host": best_c_id,
-        "min_roundtrip_ms": round(min_c_rtt, 2),
-        "in_region": min_c_rtt < 35.0,
+        "preferred_host": ids[head],  # Runtime and cost model pin coordinator on the actual head.
+        "min_roundtrip_ms": round(float(rtt[tail_stage_idx][head]), 2),
+        "in_region": float(rtt[tail_stage_idx][head]) < 35.0,
+        "advisory_alternative_host": best_c_id,
+        "advisory_alternative_ms": round(min_c_rtt, 2),
     }
 
     # Per-node impairment and bottleneck reporting (pricing & hardware suitability tiering)
@@ -719,6 +732,194 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
     return out
 
 
+def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolation=None,
+              locality=None, objective="serial", workload=None, measurements=None, now=None,
+              diagnostics=None):
+    """Backward-compatible entrypoint with locality tiers and prediction-only costs.
+
+    A legacy metadata-free call retains its historical successful solve. New
+    locality/sparse/trace calls jointly evaluate head roles within each tier;
+    expansion happens only if every local candidate failed feasibility/SLO.
+    """
+    from .locality import link_snapshot, candidate_tiers, shortlist_candidates
+    from .planning_cost import estimate, workload_spec
+    if diagnostics is not None:
+        if not isinstance(diagnostics, dict):
+            raise ValueError("diagnostics must be a dictionary")
+        diagnostics.clear()
+    if objective not in ("serial", "pipeline"):
+        raise ValueError("objective must be serial or pipeline")
+    if objective == "pipeline" and workload is None:
+        raise ValueError("pipeline planning requires an explicit workload/acceptance assumption")
+    resolved = profile_for(model) if isinstance(model, str) else model
+    if isinstance(resolved, dict) and ("schema" in resolved or
+            resolved.get("calibration_status") in {"structural", "unmeasured"}):
+        raise ValueError("structural/resource evidence is not a calibrated scalar placement profile")
+    cohorts = {node.get("cohort_id") for node in nodes if node.get("cohort_id") is not None}
+    if len(cohorts) > 1:
+        raise ValueError("planner candidates must belong to one exact model cohort")
+    if nodes and isinstance(resolved, dict) and resolved.get("cohort_id") is not None and cohorts != {resolved["cohort_id"]}:
+        raise ValueError("model profile and candidate cohort differ")
+    if not nodes:
+        return None
+    all_nodes = nodes
+    legacy_dense = (rtt is not None and measurements is None and locality is None and workload is None
+                    and objective == "serial" and not any(node.get("region") or node.get("region_id")
+                    or node.get("stage_trace") for node in nodes))
+    if legacy_dense:
+        # Existing callers already supplied a full mesh (including very wide
+        # K3 pools). Preserve their golden path rather than silently truncating it.
+        selected = list(range(len(nodes)))
+        frontier = {"total_nodes": len(nodes), "examined_nodes": len(nodes), "max_candidates": len(nodes),
+                    "truncated": False, "method": "legacy caller-supplied dense mesh"}
+    else:
+        selected, frontier = shortlist_candidates(nodes, resolved or M25_PROFILE, locality, measurements, now=now)
+    nodes = [nodes[i] for i in selected]
+    if rtt is not None and not legacy_dense:
+        rtt = [[rtt[i][j] for j in selected] for i in selected]
+    snapshot = link_snapshot(nodes, rtt, measurements, now=now)
+    # A fresh measured frame already includes expert transfers. Its per-layer
+    # average provides the heterogeneous allocation seed; the full stage trace
+    # is still re-scored and labeled when reused for another layer range.
+    from .planning_cost import stage_observation
+    nodes = [dict(node) for node in nodes]
+    for node in nodes:
+        if node.get("stage_trace") is not None:
+            observed = stage_observation(node, 1, 1.0, now=snapshot["now"])
+            if observed["source"] != "scalar_estimate":
+                node["layer_ms"] = observed["service_ms"]
+    matrix = snapshot["rtt"]
+    tiers = candidate_tiers(nodes, snapshot, locality)
+    by_id = {node["id"]: i for i, node in enumerate(nodes)}
+    attempts = []
+    heads_truncated = False
+    use_cost = objective == "pipeline" or workload is not None or any(node.get("stage_trace") is not None for node in nodes)
+    if isinstance(locality, dict) and locality.get("min_predicted_tok_s") is not None:
+        from .locality import number
+        number(locality["min_predicted_tok_s"], "min_predicted_tok_s", minimum=1e-9)
+        use_cost = True
+    if use_cost:
+        workload_spec(workload)
+    for tier in tiers:
+        best, rank = None, math.inf
+        best_used_joint = False
+        distinct_pools = {tuple(dict.fromkeys(pool)): None for pool in tier["pools"]}
+        for pool in distinct_pools:
+            indices = [by_id[nid] for nid in dict.fromkeys(pool)]
+            subset = [nodes[i] for i in indices]
+            mesh = [[matrix[i][j] for j in indices] for i in indices]
+            if not subset:
+                continue
+            legacy = tier.get("legacy", False) and not use_cost and measurements is None
+            if legacy:
+                found = _plan_ring_core(subset, mesh, resolved, slack=slack, privacy=privacy, isolation=isolation)
+                if found is not None:
+                    best = found
+                    break
+            # Bounded candidate funnel is still inside select_ring. Evaluate
+            # all capable head roles; a small central head must not kill a pool.
+            policy = locality if isinstance(locality, dict) else {}
+            max_heads = policy.get("max_head_candidates", 12)
+            if type(max_heads) is not int or not 1 <= max_heads <= 32:
+                raise ValueError("max_head_candidates must be an integer in [1,32]")
+            budget_profile = resolved or M25_PROFILE
+            def head_capable(i):
+                node = subset[i]
+                per = float(node.get("layer_vram_mb") or budget_profile.get("layer_vram_mb", 1)) + float(budget_profile.get("kv_mb_per_layer", 0))
+                need = per + float(budget_profile.get("reserve_mb", 0)) + float(budget_profile.get("head_reserve_mb", 0)) + float(node.get("load_peak_extra_mb") or budget_profile.get("load_peak_extra_mb") or 0)
+                if float(node["free_vram_mb"]) < need or node.get("cap_layers") == 0:
+                    return False
+                host_per = float(budget_profile.get("layer_host_ram_mb", 0))
+                if budget_profile.get("placement") == "ram" and host_per:
+                    ram, pin = node.get("free_ram_mb"), node.get("pinnable_ram_mb")
+                    if ram is None or pin is None or min(float(ram), float(pin)) < host_per + float(budget_profile.get("host_reserve_mb", 0)):
+                        return False
+                if privacy is not None and not (node.get("trusted") is True or node.get("staked") is True):
+                    return False
+                effective_isolation = isolation or budget_profile.get("isolation", "none")
+                if effective_isolation in ("host", "adjacent_host") and not node.get("host_id"):
+                    return False
+                if effective_isolation == "subnet" and not node.get("subnet"):
+                    return False
+                return True
+            eligible_heads = [i for i in range(len(subset)) if head_capable(i)]
+            heads_truncated = heads_truncated or len(eligible_heads) > max_heads
+            heads = sorted(eligible_heads, key=lambda i: (
+                sum(min(float(value), _UNREACHABLE) for value in mesh[i]), -float(subset[i]["free_vram_mb"])))[:max_heads]
+            hard_max = policy.get("max_stages", (resolved or {}).get("max_stages", 6))
+            for head in heads:
+                context = {}
+                def score(order, allocation, timing, outgoing, incoming):
+                    context.update(timing=timing, outgoing=outgoing, incoming=incoming)
+                    return estimate(order, allocation, timing, mesh, outgoing, incoming,
+                                    dict(enumerate(subset)), resolved or M25_PROFILE, workload,
+                                    edges=snapshot["edges"], now=snapshot["now"], objective=objective)
+                found = _plan_ring_core(subset, mesh, resolved, slack=slack, privacy=privacy,
+                    isolation=isolation, head_choice=head, joint_roles=True, objective=objective,
+                    cost_model=score if use_cost else None, hard_max_stages=hard_max)
+                if found is None:
+                    continue
+                prediction = None
+                if use_cost:
+                    order = [next(i for i, node in enumerate(subset) if node["id"] == nid) for nid in found["order"]]
+                    allocation = {next(i for i, node in enumerate(subset) if node["id"] == stage["id"]): stage["layers"]
+                                  for stage in found["stages"]}
+                    prediction = score(order, allocation, context["timing"], context["outgoing"], context["incoming"])
+                candidate_rank = prediction["predicted_request_ms"] if prediction else found.get("request_ms", found["step_ms"])
+                if policy.get("min_predicted_tok_s") is not None and (
+                        not prediction or prediction["predicted_committed_tok_s"] < float(policy["min_predicted_tok_s"])):
+                    continue
+                if candidate_rank < rank:
+                    best, rank = found, candidate_rank
+                    best_used_joint = True
+                    if prediction:
+                        best["planning"] = prediction
+        attempts.append({"tier": tier["name"], "candidate_pools": len(tier["pools"]), "feasible": best is not None})
+        if best is None:
+            continue
+        prediction = best.setdefault("planning", {"prediction_only": True, "objective": "serial",
+            "predicted_serial_step_ms": best["step_ms"], "uncertainty": ["scalar legacy calibration"],
+            "scope": "planning estimate; live hardware acceptance is separate"})
+        if "bottleneck" not in prediction:
+            actual_profile = resolved or M25_PROFILE
+            estimates = []
+            for stage in best["stages"]:
+                node = next(node for node in nodes if node["id"] == stage["id"])
+                timing = node.get("layer_ms")
+                timing = (float(timing) if timing is not None else
+                          float(actual_profile.get("layer_ms_base", 1)) * float(node.get("cpu_factor", 1)))
+                estimates.append({"kind": "stage_estimate", "node_id": node["id"],
+                                  "service_ms": stage["layers"] * timing})
+            prediction["bottleneck"] = max(estimates, key=lambda item: item["service_ms"])
+        prediction["uncertainty"] = sorted(set(prediction.get("uncertainty", []) + snapshot["uncertainty"]))
+        if frontier["truncated"]:
+            prediction["uncertainty"].append("open pool truncated to a bounded heuristic candidate frontier")
+        prediction["locality"] = {"selected_tier": tier["name"], "expansion_reason": tier["reason"],
+                                  "attempts": attempts, "regions": sorted({
+            node.get("region") or node.get("region_id") for node in nodes
+            if node["id"] in best["order"] and (node.get("region") or node.get("region_id"))})}
+        if tier["name"] == "expanded" and (frontier["truncated"] or heads_truncated):
+            prediction["locality"]["expansion_reason"] = "bounded_local_search_exhausted"
+        prediction["search"] = {"head_roles": "joint" if best_used_joint else "legacy",
+            "order": "bounded latency DP per tail; pipeline ranking is heuristic",
+            "allocation": "serial and integer water-fill candidates" if objective == "pipeline" else "min-sum",
+            **frontier}
+        prediction["search"]["heads_truncated"] = heads_truncated
+        if heads_truncated:
+            prediction["uncertainty"].append("joint head search limited to a heuristic shortlist")
+        best["dropped"] = [node["id"] for node in all_nodes if node["id"] not in best["order"]]
+        best["model_id"] = (model if isinstance(model, str) else (resolved or {}).get("model_id") or
+                            next((key for key, value in PROFILES.items() if value == resolved), None))
+        if diagnostics is not None:
+            diagnostics.update(status="planned", search=prediction["search"], attempts=attempts)
+        return best
+    if diagnostics is not None:
+        diagnostics.update(status="bounded_search_exhausted" if frontier["truncated"] or heads_truncated else "no_feasible_plan",
+            reason="no plan in examined candidates under resource/locality/stage limits; widen explicit bounds or refresh observations",
+            search={**frontier, "heads_truncated": heads_truncated}, attempts=attempts)
+    return None
+
+
 def _main() -> int:
     """`python3 -m shard.plan` — JSON in ({nodes, rtt, model?, slack?}), JSON out (the plan, or null).
     `model` is a profile dict or a catalog model_id string (PROFILES)."""
@@ -728,8 +929,10 @@ def _main() -> int:
         json.dump({"error": f"bad request json: {e}"}, sys.stdout)
         return 2
     try:
-        plan = plan_ring(req["nodes"], req["rtt"], req.get("model"), slack=req.get("slack"),
-                         privacy=req.get("privacy"), isolation=req.get("isolation"))
+        plan = plan_ring(req["nodes"], req.get("rtt"), req.get("model"), slack=req.get("slack"),
+                         privacy=req.get("privacy"), isolation=req.get("isolation"),
+                         locality=req.get("locality"), objective=req.get("objective", "serial"),
+                         workload=req.get("workload"), measurements=req.get("measurements"), now=req.get("now"))
     except KeyError as e:
         json.dump({"error": f"missing field: {e}"}, sys.stdout)
         return 2

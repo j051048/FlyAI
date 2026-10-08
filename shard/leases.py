@@ -250,10 +250,7 @@ class LeaseLedger:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            now = self.clock()
-            if type(now) not in (int, float) or not math.isfinite(now) or now < 0:
-                raise LeaseError("clock must provide finite nonnegative Unix time")
-            now = max(float(now), float(conn.execute("SELECT value FROM meta WHERE key='clock_floor'").fetchone()[0]))
+            now = self._observed_now(conn)
             conn.execute("UPDATE meta SET value=? WHERE key='clock_floor'", (str(now),))
             self._cleanup(conn, now)
             # Preserve monotonic clock/expiry even if the requested operation is
@@ -274,6 +271,12 @@ class LeaseLedger:
             raise
         finally:
             conn.close()
+
+    def _observed_now(self, conn):
+        now = self.clock()
+        if type(now) not in (int, float) or not math.isfinite(now) or now < 0:
+            raise LeaseError("clock must provide finite nonnegative Unix time")
+        return max(float(now), float(conn.execute("SELECT value FROM meta WHERE key='clock_floor'").fetchone()[0]))
 
     @staticmethod
     def _cleanup(conn, now):
@@ -440,6 +443,15 @@ class LeaseLedger:
         return self._retire(lease_id, fencing_token, principal, "revoked")
 
     def assert_fence(self, lease_id, fencing_token, *, principal, ring_id=None, model_cohort_sha256=None):
+        # Valid execution checks need no fsync or writer lock. Expiry must still
+        # be durably recorded before refusal so clock rollback cannot revive it.
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            now = self._observed_now(conn)
+            lease = self._owned(conn, lease_id, fencing_token, principal, "assert_fence", ring_id, model_cohort_sha256)
+            if lease.expires_at > now:
+                self._live(lease, now, committed=True)
+                return lease
         with self._transaction() as (conn, now):
             lease = self._owned(conn, lease_id, fencing_token, principal, "assert_fence", ring_id, model_cohort_sha256)
             self._live(lease, now, committed=True)
@@ -518,6 +530,17 @@ class LeaseLedger:
                 lease.model_cohort_sha256 != model_cohort_sha256):
             raise LeaseFenceError("guard binding differs from ledger")
         return LeaseGuard(self, lease, principal)
+
+    def resident_work(self, lease_id, *, principal):
+        """Local runner recovery query, never proof that a vanished process exited."""
+        with closing(self._connect()) as conn:
+            lease = self._read(conn, lease_id)
+            subject = self._subject(principal, "get", lease.to_dict())
+            if subject != lease.controller_id or lease.node_id != self.node_id:
+                raise LeaseAuthorizationError("resident work belongs to another controller/node")
+            rows = conn.execute("SELECT id,fence FROM work WHERE lease_id=? AND ended IS NULL AND id LIKE 'resident-stage-%'",
+                                (lease_id,)).fetchall()
+            return [WorkLease(row[0], lease_id, row[1]) for row in rows]
 
 
 class LeaseGuard:

@@ -191,6 +191,158 @@ def test_partial_begin_failure_unwinds_previously_acquired_node_work():
     with pytest.raises(RingUnavailable, match="begin"):
         pool.warmup("a")
     assert not guards[0].works and ring.local_work == 0
+    assert ring.state == RingState.FAILED
+    pool.shutdown()
+
+
+def test_live_connection_with_invalid_final_proof_is_removed_from_admission():
+    class BadFinal(Backend):
+        def execute(self, job, emit, check):
+            result = super().execute(job, emit, check)
+            result["proof"]["verified"] = False
+            return result
+    pool = RingPool(); ring = add_ready(pool, backend=BadFinal())
+    bound = pool.acquire("test-model", COHORT, estimated_tokens=2); job = make_job()
+    with pytest.raises(RingUnavailable, match="proof"):
+        pool.execute(bound, job, job.commit, job.check_stop)
+    assert ring.state == RingState.FAILED and not pool.ready()[0]
+    pool.release(bound); pool.shutdown()
+
+
+def test_backend_connection_owner_cannot_be_shared_between_distinct_rings():
+    pool = RingPool(); ring = add_ready(pool)
+    with pytest.raises(ValueError, match="connection owner"):
+        pool.add("another", ring.backend, model_id="test-model", cohort_id=COHORT, gpu_uuids=["OTHER-GPU"])
+    pool.shutdown()
+
+
+def test_recovery_requires_idle_unverified_ring_and_a_new_signed_warmup():
+    pool = RingPool(); ring = add_ready(pool)
+    bound = pool.acquire("test-model", COHORT, estimated_tokens=2)
+    ring.backend.healthy = False
+    assert not pool.ready()[0]
+    with pytest.raises(RingUnavailable, match="idle"):
+        pool.recover(ring.ring_id)
+    pool.release(bound)
+    assert pool.recover(ring.ring_id)["proof_verified"] and pool.ready()[0]
+    pool.drain(ring.ring_id)
+    with pytest.raises(RingUnavailable):
+        pool.recover(ring.ring_id)
+
+
+def test_drain_during_actual_warmup_waits_for_work_cleanup_before_stop():
+    class SlowWarmup(Backend):
+        def warmup(self, timeout_s=300):
+            self.started.set(); self.release.wait(2)
+            return super().warmup(timeout_s)
+    pool = RingPool(); backend = SlowWarmup()
+    ring = pool.add("a", backend, model_id=backend.model_id, cohort_id=COHORT, gpu_uuids=["GPU"])
+    guard = Guard("a", "GPU")
+    pool.reserve("a", [guard]); pool.mark_loading("a")
+    errors = []
+    def warming():
+        try:
+            pool.warmup("a")
+        except Exception as error:
+            errors.append(error)
+    thread = threading.Thread(target=warming); thread.start()
+    assert backend.started.wait(1) and guard.works
+    pool.drain("a")
+    assert ring.state == RingState.DRAINING and not backend.closed
+    backend.release.set(); thread.join(2)
+    assert errors and ring.state == RingState.STOPPED and not guard.works
+
+
+def test_cleanup_failure_blocks_recovery_and_gpu_reuse():
+    class FailedEnd(Guard):
+        def end_work(self, work):
+            raise OSError("node cleanup acknowledgement lost")
+    pool = RingPool()
+    guard = FailedEnd("a", "GPU")
+    ring = pool.add("a", Backend(), model_id="test-model", cohort_id=COHORT, gpu_uuids=["GPU"])
+    pool.reserve("a", [guard]); pool.mark_loading("a")
+    with pytest.raises(OSError, match="cleanup"):
+        pool.warmup("a")
+    assert ring.state == RingState.FAILED and ring.local_work == 1
+    with pytest.raises(RingUnavailable):
+        pool.recover("a")
+    pool.drain("a"); assert ring.state == RingState.DRAINING
+    pool.add("b", Backend(), model_id="test-model", cohort_id=COHORT, gpu_uuids=["GPU"])
+    with pytest.raises(RingUnavailable, match="already"):
+        pool.reserve("b", [Guard("b", "GPU")])
+
+
+def test_pool_registration_has_an_explicit_bound():
+    pool = RingPool(max_rings=1); add_ready(pool)
+    with pytest.raises(ValueError):
+        pool.add("extra", Backend(), model_id="test-model", cohort_id=COHORT, gpu_uuids=["GPU-extra"])
+    pool.shutdown()
+
+
+def test_live_ring_capacity_survives_many_normal_reformations_with_bounded_history():
+    pool = RingPool(max_rings=1, max_history=2)
+    saved = None
+    for index in range(20):
+        ring = add_ready(pool, str(index), gpu="GPU-reused")
+        bound = pool.acquire("test-model", COHORT, estimated_tokens=2)
+        if index == 0:
+            saved = bound
+        pool.release(bound); pool.drain(ring.ring_id)
+        assert ring.state == RingState.STOPPED
+        assert len(pool.rings()) <= 2
+    assert saved.ring.ring_id == "0" and saved.backend.closed
+    assert saved.ring not in pool.rings()  # old clients still own the original object
+    assert len(pool.rings()) == 2
+    pool.shutdown()
+
+
+def test_slow_remote_guard_refresh_does_not_hold_pool_lock_or_block_other_ring():
+    class SlowGuard(Guard):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.slow = False
+            self.entered, self.unblock = threading.Event(), threading.Event()
+        def assert_live(self):
+            if self.slow:
+                self.entered.set(); self.unblock.wait(2)
+            return super().assert_live()
+    pool = RingPool()
+    slow = SlowGuard("slow", "GPU-slow")
+    add_ready(pool, "slow", guards=[slow])
+    healthy = add_ready(pool, "healthy", region="east")
+    slow.slow = True
+    assert slow.entered.wait(1)
+    done, selected = threading.Event(), []
+    def admission():
+        selected.append(pool.acquire("test-model", COHORT, estimated_tokens=2, region="east"))
+        done.set()
+    thread = threading.Thread(target=admission); thread.start()
+    try:
+        assert done.wait(0.3), "guard RPC held the global pool admission lock"
+        assert selected[0].ring is healthy
+    finally:
+        slow.unblock.set(); thread.join(1)
+        for binding in selected:
+            pool.release(binding)
+        pool.shutdown()
+
+
+def test_idle_guard_refresh_tracks_external_renewal_without_needing_a_request():
+    pool = RingPool(); ring = add_ready(pool)
+    initial = ring.lease_expires_at
+    ring.guards[0].expires_at = initial + 600
+    updated = threading.Event()
+    original = ring.guards[0].assert_live
+    def observe():
+        lease = original(); updated.set(); return lease
+    ring.guards[0].assert_live = observe
+    assert updated.wait(1)
+    # Event is set just before the monitor stores the lease snapshot. Acquire the
+    # next guard cycle deterministically if that write has not happened yet.
+    end = time.monotonic() + 1
+    while ring.lease_expires_at == initial and time.monotonic() < end:
+        updated.clear(); updated.wait(0.1)
+    assert ring.lease_expires_at == initial + 600 and pool.ready()[0]
     pool.shutdown()
 
 

@@ -12,10 +12,10 @@ import time
 
 try:
     from shard.service_queue import ServiceQueue, AdmissionError, JobCancelled, JobExpired
-    from shard.ring_pool import RingUnavailable
+    from shard.ring_pool import RingUnavailable, RingState
 except ImportError:
     from service_queue import ServiceQueue, AdmissionError, JobCancelled, JobExpired
-    from ring_pool import RingUnavailable
+    from ring_pool import RingUnavailable, RingState
 
 
 class RingRouter:
@@ -58,15 +58,22 @@ class MultiRingQueue(ServiceQueue):
             with self._condition:
                 if self._stopping:
                     return
+                for ring_id, worker in tuple(self._ring_workers.items()):
+                    if not worker.is_alive():
+                        self._ring_workers.pop(ring_id, None)
                 for ring in self.router.pool.rings():
-                    if ring.ring_id not in self._ring_workers:
-                        worker = threading.Thread(target=self._run_ring, args=(ring.ring_id,),
+                    if ring.state != RingState.STOPPED and ring.ring_id not in self._ring_workers:
+                        worker = threading.Thread(target=self._run_ring, args=(ring,),
                                                   name="ring-" + ring.ring_id, daemon=True)
                         self._ring_workers[ring.ring_id] = worker
                         worker.start()
                 self._condition.wait(0.1)
 
     def submit_request(self, tenant, body, *, idempotency_key=None):
+        if tenant not in self.tenants:
+            raise AdmissionError("unknown tenant", status=403, code="permission_denied")
+        if idempotency_key is not None and (not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128):
+            raise AdmissionError("idempotency key must have 1..128 characters", status=400, code="invalid_request_error")
         if not isinstance(body, dict):
             raise AdmissionError("request must be a JSON object", status=400, code="invalid_request_error")
         try:
@@ -118,12 +125,12 @@ class MultiRingQueue(ServiceQueue):
                 self.router.pool.release(binding)
                 raise
 
-    def _next_for_ring(self, ring_id):
+    def _next_for_ring(self, ring):
         for _ in range(len(self._round)):
             tenant = self._round.popleft()
             queue = self._queues[tenant]
             job = next((item for item in queue if not item.terminal and
-                        item.ring_binding.ring.ring_id == ring_id), None)
+                        item.ring_binding.ring is ring), None)
             if job is None:
                 if queue:
                     self._round.append(tenant)
@@ -150,13 +157,16 @@ class MultiRingQueue(ServiceQueue):
             self.router.pool.release(job.ring_binding, elapsed_s=elapsed,
                                      tokens=job.prompt_tokens + len(job.tokens) if state == "completed" else None)
 
-    def _run_ring(self, ring_id):
+    def _run_ring(self, ring):
+        ring_id = ring.ring_id
         while True:
             with self._condition:
-                job = self._next_for_ring(ring_id)
+                job = self._next_for_ring(ring)
                 while job is None and not self._stopping:
+                    if ring.state == RingState.STOPPED:
+                        return
                     self._condition.wait(0.1)
-                    job = self._next_for_ring(ring_id)
+                    job = self._next_for_ring(ring)
                 if job is None and self._stopping:
                     return
                 self._running_by_ring[ring_id] = job

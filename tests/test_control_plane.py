@@ -76,6 +76,68 @@ def test_cohort_mismatch_never_reserves_node(tmp_path):
     assert "cohort" in answer["payload"]["error"]
 
 
+def test_agent_restart_never_mistakes_durable_resident_work_for_an_idle_gpu(tmp_path):
+    ledger, agent = node(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    principal = _identity(key)[0]
+    lease = ledger.prepare(request(ledger.node_id), principal=principal, idempotency_key="resident")
+    ledger.commit(lease.lease_id, lease.fencing_token, principal=principal)
+    resident = ledger.begin_work(lease.lease_id, lease.fencing_token, principal=principal,
+                                 work_id="resident-stage-old-process")
+    restarted = NodeLeaseAgent(ledger, agent.key, cohorts={"1" * 64},
+                               stage_factory=lambda *_: pytest.fail("must not launch another process"))
+    base = {"lease_id": lease.lease_id, "fencing_token": lease.fencing_token}
+    try:
+        reply = restarted.dispatch(_signed("request", {"action": "stage_status", "body": base}, key))
+        assert reply["payload"]["result"] == {"running": None, "resident_work_held": True, "cleanup_unconfirmed": True}
+        assignment = {"ring_id": "ring", "cohort_id": "1" * 64, "node_id": ledger.node_id, "gpu_uuid": "GPU-0"}
+        reply = restarted.dispatch(_signed("request", {"action": "start_stage", "body": {**base, "assignment": assignment}}, key))
+        assert reply["payload"]["ok"] is False and "unconfirmed" in reply["payload"]["error"]
+    finally:
+        ledger.end_work(resident, principal=principal)
+
+
+def test_remote_lease_owner_cannot_acknowledge_resident_process_cleanup(tmp_path):
+    ledger, agent = node(tmp_path)
+    with serving(lambda p, b: agent.dispatch(b)) as address:
+        key = Ed25519PrivateKey.generate()
+        client = LeaseRPCClient(address, ledger.node_id, key)
+        lease = client.prepare(request(ledger.node_id), idempotency_key="x")
+        lease = client.operation("commit", lease)
+        resident = ledger.begin_work(lease["lease_id"], lease["fencing_token"],
+                                     principal=_identity(key)[0], work_id="resident-stage-" + lease["lease_id"])
+        with pytest.raises(ControlError, match="local engine cleanup"):
+            client.call("end_work", {"work": resident.to_dict()})
+        assert ledger.get(lease["lease_id"], principal=_identity(key)[0]).active_work == 1
+        ledger.end_work(resident, principal=_identity(key)[0])
+
+
+def test_signed_http_controller_starts_only_a_locally_configured_resident_process(tmp_path):
+    import sys
+    from shard.leased_runtime import LeasedProcessRunner
+    ledger, agent = node(tmp_path)
+    agent.stage_factory = lambda assignment, guard: LeasedProcessRunner(guard,
+        ledger_path=tmp_path / "leases.sqlite",
+        command_factory=lambda _: [sys.executable, "-c", "import time; time.sleep(300)"])
+    with serving(lambda p, b: agent.dispatch(b)) as address:
+        key = Ed25519PrivateKey.generate()
+        client = LeaseRPCClient(address, ledger.node_id, key)
+        lease = client.prepare(request(ledger.node_id), idempotency_key="start")
+        lease = client.operation("commit", lease)
+        assignment = {"ring_id": "ring", "cohort_id": "1" * 64, "node_id": ledger.node_id, "gpu_uuid": "GPU-0"}
+        try:
+            with pytest.raises(ControlError, match="commands"):
+                client.operation("start_stage", lease, assignment={**assignment, "argv": ["wrong"]})
+            started = client.operation("start_stage", lease, assignment=assignment)
+            assert started["pid"] > 0
+            assert client.operation("stage_status", lease)["resident_work_held"]
+            client.operation("stop_stage", lease)
+            assert not client.operation("stage_status", lease)["running"]
+            assert ledger.get(lease["lease_id"], principal=_identity(key)[0]).active_work == 0
+        finally:
+            client.operation("stop_stage", lease)
+
+
 def test_rpc_nonce_replay_is_rejected_across_agent_restart(tmp_path):
     ledger, agent = node(tmp_path)
     path = tmp_path / "replays.sqlite"

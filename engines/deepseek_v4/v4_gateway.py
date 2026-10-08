@@ -733,6 +733,8 @@ readiness claims are never accepted; every backend actually executes warmup.
             if hashlib.sha256((directory / "config.json").read_bytes()).hexdigest() != cohort.config_sha256:
                 raise ValueError("local checkpoint config differs from model cohort")
             caps = [stage["runtime_config"]["args"]["max_seq_len"] for stage in bundle["stages"]]
+            if not caps or any(type(cap) is not int or cap < 1 for cap in caps):
+                raise ValueError("measured stage context limits are required")
             context = record.get("max_context", min(caps))
             if any(type(cap) is not int or cap < 1 for cap in caps) or type(context) is not int or not 1 <= context <= min(caps):
                 raise ValueError("service context must fit every measured stage")
@@ -744,8 +746,12 @@ readiness claims are never accepted; every backend actually executes warmup.
                 backend.close()
                 raise ValueError("served backend differs from declared model cohort")
             backend.model_cohort = cohort.to_dict()
-            pool.add(ring_id, backend, model_id=cohort.model_id, cohort_id=cohort.cohort_id,
-                     gpu_uuids=[stage["gpu_uuid"] for stage in bundle["stages"]], region=record.get("region"))
+            try:
+                pool.add(ring_id, backend, model_id=cohort.model_id, cohort_id=cohort.cohort_id,
+                         gpu_uuids=[stage["gpu_uuid"] for stage in bundle["stages"]], region=record.get("region"))
+            except Exception:
+                backend.close()
+                raise
             guards = [(guard_loader(spec, ring_id=ring_id, cohort_id=cohort.cohort_id) if guard_loader else
                        _manifest_guard(spec, ring_id=ring_id, cohort_id=cohort.cohort_id, base=base))
                       for spec in record["leases"]]
@@ -753,7 +759,7 @@ readiness claims are never accepted; every backend actually executes warmup.
             for stage in bundle["stages"]:
                 guard = by_gpu[stage["gpu_uuid"]]
                 req = PlacementRequirements.from_dict(stage["requirements"])
-                if (guard.node_id != stage["node_id"] or guard.memory_domain_id != stage["host_id"] or
+                if (guard.node_id != stage["node_id"] or guard.memory_domain_id != stage.get("memory_domain_id", stage["host_id"]) or
                         guard.resources.vram_bytes < req.gpu.peak_bytes or
                         guard.resources.ram_bytes < req.host.peak_bytes or
                         guard.resources.pinned_bytes < req.host.pinned_bytes):

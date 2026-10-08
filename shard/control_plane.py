@@ -108,11 +108,13 @@ class ReplayCache:
 
 class NodeLeaseAgent:
     """Authenticate requests before the ledger's ownership and resource checks."""
-    def __init__(self, ledger, key, *, cohorts, replay=None, clock=time.time):
+    def __init__(self, ledger, key, *, cohorts, replay=None, clock=time.time, stage_factory=None):
         self.ledger, self.key, self.clock = ledger, key, clock
         self.cohorts = set(cohorts)
         self.replay = replay or ReplayCache(clock=clock)
         self.peer_id = _identity(key)[0]
+        self.stage_factory, self._runners = stage_factory, {}
+        self._runner_lock = threading.RLock()
         if not ledger.node_id.startswith(self.peer_id + "/"):
             raise ControlError("lease node identity differs from sidecar identity")
 
@@ -131,6 +133,8 @@ class NodeLeaseAgent:
                 if set(body) != {"request", "idempotency_key"}:
                     raise ControlError("invalid prepare arguments")
                 request = LeaseRequest.from_dict(body["request"])
+                if request.gpu_uuid != self.ledger.node_id.split("/", 1)[1]:
+                    raise ControlError("GPU differs from authenticated node endpoint")
                 if request.model_cohort_sha256 not in self.cohorts:
                     raise ControlError("node does not support this model cohort")
                 value = self.ledger.prepare(request, principal=peer, idempotency_key=body["idempotency_key"])
@@ -143,11 +147,56 @@ class NodeLeaseAgent:
                 if action == "renew":
                     kwargs.update(ttl_s=body["ttl_s"], idempotency_key=body["idempotency_key"])
                 elif action == "begin_work":
-                    kwargs["work_id"] = body["work_id"]
+                    work_id = body["work_id"]
+                    if not isinstance(work_id, str) or not work_id or len(work_id) > 128:
+                        raise ControlError("bounded RPC work_id required")
+                    # A remote controller cannot create or end a node-local
+                    # resident engine handle, even when it owns the lease.
+                    kwargs["work_id"] = "rpc:" + peer + ":" + work_id
                 value = getattr(self.ledger, action)(body["lease_id"], body["fencing_token"], **kwargs)
+            elif action in {"start_stage", "stop_stage", "stage_status"}:
+                expected = {"lease_id", "fencing_token"} | ({"assignment"} if action == "start_stage" else set())
+                if set(body) != expected:
+                    raise ControlError("invalid stage lifecycle arguments")
+                lease = self.ledger.get(body["lease_id"], principal=peer)
+                if lease.fencing_token != body["fencing_token"]:
+                    raise ControlError("stage lifecycle fencing token differs")
+                with self._runner_lock:
+                    runner = self._runners.get(lease.lease_id)
+                    if action == "start_stage":
+                        if self.stage_factory is None:
+                            raise ControlError("node has no locally configured engine runner")
+                        assignment = body["assignment"]
+                        allowed = {"ring_id", "cohort_id", "node_id", "gpu_uuid", "lo", "hi", "head", "tail",
+                                   "stage", "nstages", "next"}
+                        if not isinstance(assignment, dict) or set(assignment) - allowed:
+                            raise ControlError("remote assignment cannot contain commands or environment")
+                        guard = self.ledger.guard(lease.lease_id, lease.fencing_token, principal=peer,
+                                                  ring_id=lease.ring_id, model_cohort_sha256=lease.model_cohort_sha256)
+                        guard.assert_live()
+                        if runner is None or not runner.status()["resident_work_held"]:
+                            if self.ledger.resident_work(lease.lease_id, principal=peer):
+                                raise ControlError("resident stage cleanup is unconfirmed after restart")
+                            runner = self.stage_factory(assignment, guard)
+                            value = runner.start(assignment)
+                            self._runners[lease.lease_id] = runner
+                        else:
+                            value = runner.status()
+                    elif runner is None:
+                        orphaned = bool(self.ledger.resident_work(lease.lease_id, principal=peer))
+                        value = {"running": None if orphaned else False, "resident_work_held": orphaned,
+                                 "cleanup_unconfirmed": orphaned}
+                    elif action == "stop_stage":
+                        runner.stop()
+                        value = runner.status()
+                        self._runners.pop(lease.lease_id, None)
+                    else:
+                        value = runner.status()
             elif action == "end_work":
                 if set(body) != {"work"} or set(body["work"]) != {"work_id", "lease_id", "fencing_token"}:
                     raise ControlError("invalid work release")
+                if not body["work"]["work_id"].startswith("rpc:" + peer + ":"):
+                    raise ControlError("remote controller cannot acknowledge local engine cleanup")
                 value = self.ledger.end_work(WorkLease(**body["work"]), principal=peer)
             else:
                 raise ControlError("unknown lease action")
@@ -196,6 +245,8 @@ def _json_loads(raw):
 def control_server(address, dispatch, *, certificate=None, private_key=None):
     """Bounded JSON HTTP adapter; public bindings require configured TLS."""
     host, port = address
+    if bool(certificate) != bool(private_key):
+        raise ControlError("provide both TLS certificate and key")
     if host not in {"127.0.0.1", "::1", "localhost"} and not (certificate and private_key):
         raise ControlError("non-loopback control listener requires TLS")
     class Handler(BaseHTTPRequestHandler):
@@ -234,7 +285,9 @@ def control_server(address, dispatch, *, certificate=None, private_key=None):
     if certificate and private_key:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certificate, private_key)
-        server.socket = context.wrap_socket(server.socket, server_side=True)
+        # Handshake in the bounded worker after its socket timeout is set;
+        # an idle TLS client must not block the accept/renewal loop.
+        server.socket = context.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
     return server
 
 
@@ -282,6 +335,9 @@ class RemoteLeaseGuard:
         self.watch_interval_s = 1.0
         self._lease = self.assert_live()
         self.gpu_uuid, self.memory_domain_id = self._lease.gpu_uuid, self._lease.memory_domain_id
+        from .leases import LeaseResources
+        self.node_id = self._lease.node_id
+        self.resources = LeaseResources.from_dict(self._lease.resources)
 
     def assert_live(self):
         row = self.client.call("assert_fence", {"lease_id": self.lease_id, "fencing_token": self.fencing_token})
@@ -321,135 +377,283 @@ class LocalLeaseClient:
                                  ring_id=ring_id, model_cohort_sha256=cohort_id)
 
 
-class FormationController:
-    """Joint planning then all-node reservation, loading and signed warmup.
+class ManagedRingBackend:
+    """Existing inference backend plus node-local process lifecycle acknowledgements."""
+    def __init__(self, backend, nodes):
+        self.backend, self.nodes = backend, tuple(nodes)
 
-    requirements(stage,offer) must produce the exact measured block resource
-    contract; backend_factory receives that immutable assignment. This prevents
-    turning a scalar planning estimate into a production resource admission.
+    def __getattr__(self, name):
+        return getattr(self.backend, name)
+
+    def load(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(16, len(self.nodes))) as workers:
+            futures = [workers.submit(client.operation, "start_stage", lease, assignment=assignment)
+                       for client, lease, assignment in self.nodes]
+            errors = []
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(exc)
+            if errors:
+                # Stop every selected node, including starts whose reply was lost.
+                self.close()
+                raise errors[0]
+
+    def close(self):
+        self.backend.close()
+        errors = []
+        for client, lease, _ in self.nodes:
+            try:
+                state = client.operation("stop_stage", lease)
+                if state.get("resident_work_held") or state.get("cleanup_unconfirmed"):
+                    raise ControlError("node engine cleanup was not acknowledged")
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+
+
+class FormationController:
+    """Plan, reserve and start rings; maintenance continues during slow loading.
+
+    The caller supplies measured block contracts and a configured engine adapter.
+    Global locks cover only state snapshots, never network or model operations.
     """
-    def __init__(self, registry, ring_pool, agents, *, requirements, backend_factory, clock=time.time):
+    def __init__(self, registry, ring_pool, agents, *, requirements, backend_factory,
+                 clock=time.time, maintain=True, agent_factory=None):
         self.registry, self.pool, self.agents = registry, ring_pool, dict(agents)
         self.requirements, self.backend_factory, self.clock = requirements, backend_factory, clock
+        self.agent_factory = agent_factory
         self._lock = threading.RLock()
         self._formations = {}
+        self._closed = False
+        self._maintenance_stop = threading.Event()
+        self._maintenance = None
+        if maintain:
+            self._maintenance = threading.Thread(target=self._maintain, daemon=True, name="ring-lease-renewal")
+            self._maintenance.start()
+
+    def _maintain(self):
+        while not self._maintenance_stop.wait(.1):
+            self.tick(asynchronous=True)
 
     def form(self, ring_id, cohort, profile, *, rtt=None, measurements=None, locality=None,
              objective="serial", workload=None, ttl_s=120, warmup_timeout_s=60):
         from .plan import plan_ring
         from .leases import LeaseRequest, LeaseResources
         from .resources import PlacementRequirements
+        from datetime import datetime
         cohort = cohort if isinstance(cohort, ModelCohort) else ModelCohort.from_dict(cohort)
         cid = cohort.cohort_id
         if int(profile.get("n_layers", -1)) != cohort.n_layers:
             raise ControlError("placement profile layer count differs from model cohort")
+        info = {"leases": [], "gpus": [], "cohort": cid, "ttl_s": ttl_s, "next_renewal": self.clock() + ttl_s / 3,
+                "renewal_sequence": 0, "io_lock": threading.RLock(), "failed": threading.Event(),
+                "added": False, "draining": False, "backend": None}
         with self._lock:
-            if ring_id in self._formations:
-                raise ControlError("ring_id already has a formation")
+            if self._closed or ring_id in self._formations:
+                raise ControlError("controller is closed or ring_id already has a formation")
+            self._formations[ring_id] = info
+            busy = {uuid for other in self._formations.values() if other is not info for uuid in other["gpus"]}
+        guards, contracts = [], []
+        try:
             nodes = self.registry.snapshot(cid)
-            busy = {uuid for info in self._formations.values() for uuid in info["gpus"]}
+            all_ids = [n["id"] for n in nodes]
+            if self.agent_factory is not None:
+                for node in nodes:
+                    if node["id"] not in self.agents:
+                        try:
+                            client = self.agent_factory(self.registry.get(node["id"]))
+                            if client.node_id != node["id"]:
+                                raise ControlError("discovered lease agent identity mismatch")
+                            with self._lock:
+                                self.agents[node["id"]] = client
+                        except (ValueError, KeyError, OSError):
+                            continue  # Registered nodes without a usable endpoint stay in the pool.
             nodes = [n for n in nodes if n["gpu_uuid"] not in busy and n["id"] in self.agents]
-            # Sparse unknown links never become zero-cost network connections.
-            if rtt is None:
-                rtt = [[0 if a["id"] == b["id"] else 9000 for b in nodes] for a in nodes]
+            if rtt is not None:
+                # Caller dense matrices align to the complete cohort snapshot.
+                positions = [all_ids.index(n["id"]) for n in nodes]
+                rtt = [[rtt[a][b] for b in positions] for a in positions]
+            diagnostics = {}
             plan = plan_ring(nodes, rtt, profile, locality=locality or {"mode": "prefer_local"},
-                             objective=objective, workload=workload, measurements=measurements, now=self.clock())
+                             objective=objective, workload=workload, measurements=measurements, now=self.clock(),
+                             diagnostics=diagnostics)
             if plan is None:
-                raise ControlError("no compatible ring satisfies locality and resource requirements")
-            leases, contracts, guards = [], [], []
-            added = False
-            try:
-                # Validate every measured contract before reserving any node.
-                for stage in plan["stages"]:
-                    offer = self.registry.get(stage["id"])
-                    req = self.requirements(copy.deepcopy(stage), copy.deepcopy(offer))
-                    if not isinstance(req, PlacementRequirements):
-                        req = PlacementRequirements.from_dict(req)
-                    if ((req.layer_start, req.layer_end, req.model_id) != (stage["lo"], stage["hi"], cohort.model_id)
-                            or req.provenance.node_id != offer["node_id"] or req.provenance.checkpoint_id != cohort.checkpoint_id):
-                        raise ControlError("measured block contract differs from model assignment")
-                    # Provenance timestamp may be ISO; no stale evidence is used for admission.
-                    from datetime import datetime
-                    measured = datetime.fromisoformat(req.provenance.measured_at.replace("Z", "+00:00")).timestamp()
-                    if not -30 <= self.clock() - measured <= self.registry.max_ttl_s:
-                        raise ControlError("block calibration is stale")
-                    contracts.append((stage, offer, req))
-                for stage, offer, req in contracts:
-                    request = LeaseRequest(ring_id, cid, offer["node_id"], offer["gpu_uuid"],
-                                           offer["memory_domain_id"],
-                                           LeaseResources(req.gpu.peak_bytes, req.host.peak_bytes, req.host.pinned_bytes), ttl_s)
-                    client = self.agents[offer["node_id"]]
-                    if client.node_id != offer["node_id"]:
-                        raise ControlError("lease agent identity differs from selected offer")
+                raise ControlError(diagnostics.get("reason", "no compatible ring found in the examined candidates"))
+            plan["ring_id"] = ring_id
+            info["plan"] = plan
+            selected = {node["id"]: node for node in nodes}
+            with self._lock:
+                info["gpus"] = [self.registry.get(stage["id"])["gpu_uuid"] for stage in plan["stages"]]
+            for stage in plan["stages"]:
+                stage["cohort_id"] = cid
+                offer = self.registry.get(stage["id"])
+                if (offer["sequence"] != selected[stage["id"]]["offer_sequence"] or
+                        cid not in {model_cohort_id(item["cohort"]) for item in offer["models"]}):
+                    raise ControlError("selected offer changed during planning; form a fresh plan")
+                req = self.requirements(copy.deepcopy(stage), copy.deepcopy(offer))
+                if not isinstance(req, PlacementRequirements):
+                    req = PlacementRequirements.from_dict(req)
+                if ((req.layer_start, req.layer_end, req.model_id) != (stage["lo"], stage["hi"], cohort.model_id)
+                        or req.provenance.node_id != offer["node_id"] or req.provenance.checkpoint_id != cohort.checkpoint_id):
+                    raise ControlError("measured block contract differs from model assignment")
+                measured = datetime.fromisoformat(req.provenance.measured_at.replace("Z", "+00:00")).timestamp()
+                if not -30 <= self.clock() - measured <= self.registry.max_ttl_s:
+                    raise ControlError("block calibration is stale")
+                contracts.append((stage, offer, req))
+            for stage, offer, req in contracts:
+                request = LeaseRequest(ring_id, cid, offer["node_id"], offer["gpu_uuid"], offer["memory_domain_id"],
+                                       LeaseResources(req.gpu.peak_bytes, req.host.peak_bytes, req.host.pinned_bytes), ttl_s)
+                client = self.agents[offer["node_id"]]
+                if client.node_id != offer["node_id"]:
+                    raise ControlError("lease agent identity differs from selected offer")
+                with info["io_lock"]:
+                    if info["failed"].is_set():
+                        raise ControlError("formation lease maintenance failed")
                     lease = client.prepare(request, idempotency_key=f"{ring_id}:{offer['node_id']}")
-                    leases.append((client, lease))
-                for i, (client, lease) in enumerate(leases):
+                    info["leases"].append((client, lease))
+            with info["io_lock"]:
+                if any(self.registry.get(stage["id"])["sequence"] != selected[stage["id"]]["offer_sequence"]
+                       for stage, _, _ in contracts):
+                    raise ControlError("selected offer changed before commit")
+                for i, (client, lease) in enumerate(info["leases"]):
                     lease = client.operation("commit", lease)
-                    leases[i] = client, lease
+                    info["leases"][i] = client, lease
                     guard = (client.guard(lease, ring_id=ring_id, cohort_id=cid) if isinstance(client, LocalLeaseClient)
                              else RemoteLeaseGuard(client, lease["lease_id"], lease["fencing_token"], ring_id=ring_id, cohort_id=cid))
                     guards.append(guard)
-                backend = self.backend_factory(copy.deepcopy(plan), cohort, [req.to_dict() for _, _, req in contracts])
-                gpus = [offer["gpu_uuid"] for _, offer, _ in contracts]
-                region = next((offer.get("region") for _, offer, _ in contracts if offer.get("region")), None)
-                self.pool.add(ring_id, backend, model_id=cohort.model_id, cohort_id=cid, gpu_uuids=gpus, region=region)
-                added = True
-                self.pool.reserve(ring_id, guards)
-                self.pool.mark_loading(ring_id)
-                # Optional loader is an explicit, configured engine adapter, never peer-supplied code.
-                load = getattr(backend, "load", None)
-                if load is not None:
-                    handles = [guard.begin_work() for guard in guards]
-                    try:
-                        load()
-                    finally:
-                        for guard, work in zip(guards, handles):
-                            guard.end_work(work)
-                self.pool.warmup(ring_id, timeout_s=warmup_timeout_s)
-                self._formations[ring_id] = {"plan": plan, "leases": leases, "gpus": gpus, "cohort": cid,
-                                             "ttl_s": ttl_s, "next_renewal": self.clock() + ttl_s / 3,
-                                             "renewal_sequence": 0}
-                return {"ring_id": ring_id, "cohort_id": cid, "plan": plan, "ready": True}
-            except BaseException:
-                if added:
-                    self.pool.fail(ring_id, "formation failed")
-                for client, lease in reversed(leases):
-                    try:
-                        client.operation("release", lease)
-                    except (ValueError, RuntimeError, OSError):
-                        pass  # failed RPC retains the node-side reservation until expiry/cleanup
-                raise
-
-    def tick(self):
-        """Renew live formations; revoke readiness on any lost lease."""
-        with self._lock:
-            for ring_id, info in list(self._formations.items()):
-                if self.clock() < info["next_renewal"]:
-                    continue
-                info["renewal_sequence"] += 1
+            backend = self.backend_factory(copy.deepcopy(plan), cohort, [req.to_dict() for _, _, req in contracts])
+            info["backend"] = backend
+            regions = {offer.get("region") for _, offer, _ in contracts}
+            region = next(iter(regions)) if len(regions) == 1 and None not in regions else None
+            self.pool.add(ring_id, backend, model_id=cohort.model_id, cohort_id=cid,
+                          gpu_uuids=info["gpus"], region=region, on_stopped=self._stopped)
+            info["added"] = True
+            self.pool.reserve(ring_id, guards)
+            self.pool.mark_loading(ring_id)
+            load = getattr(backend, "load", None)
+            if load is not None:
+                handles = []
                 try:
-                    for i, (client, lease) in enumerate(info["leases"]):
-                        renewed = client.operation("renew", lease, ttl_s=info["ttl_s"],
-                                                   idempotency_key=f"{ring_id}:renew:{info['renewal_sequence']}")
-                        info["leases"][i] = client, renewed
-                    info["next_renewal"] = self.clock() + info["ttl_s"] / 3
+                    for guard in guards:
+                        handles.append((guard, guard.begin_work()))
+                    load()
+                    if info["failed"].is_set():
+                        raise ControlError("lease maintenance failed during loading")
+                finally:
+                    errors = []
+                    for guard, work in reversed(handles):
+                        try:
+                            guard.end_work(work)
+                        except Exception as error:
+                            errors.append(error)
+                    if errors:
+                        raise errors[0]
+            self.pool.warmup(ring_id, timeout_s=warmup_timeout_s)
+            if info["failed"].is_set():
+                raise ControlError("lease maintenance failed during warmup")
+            return {"ring_id": ring_id, "cohort_id": cid, "plan": plan, "ready": True}
+        except BaseException:
+            info["failed"].set()
+            if info["added"]:
+                self.pool.fail(ring_id, "formation failed")
+                self.pool.drain(ring_id)
+            else:
+                if info["backend"] is not None:
+                    info["backend"].close()
+                self._release_formation(ring_id, info)
+            raise
+
+    def tick(self, *, asynchronous=False):
+        with self._lock:
+            snapshot = list(self._formations.items())
+        for ring_id, info in snapshot:
+            if info["failed"].is_set() or self.clock() < info["next_renewal"]:
+                continue
+            with self._lock:
+                if info.get("renewing"):
+                    continue
+                info["renewing"] = True
+            if asynchronous:
+                threading.Thread(target=self._renew_one, args=(ring_id, info), daemon=True,
+                                 name="formation-lease-renewal").start()
+            else:
+                self._renew_one(ring_id, info)
+
+    def _renew_one(self, ring_id, info):
+        acquired = info["io_lock"].acquire(False)
+        try:
+            if not acquired or info["failed"].is_set():
+                return
+            info["renewal_sequence"] += 1
+            for i, (client, lease) in enumerate(info["leases"]):
+                renewed = client.operation("renew", lease, ttl_s=info["ttl_s"],
+                                           idempotency_key=f"{ring_id}:renew:{info['renewal_sequence']}")
+                info["leases"][i] = client, renewed
+            info["next_renewal"] = self.clock() + info["ttl_s"] / 3
+        except (ValueError, RuntimeError, OSError):
+            info["failed"].set()
+            backend = info["backend"]
+            if backend is not None:
+                backend.abort()
+            if info["added"]:
+                self.pool.fail(ring_id, "lease renewal failed")
+                self.pool.drain(ring_id)
+        finally:
+            if acquired:
+                info["io_lock"].release()
+            with self._lock:
+                info["renewing"] = False
+
+    def _stopped(self, ring_id):
+        # RingPool invokes its callback under its own lock; never perform RPC or
+        # acquire the controller lock synchronously on that callback stack.
+        threading.Thread(target=self._release_formation, args=(ring_id,), daemon=True,
+                         name="stopped-ring-cleanup").start()
+
+    def _release_formation(self, ring_id, expected=None):
+        with self._lock:
+            info = self._formations.get(ring_id)
+        if info is None or (expected is not None and info is not expected):
+            return
+        info["failed"].set()
+        with info["io_lock"]:
+            for client, lease in reversed(info["leases"]):
+                try:
+                    client.operation("release", lease)
                 except (ValueError, RuntimeError, OSError):
-                    self.pool.fail(ring_id, "lease renewal failed")
-                    self.stop(ring_id)
+                    pass  # Node-side expiry/real process cleanup still prevents reuse.
+        with self._lock:
+            if self._formations.get(ring_id) is info:
+                self._formations.pop(ring_id)
+            if self._closed and not self._formations:
+                self._maintenance_stop.set()
 
     def stop(self, ring_id):
         with self._lock:
             info = self._formations.get(ring_id)
-            if info is None:
-                return
+        if info is None:
+            return
+        info["draining"] = True
+        if info["added"]:
+            # Keep renewing until queued and running bindings have all finished.
             self.pool.drain(ring_id)
-            for client, lease in info["leases"]:
-                try:
-                    client.operation("release", lease)
-                except (ValueError, RuntimeError, OSError):
-                    pass
-            # Node ledgers retain active-work resources until the executor finishes.
-            self._formations.pop(ring_id, None)
+        else:
+            info["failed"].set()
+            self._release_formation(ring_id, info)
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            rings = list(self._formations)
+            if not rings:
+                self._maintenance_stop.set()
+        for ring_id in rings:
+            self.stop(ring_id)
 
 
 def main(argv=None):
@@ -489,7 +693,10 @@ def main(argv=None):
         ledger.register_capacity(capacity["memory_domain_id"], available_ram_bytes=capacity["available_ram_bytes"],
                                  pinnable_ram_bytes=capacity["pinnable_ram_bytes"],
                                  gpu_capacity_bytes=capacity["gpu_capacity_bytes"])
-        agent = NodeLeaseAgent(ledger, key, cohorts=capacity["cohort_ids"], replay=ReplayCache(str(args.db) + ".rpc"))
+        from .leased_runtime import configured_stage_factory
+        factory = configured_stage_factory(args.db, capacity["stages"]) if capacity.get("stages") else None
+        agent = NodeLeaseAgent(ledger, key, cohorts=capacity["cohort_ids"], replay=ReplayCache(str(args.db) + ".rpc"),
+                               stage_factory=factory)
         def dispatch(path, body):
             if path != "/lease":
                 raise ControlError("unknown node endpoint")

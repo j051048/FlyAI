@@ -845,7 +845,7 @@ def _reset_capacity_error(st, msg):
 
 def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=None, device=None,
                 receipts=None, key_path=None, timeout=600.0, bind="127.0.0.1", ready=None,
-                ret_relay=None, dspark=False, runtime_metrics=None, token_privacy=None):
+                ret_relay=None, dspark=False, runtime_metrics=None, token_privacy=None, lease_guard=None):
     """Serve one contiguous layer block [lo:hi) in the fire-forward ring.
 
     head (stage 0)      embeds token ids -> h [b, s, 4, dim], runs its layers, forwards (h, ids).
@@ -863,10 +863,16 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
     reset's `dspark` flag. `ready` is an optional threading.Event set once the stage is listening (the
     selftest waits on it instead of sleeping). `args` (a ModelArgs) skips the on-disk config for an
     in-process ring; `ckpt_dir` loads real weights."""
+    if lease_guard is not None:
+        lease_guard.assert_live()
     V4 = _v4()
     head, tail = (stage == 0), (stage == nstages - 1)
     args = args if args is not None else ring_args(ckpt_dir)
     dev = device or getattr(V4, "dev", "cuda")
+    if lease_guard is not None and str(dev).startswith("cuda"):
+        actual_uuid = str(getattr(torch.cuda.get_device_properties(dev), "uuid", ""))
+        if not actual_uuid or actual_uuid.strip().casefold() != lease_guard.gpu_uuid.strip().casefold():
+            raise ValueError("leased GPU UUID differs from the actual stage CUDA device")
     receipts = RECEIPTS if receipts is None else receipts
     key_path = key_path or NODE_KEY_PATH
     if str(dev).startswith("cuda"):
@@ -890,8 +896,23 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
         if runtime_metrics is not None:
             options["runtime_metrics"] = runtime_metrics
         st = V4.Stage(lo, hi, args, **options)
+        if lease_guard is not None:
+            from shard.leased_runtime import install_stage_lease_checks
+            install_stage_lease_checks(st, lease_guard)
         if ckpt_dir is not None:
             st.load(ckpt_dir)
+    declared_config = getattr(lease_guard, "expected_runtime_config", None)
+    if declared_config is not None:
+        from v4_resources import runtime_config_payload
+        actual_config = runtime_config_payload(st)
+        def portable_config(value):
+            value = dict(value)
+            value["environment"] = {k: v for k, v in value.get("environment", {}).items()
+                                    if k not in ("V4_DIR", "V4_DEV")}
+            return value
+        if (json.dumps(portable_config(actual_config), sort_keys=True, allow_nan=False) !=
+                json.dumps(portable_config(declared_config), sort_keys=True, allow_nan=False)):
+            raise ValueError("loaded V4 runtime differs from its calibrated lease configuration")
     st._token_privacy = token_privacy if token_privacy is not None else _configured_token_privacy(
         trusted=head or tail or lo < getattr(args, "n_hash_layers", 3))
     st._privacy_job = None
@@ -3370,9 +3391,19 @@ def main():
     a = ap.parse_args()
 
     if a.cmd == "stage":
+        lease_guard = None
+        lease_stop = None
+        lease_config = os.environ.get("SHARD_STAGE_LEASE_CONFIG")
+        if lease_config:
+            from shard.leased_runtime import load_local_lease_guard, process_lease_watchdog
+            lease_guard = load_local_lease_guard(lease_config)
+            lease_stop = process_lease_watchdog(lease_guard)
         serve_stage(a.stage, a.nstages, a.lo, a.hi, a.port, nxt=a.next, ckpt_dir=a.dir,
                     device=a.device, receipts=(a.receipts or RECEIPTS), bind=a.bind,
-                    ret_relay=a.ret_relay, dspark=a.dspark, runtime_metrics=a.runtime_metrics)
+                    ret_relay=a.ret_relay, dspark=a.dspark, runtime_metrics=a.runtime_metrics,
+                    lease_guard=lease_guard)
+        if lease_stop is not None:
+            lease_stop.set()
     elif a.cmd == "coord":
         sys.exit(_coord_cli(a))
     elif a.cmd == "selftest":

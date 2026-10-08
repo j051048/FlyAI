@@ -92,6 +92,21 @@ def test_registration_is_idempotent_but_sequence_equivocation_is_rejected():
         registry.announce(sign_offer(changed, key))
 
 
+def test_departed_identities_release_registration_slots_without_erasing_recent_sequences():
+    clock = [1000]
+    registry = OfferRegistry(clock=lambda: clock[0], max_nodes=1)
+    key = Ed25519PrivateKey.generate()
+    old = offer(key, seq=4)
+    registry.announce(old)
+    with pytest.raises(OfferError, match="capacity"):
+        registry.announce(offer())
+    clock[0] = 1200
+    registry.announce(offer(now=1200))
+    assert len(registry.active()) == 1
+    with pytest.raises(OfferError, match="sequence"):
+        registry.announce(offer(key, seq=3, now=1200))
+
+
 def test_model_version_quantization_and_wire_are_separate_cohorts():
     base = cohort()
     for name, value in (("model_id", "model/v2"), ("quantization", "bf16"),
@@ -123,6 +138,25 @@ def test_sidecar_identity_is_reused_and_corrupt_key_is_rejected(tmp_path):
     path.write_bytes(b"\x08\x01\x12\x40" + raw[:-1] + bytes([raw[-1] ^ 1]))
     with pytest.raises(OfferError, match="public half"):
         load_sidecar_key(path)
+
+
+@pytest.mark.parametrize("trace", [
+    {"schema": "bad"},
+    {"schema": "shard-stage-trace/1", "measured_at": 1000, "ttl_s": 100,
+     "layer_start": 0, "layer_end": 2, "frame_ms": 1, "node_id": "another-node"},
+    {"schema": "shard-stage-trace/1", "measured_at": 1000, "ttl_s": 100,
+     "layer_start": 0, "layer_end": 200, "frame_ms": 1},
+])
+def test_malformed_or_cross_node_trace_is_rejected_before_it_can_poison_the_pool(trace):
+    key = Ed25519PrivateKey.generate()
+    malicious = offer(key)
+    malicious["models"][0]["profile"]["stage_trace"] = trace
+    registry = OfferRegistry(clock=lambda: 1000)
+    honest = offer()
+    registry.announce(honest)
+    with pytest.raises(OfferError, match="stage trace"):
+        registry.announce(sign_offer(malicious, key))
+    assert len(registry.snapshot(model_cohort_id(cohort()))) == 1
 
 
 @pytest.mark.parametrize("change", [

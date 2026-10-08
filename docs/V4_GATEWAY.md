@@ -3,7 +3,10 @@
 `engines/deepseek_v4/v4_gateway.py` exposes an existing V4 ring as a bounded text-chat service.
 It directly calls the current greedy, serial DSpark and pipelined DSpark coordinators. It does
 not launch/rent GPU nodes, download models, provide continuous batching or claim durable HA.
-One dispatcher owns one ring. Additional independently formed rings can use separate instances.
+The single-ring dispatcher owns one ring. `--ring-pool` now runs one serial worker
+per verified leased ring, sharing tenant quotas and idempotency across the pool.
+The complete open-contribution workflow, renewal ownership and rolling-version
+routing are documented in [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md).
 
 ## Startup and admission
 
