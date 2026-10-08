@@ -43,6 +43,45 @@ def _file_sha(path):
     return h.hexdigest()
 
 
+def verify_activation_commitments(commitments):
+    """Check unsigned chain structure and declared endpoints, not executed math."""
+    from phase0.activation_proof import verify_commitment_chain
+    if isinstance(commitments, dict):
+        if not commitments:
+            return False, "empty stage commitments"
+        bundles = []
+        for name, chain in commitments.items():
+            if not isinstance(name, str) or not name.isdecimal() or str(int(name)) != name:
+                return False, "stage dictionary keys must be canonical nonnegative integer strings"
+            bundles.append({"stage_idx": int(name), "chain": chain})
+    elif isinstance(commitments, list) and commitments:
+        if all(isinstance(item, dict) and "chain" in item for item in commitments):
+            bundles = commitments
+        elif all(isinstance(item, dict) and "commitment" in item and "chain" not in item for item in commitments):
+            return verify_commitment_chain(commitments)
+        else:
+            return False, "malformed or mixed stage commitment records"
+    else:
+        return False, "stage commitments must be a nonempty list or dictionary"
+    seen = set()
+    for item in bundles:
+        stage = item.get("stage_idx")
+        if type(stage) is not int or stage < 0 or stage in seen:
+            return False, "invalid or duplicate commitment stage"
+        seen.add(stage)
+        chain = item.get("chain")
+        if not isinstance(chain, list) or not chain:
+            return False, f"stage {stage} has an empty or malformed chain"
+        # A bundle's claimed final root must actually be the chain endpoint.
+        if "final_commitment" in item and item["final_commitment"] is None:
+            return False, f"stage {stage} has a missing final commitment"
+        ok, err = verify_commitment_chain(chain, expected_stage=stage,
+                                          expected_final=item.get("final_commitment"))
+        if not ok:
+            return False, f"stage {stage}: {err}"
+    return True, f"{len(seen)} stage chains internally consistent"
+
+
 def build(args):
     nodes = json.load(open(args.nodes))
     edges = json.load(open(args.edges)) if args.edges else []
@@ -97,34 +136,9 @@ def verify(args):
     checks.append(("output hash matches token ids", _sha(r["output_token_ids"]) == r["output_sha256"], r["output_sha256"][:12]))
     # 4. (optional) stage activation commitments chain integrity
     commitments = r.get("envelope", {}).get("stage_commitments")
-    if commitments:
-        from phase0.activation_proof import verify_commitment_chain
-        if isinstance(commitments, dict):
-            all_valid = True
-            for s_name, chain in commitments.items():
-                ok_chain, err = verify_commitment_chain(chain)
-                if not ok_chain:
-                    all_valid = False
-                    checks.append((f"activation chain ({s_name})", False, str(err)))
-                    break
-            if all_valid:
-                checks.append(("activation commitments valid", True, f"{len(commitments)} stages verified"))
-        elif isinstance(commitments, list):
-            all_valid = True
-            for item in commitments:
-                if isinstance(item, dict) and "chain" in item:
-                    ok_chain, err = verify_commitment_chain(item["chain"])
-                    if not ok_chain:
-                        all_valid = False
-                        checks.append((f"activation chain (stage {item.get('stage_idx')})", False, str(err)))
-                        break
-                else:
-                    all_valid, err = verify_commitment_chain(commitments)
-                    if not all_valid:
-                        checks.append(("activation commitments valid", False, str(err)))
-                    break
-            if all_valid:
-                checks.append(("activation commitments valid", True, f"{len(commitments)} stages verified"))
+    if commitments is not None:
+        consistent, detail = verify_activation_commitments(commitments)
+        checks.append(("activation commitment consistency", consistent, str(detail)))
     # 5. (optional) reference match — bit-for-bit reproducibility
     if args.ref_tokens:
         ref = json.load(open(args.ref_tokens))
@@ -148,7 +162,8 @@ def verify(args):
                if args.ref_tokens else "every claim is ")
         print("VERDICT: RECEIPT SELF-CONSISTENT — " + ref + "SELF-REPORTED (unsigned). "
               "This attests internal consistency only, NOT that the run was distributed, "
-              "correct, or reproducible; a signed envelope is required for that claim.")
+              "correct, or reproducible. Authenticated identities and independent replay are required "
+              "to establish execution; a signature alone is insufficient.")
     sys.exit(0 if ok else 1)
 
 

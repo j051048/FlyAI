@@ -260,7 +260,7 @@ def test_live_adapter_calls_existing_coordinators_and_separate_sweep(monkeypatch
     vp = SimpleNamespace(coordinate=coordinate, coordinate_dspark=coordinate,
                          coordinate_dspark_pipelined=coordinate, SWARM_TOKEN=None,
                          connect_ring=lambda *a, **kw: sockets,
-                         _sweep_receipts=lambda pipe, ret, layers, nonce: ([{"nonce": nonce}], True))
+                         _sweep_receipts=lambda pipe, ret, layers, nonce, **kw: ([{"nonce": nonce}], True))
     for key in list(os.environ):
         if key.startswith("V4_"):
             monkeypatch.delenv(key)
@@ -277,6 +277,7 @@ def test_live_adapter_calls_existing_coordinators_and_separate_sweep(monkeypatch
     result = adapter.generate([1, 2], 8, mode="pipelined", nonce="nonce", job_id="job", on_token=tokens.append)
     assert result["tokens"] == tokens == [7]
     assert calls[-1][2]["receipts"] is False and calls[-1][2]["eos_ids"] == ()
+    assert calls[-1][2]["strict_job_binding"] is True
     assert calls[-1][2]["depth"] == 16 and calls[-1][2]["lazy"] is True
     assert adapter.sweep("nonce") == ([{"nonce": "nonce"}], True)
     adapter.close()

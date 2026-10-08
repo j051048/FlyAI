@@ -276,19 +276,119 @@ def test_moe_level_bit_exact_over_many_draws():
 
 
 def test_declined_shapes_fall_through_bit_identically():
-    """T == 1 and pairs > block_M land on the class chain with the reference's exact answer, and
+    """T == 1 lands on the class chain with the reference's exact answer, and
     the decline is RECORDED — a lever that silently does nothing is the bug class this engine keeps
     paying for."""
     moe = _tiny_fp4_moe()
     assert _arm(moe) == 1
     ref_fwd = type(moe).forward
-    for s, why in ((1, "s<=1"), (9, "pairs>block_M")):      # 9 * 4 = 36 > 32
+    for s, why in ((1, "s<=1"),):
         x, ids = _x(moe, s, seed=s)
         with torch.no_grad():
             want = ref_fwd(moe, x, ids)
             got = moe(x, ids)
         assert torch.equal(want, got)
         assert moe._draft_declined.get(why) == 1, (why, moe._draft_declined)
+
+
+@pytest.mark.parametrize("rows,topk", [(8, 4), (11, 3), (8, 6), (16, 6), (32, 6)])
+def test_wide_pair_dispatch_preserves_reference_cpu_shapes_and_fold(rows, topk):
+    """32,33,48,96,192 logical pairs no longer silently exercise fallback."""
+    moe = _tiny_fp4_moe(n_experts=64, topk=topk)
+    reference = type(moe).forward
+    assert _arm(moe) == 1
+    for seed in (7, 23):
+        x, ids = _x(moe, rows, seed=seed)
+        with torch.no_grad():
+            want, got = reference(moe, x, ids), moe(x, ids)
+        assert torch.equal(want, got), (rows, topk, seed)
+    detail = DM.coverage_details(_stub_tail(moe))[moe.layer_id]
+    assert detail["steps"] == 2 and detail["pairs"] == 2 * rows * topk
+    assert detail["pair_widths"] == {rows * topk: 2}
+    assert detail["cuda_chunks_per_matrix"] == detail["cuda_grouped_gemms"] == 0
+    assert detail["declined"] == {}
+
+
+@pytest.mark.parametrize("count", [30, 32, 33, 48, 64, 96, 192])
+def test_cuda_pair_schedule_bounds_every_launch_and_reassembles_original_order(monkeypatch, count):
+    """Host schedule test with marker outputs, not a simulated GPU numeric proof.
+
+    Every marker carries its activation row and expert ID across uneven chunk
+    boundaries. Production48 splits a token's six pairs across32/16.
+    """
+    calls = []
+    class Grouped:
+        _BLOCK_M = 32
+        @staticmethod
+        def _gather_fp(bank, ids):
+            return bank[ids]
+        @staticmethod
+        def grouped_fp4_gemm(a, scales, weight, weight_scales, dtype):
+            assert 0 < a.size(0) <= 32
+            assert a.size(0) == scales.size(0) == weight.size(0) == weight_scales.size(0)
+            calls.append(a.size(0))
+            return (a[:, :1] + weight[:, :1, 0] * 100).expand(-1, weight.size(1)).clone()
+    monkeypatch.setattr(DM, "_grouped", lambda: Grouped)
+    flat = torch.arange(count).remainder(8)
+    a = torch.arange(count, dtype=torch.float32).reshape(count, 1)
+    scales = torch.ones(count, 1)
+    bank = torch.arange(8, dtype=torch.float32).reshape(8, 1, 1).expand(8, 4, 1)
+    out = DM._grouped_pair_chunks(a, scales, flat, bank, torch.ones_like(bank), torch.float32)
+    expected = a[:, 0] + 100 * flat.float()
+    assert torch.equal(out[:, 0], expected)
+    assert calls == [32] * (count // 32) + ([count % 32] if count % 32 else [])
+
+
+def test_production_block8_drafted_ids_logits_confidence_and_cache_are_exact():
+    args = _args()
+    args.dspark_block_size = 8
+    oracle = REFCPU.build_oracle(args, SEED)
+    tok, prefill, rounds = _record(oracle, args)
+    _, reference = _build(oracle, args)
+    _, grouped = _build(oracle, args)
+    DM.V4_DSPARK_MOE = True
+    assert DM.install_drafter(grouped) == 3
+    for drafter in (reference, grouped):
+        drafter.prefill(tok, prefill)
+    for committed, hidden, position in rounds:
+        reference.advance_and_draft(committed, hidden, position)
+        grouped.advance_and_draft(committed, hidden, position)
+        for original, optimized in zip(reference.last_spec, grouped.last_spec):
+            assert torch.equal(original, optimized)
+        for original, optimized in zip(reference.mtp, grouped.mtp):
+            assert torch.equal(original.attn.kv_cache, optimized.attn.kv_cache)
+    assert all(detail["pair_widths"] == {48: sum(RUNS)} and not detail["declined"]
+               for detail in DM.coverage_details(grouped).values())
+
+
+def test_block8_pair_path_composes_with_mtp_fp8_shared_on_full_drafted_rounds(monkeypatch):
+    import v4_fp8_gemv as FG
+    monkeypatch.setattr(FG, "V4_FP8_SHARED", True)
+    # Restore the probe module globals after this in-process parity arm.
+    for name in ("_MOD", "_REF_FP8_GEMM", "_REF_EXPERT_FORWARD"):
+        monkeypatch.setattr(FG, name, getattr(FG, name))
+    args = _args()
+    args.dspark_block_size = 8
+    oracle = REFCPU.build_oracle(args, SEED)
+    tok, prefill, rounds = _record(oracle, args)
+    _, reference = _build(oracle, args)
+    _, optimized = _build(oracle, args)
+    for drafter in (reference, optimized):
+        DM.swap_in_fp4_moes(drafter, moe_inter_dim=128, seed=SEED, shared_fp8=True)
+    DM.V4_DSPARK_MOE = True
+    assert DM.install_drafter(optimized) == 3
+    assert FG.install_drafter_shared(optimized, mod=V4.ref()) == 3
+    for drafter in (reference, optimized):
+        drafter.prefill(tok, prefill)
+    for committed, hidden, position in rounds:
+        reference.advance_and_draft(committed, hidden, position)
+        optimized.advance_and_draft(committed, hidden, position)
+        for original, fused in zip(reference.last_spec, optimized.last_spec):
+            assert torch.equal(original, fused)
+        for original, fused in zip(reference.mtp, optimized.mtp):
+            assert torch.equal(original.attn.kv_cache, fused.attn.kv_cache)
+    assert all(row["steps"] == sum(RUNS) and row["cuda_steps"] == 0 and not row["declined"]
+               for row in FG.drafter_shared_coverage(optimized).values())
 
 
 def test_hash_gate_is_never_claimed():
@@ -378,10 +478,11 @@ def test_lever_is_registered_and_judged_from_the_note():
 # ── the GPU half of the claim, run on the ring's tail box ─────────────────────────────────────────
 
 @pytest.mark.hardware
-def test_bit_exact_on_gpu_at_the_drafter_shape():
+@pytest.mark.parametrize("rows", [5, 8, 16, 32])
+def test_bit_exact_on_gpu_at_the_drafter_shape(rows):
     """The CUDA branch — every (row, expert) pair one slot of one grouped launch — against the
-    untouched reference at V4's REAL dims and the REAL drafter shape (5 rows x 6 experts = 30
-    pairs). This is the row-invariance claim on silicon; everything above the kernel was proven on
+    untouched reference at V4's REAL dims, 30/48/96/192 pairs including the block8 production
+    width. This is the row-invariance claim on silicon; everything above the kernel was proven on
     CPU. Mirrors v4_moe_grouped's hardware tests, including the bank layout."""
     if not torch.cuda.is_available():
         pytest.skip("needs a CUDA device")
@@ -394,10 +495,13 @@ def test_bit_exact_on_gpu_at_the_drafter_shape():
     DM._WORLD_SIZE = 1
     moe.forward = types.MethodType(DM.draft_forward, moe)
     for t in range(8):
-        x = torch.randn(1, 5, args.dim, dtype=torch.bfloat16, device="cuda")
-        ids = torch.randint(0, args.vocab_size, (1, 5), device="cuda")
+        x = torch.randn(1, rows, args.dim, dtype=torch.bfloat16, device="cuda")
+        ids = torch.randint(0, args.vocab_size, (1, rows), device="cuda")
         with torch.no_grad():
             want = ref_fwd(moe, x, ids)
             got = moe(x, ids)
         assert torch.equal(want, got), f"pair path diverged on GPU draw {t}"
     assert moe._draft_steps == 8 and not getattr(moe, "_draft_declined", {})
+    expected_chunks = (rows * args.n_activated_experts + GROUPED._BLOCK_M - 1) // GROUPED._BLOCK_M
+    assert moe._draft_cuda_chunks == 8 * expected_chunks
+    assert moe._draft_cuda_grouped_gemms == 16 * expected_chunks

@@ -291,12 +291,20 @@ def _check_fp8_shared(ctx):
     req = _flag("v4_fp8_gemv", "V4_FP8_SHARED")
     if m is None or ctx.mod is None:
         return req, "unloaded", None
-    if not getattr(ctx.mod.Expert.forward, "_v4_fp8_shared", False):
+    tail = getattr(ctx.stage, "_runtime_draft", None) if ctx.stage is not None else None
+    detail = m.drafter_shared_coverage(tail) if tail is not None else {}
+    draft_banked = sum(row["banked"] and row["instance_bound"] for row in detail.values())
+    if not getattr(ctx.mod.Expert.forward, "_v4_fp8_shared", False) and not draft_banked:
         return req, "off", _agree(req, "off")
     obs = m.shared_status()
+    undecided = obs == "armed"
     if ctx.stage is not None:
         banked = getattr(ctx.stage, "_shared_banked", 0)
-        return req, f"{obs}/banked-{banked}", (None if obs == "armed"
+        if tail is not None:
+            cuda_calls = sum(row["cuda_steps"] for row in detail.values())
+            banked += draft_banked
+            obs += f"/draft-banked-{draft_banked}/draft-cuda-calls-{cuda_calls}"
+        return req, f"{obs}/banked-{banked}", (None if undecided
                                                else (_agree(req, "on") and banked > 0
                                                      and obs.startswith("on/")))
     if obs == "armed":
@@ -321,6 +329,28 @@ def _check_expert_placement(ctx):
     cached = [getattr(L.ffn, "_hybrid_runtime", None) is not None for L in stage.layers]
     observed = "ram" if cached and all(cached) else "mixed" if any(cached) else "gpu"
     return requested, observed, requested == observed
+
+
+def _check_kv_placement(ctx):
+    if ctx.stage is None:
+        return os.environ.get("V4_KV_PLACEMENT", "gpu"), "no-stage", None
+    requested = getattr(ctx.stage, "_kv_placement", "gpu")
+    observed = "layer" if getattr(ctx.stage, "_kv_runtime", None) is not None else "gpu"
+    return requested, observed, requested == observed
+
+
+def _check_prefill_queries(ctx):
+    if ctx.stage is None:
+        return os.environ.get("V4_PREFILL_QUERY_CHUNK", "0"), "no-stage", None
+    requested = getattr(ctx.stage, "_prefill_query_chunk", 0)
+    status = ctx.stage.prefill_runtime_status()
+    if not requested:
+        return 0, 0, True
+    if not all(hasattr(layer.attn, "_prefill_query_chunks") for layer in ctx.stage.layers):
+        return requested, "missing-query-chunk-attention", False
+    if not status["gate_checks"] and not status["executed_query_chunks"]:
+        return requested, "installed/awaiting-numerical-gate", None
+    return requested, f"gated/query-chunks-{status['executed_query_chunks']}", True
 
 
 def _check_spec_depth(ctx):
@@ -366,6 +396,39 @@ def _check_fp8_wire(ctx):
     return req, obs, _agree(req, obs)
 
 
+def _check_expert_prefetch(ctx):
+    req = _flag("v4_stage", "V4_EXPERT_PREFETCH")
+    stage = ctx.stage
+    if stage is None:
+        return req, "no-stage", None
+    if not getattr(stage, "_expert_prefetch", False):
+        return req, "off", _agree(req, "off")
+    if getattr(stage, "_expert_cache", None) is None:
+        return req, "no-RAM-cache", False
+    if not getattr(stage, "_hybrid_cache_ready", False):
+        return req, "armed", None
+    runtimes = [b.ffn._hybrid_runtime for b in stage._hybrid_blocks]
+    if not all(r.prefetch_enabled for r in runtimes):
+        return req, "not-configured", False
+    requested = sum(r.prefetch_stats()["requested"] for r in runtimes)
+    return req, (f"on/requested-{requested}" if requested else "armed"), (True if requested else None)
+
+
+def _check_wire_fused(ctx):
+    req = _flag("v4_pipe", "V4_WIRE_FUSED")
+    module = _mod("v4_wire_codec")
+    if req == "off":
+        return req, "off", True
+    if module is None:
+        return req, "unwarmed", None
+    stats = module.stats()
+    if stats["compiled_calls"]:
+        return req, f"on/calls-{stats['compiled_calls']}", True
+    if stats["ready_keys"]:
+        return req, f"ready/keys-{stats['ready_keys']}", None
+    return req, (f"declined/keys-{stats['declined_keys']}" if stats["declined_keys"] else "unwarmed"), None
+
+
 def _check_dspark_fast(ctx):
     """The drafter lever, and the one that is TAIL-ONLY: only the tail builds a DSparkTail, so a
     non-tail stage legitimately has nothing rebound. Judged only where the class exists."""
@@ -389,6 +452,21 @@ def _check_dspark_moe(ctx):
     this says so rather than guessing; the class chain is untouched by design (the bind is per
     INSTANCE), so no module-level rebind exists to inspect."""
     req = _flag("v4_dspark_moe", "V4_DSPARK_MOE")
+    module = _mod("v4_dspark_moe")
+    tail = getattr(ctx.stage, "_runtime_draft", None) if ctx.stage is not None else None
+    if req == "on" and module is not None and tail is not None:
+        rows = module.coverage_details(tail)
+        calls = sum(row["cuda_grouped_gemms"] for row in rows.values())
+        declines = sum(sum(row["declined"].values()) for row in rows.values())
+        if calls:
+            active = sum(row["cuda_grouped_gemms"] > 0 for row in rows.values())
+            if active != len(rows):
+                return req, f"partial/{active}-of-{len(rows)}/cuda-gemms-{calls}/declines-{declines}", \
+                    (False if declines else None)
+            return req, f"on/cuda-gemms-{calls}/declines-{declines}", True
+        if declines:
+            return req, f"declined/{declines}", False
+        return req, "armed/no-CUDA-calls-observed", None
     fact = _NOTES.get("V4_DSPARK_MOE")
     if fact is not None:
         return req, fact, _agree(req, fact)
@@ -562,6 +640,10 @@ LEVERS = (
           "count the rescue rate that gates tree speculation (docs/V4_TREE_VERDICT.md)"),
     Lever("V4_FP8_WIRE", STAGE, "v4_pipe", _check_fp8_wire,
           "fp8-pack h on the forward leg (every non-tail stage packs its own output)"),
+    Lever("V4_WIRE_FUSED", STAGE, "v4_pipe", _check_wire_fused,
+          "pre-warmed, byte-checked CUDA compilation of the existing wire codec"),
+    Lever("V4_EXPERT_PREFETCH", STAGE, "v4_stage", _check_expert_prefetch,
+          "bounded local expert predictions submitted before attention"),
     Lever("V4_SPEC_DEPTH", BOTH, "v4_pipe", _check_spec_depth,
           "pipelined speculation depth: the coordinator's window AND the stage's rollback ring"),
     Lever("V4_PIPELINED_SPEC", COORDINATOR, "v4_pipe", _check_pipelined,
@@ -584,12 +666,22 @@ LEVERS = (
           "kernel backend selection (tilelang / cpu)", kind="knob"),
 )
 
+LEVERS += (
+    Lever("V4_KV_PLACEMENT", STAGE, "v4_stage", _check_kv_placement,
+          "bounded shared per-layer KV working set with host compressed history"),
+    Lever("V4_PREFILL_QUERY_CHUNK", STAGE, "v4_stage", _check_prefill_queries,
+          "numerically gated attention/index-score query chunks preserving projection shapes"),
+)
 LEVERS_BY_ENV = {lv.env: lv for lv in LEVERS}
 
 # Read by the engine but not levers: nothing installs, nothing can be observed, and a wrong value
 # fails loudly on its own (a missing V4_DIR cannot be mistaken for a slow ring). Listed rather than
 # pattern-matched so the registry test stays total — an unlisted new name fails the suite.
 NON_LEVER_ENV = {
+    "V4_KV_GPU_MIB": "explicit total GPU KV budget, including resident windows and shared workspace",
+    "V4_KV_HOST_MIB": "explicit host KV history plus rollback/gate budget",
+    "V4_SEALED_IDS": "version-negotiated opaque token frames; activations remain visible",
+    "V4_TOKEN_PRIVACY_KEY_ID": "public independent token-key identity, never the secret",
     "V4_EXPERT_CACHE_SLOTS": "explicit fixed slots per main/MTP expert pool",
     "V4_EXPERT_CACHE_MIB": "explicit total fixed-slot cache byte budget",
     "V4_EXPERT_CACHE_RESERVE_MIB": "runtime headroom deducted from actual available GPU memory",
@@ -605,6 +697,10 @@ NON_LEVER_ENV = {
     "V4_TIMING": "instrumentation",
     "V4_TIMING_EVERY": "instrumentation period",
     "V4_RUNTIME_METRICS": "opt-in signed per-job work/residency observations; no math or wire change",
+    "V4_PROFILE_RUNTIME": "bounded host phase statistics and sampled CUDA event intervals",
+    "V4_PROFILE_GPU_EVERY": "GPU profile sample interval; events resolved outside token execution",
+    "V4_EXPERT_PREFETCH_SLOTS": "maximum experts predicted before each layer's attention",
+    "V4_EXPERT_PREFETCH_WARMUP": "executed routes observed before prediction begins",
     "V4_EXPERT_CACHE_SLOTS": "expert cache slot count per pool when V4_EXPERT_PLACEMENT=ram",
     "V4_EXPERT_CACHE_MIB": "expert cache total budget in MiB when V4_EXPERT_PLACEMENT=ram",
     "V4_EXPERT_CACHE_RESERVE_MIB": "VRAM reservation in MiB preserved before allocating expert cache",
@@ -761,8 +857,8 @@ ENGINE_MODULES = (
     "v4_moe_multi.py", "v4_fp8_gemv.py", "v4_dspark_fast.py", "v4_dspark_moe.py",
     "v4_dspark_draft.py", "v4_ref_slim.py", "v4_ref_cpu.py", "v4_whole_layer_graph.py",
     "v4_kernels_cpu.py", "v4_sparse_attn_sm120.py", "v4_resources.py",
-    "v4_expert_cache.py", "v4_hybrid.py",
-    "v4_expert_cache.py", "v4_hybrid.py",
+    "v4_expert_cache.py", "v4_hybrid.py", "v4_chunked_prefill.py", "v4_wire_codec.py",
+    "v4_kv_runtime.py", "v4_privacy.py", "v4_gateway.py",
 )
 
 _ENV_RE = re.compile(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""")

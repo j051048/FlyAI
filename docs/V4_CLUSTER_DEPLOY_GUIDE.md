@@ -2,6 +2,11 @@
 
 本指南针对在 **Vast.ai、AutoDL 等云端租机平台** 或 **自有 GPU 物理机** 上部署并运行 DeepSeek-V4-Flash-0731（43层 MoE + 3个 DSpark MTP 投机块）分布式流水线推理集群，提供完整的端到端实操步骤。
 
+当前代码的配置、部署合同、认证服务与硬件验收以 [V4_NEXT_PHASE.md](V4_NEXT_PHASE.md)
+为准。下列拓扑示例需要按真实节点的校准结果调整；RAM/KV 路径尚未完成四卡／六卡
+GPU 性能验收。使用 Python 3.11 或更新版本，以及实测支持 sm120 的 CUDA PyTorch／
+TileLang 环境；旧 CUDA 12.4 安装示例不适合作为 RTX 5090 的运行时标准。
+
 ---
 
 ## 目录
@@ -119,8 +124,8 @@ export V4_EXPERT_CACHE_SLOTS=32
 export V4_EXPERT_CACHE_RESERVE_MIB=2048
 
 # 启用流水线预取与分块 Prefill
-export V4_CHUNK_PREFILL=1
-export V4_PREFETCH=1
+export V4_PREFILL_QUERY_CHUNK=512
+export V4_EXPERT_PREFETCH=1
 
 # 启用运行时监控
 export V4_RUNTIME_METRICS=1

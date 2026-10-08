@@ -1,11 +1,11 @@
-"""DeepSeek-V4 Phase 1 Hardware Acceptance Suite (Step 8 Implementation).
+"""DeepSeek-V4 placement/cache simulation, not hardware acceptance.
 
-Provides comprehensive validation for 4-node and 6-node clusters:
+Models hypothetical 4-node and 6-node clusters using supplied latency/bandwidth:
   1. Compares 6-node all-resident GPU mode vs. 6-node dual-resource cache mode.
   2. Evaluates 4-node dual-resource mode (WAN latency savings vs. DMA swap overhead).
   3. Stress scenarios: Cold Cache, Warm Cache, High Eviction Pressure, Multi-Turn Dialogues,
      and Speculative Rollback.
-  4. Generates verifiable JSON/Markdown acceptance verdicts against targets:
+  4. Generates forecast JSON/Markdown against targets, with hardware_verified=False:
      - 4x5090: >= 40.0 tok/s
      - 6x5090: >= 30.0 tok/s
 """
@@ -373,7 +373,10 @@ class V4AcceptanceHarness:
 
         report = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "overall_status": "ACCEPTANCE_PASSED" if all_passed else "ACCEPTANCE_FAILED",
+            "overall_status": "SIMULATION_TARGETS_MET" if all_passed else "SIMULATION_TARGETS_MISSED",
+            "evidence_scope": "CPU logical cache simulation and analytical placement estimates",
+            "hardware_verified": False,
+            "speed_pass": False,
             "cluster_tradeoffs": {k: dataclasses.asdict(v) for k, v in tradeoffs.items()},
             "stress_scenarios": [dataclasses.asdict(s) for s in stress_results],
             "targets": ACCEPTANCE_TARGETS,
@@ -388,7 +391,8 @@ class V4AcceptanceHarness:
     def render_markdown_summary(self, report: Dict[str, Any]) -> str:
         """Formats report as human-readable Markdown for inspection."""
         lines = [
-            "# DeepSeek-V4 Phase 1 Hardware Acceptance Report",
+            "# DeepSeek-V4 Placement and Cache Simulation",
+            "Hardware acceptance is pending. Use v4_benchmark.py and v4_soak.py on a real ring.\n",
             f"**Overall Verdict:** `{'✅ ' + report['overall_status']}` | Timestamp: `{report['timestamp']}`\n",
             "## 1. Cluster Throughput & WAN Latency Tradeoff Modeling\n",
             "| Cluster Configuration | Placement | Stages | WAN Roundtrip | Compute | DMA Overhead | Total Step | Est. Throughput | Target | Verdict |",
@@ -428,7 +432,7 @@ class V4AcceptanceHarness:
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description="DeepSeek-V4 Phase 1 Hardware Acceptance Suite")
+    parser = argparse.ArgumentParser(description="DeepSeek-V4 placement/cache simulation; not hardware acceptance")
     parser.add_argument("--rtt-ms", type=float, default=10.0, help="Average one-way WAN RTT per hop in ms")
     parser.add_argument("--h2d-gbps", type=float, default=24.0, help="Host-to-device PCIe bandwidth in GB/s")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON only")

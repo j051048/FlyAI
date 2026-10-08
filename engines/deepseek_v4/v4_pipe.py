@@ -123,6 +123,8 @@ NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
 # adopts a silent/foreign connection. Optional; a bare localhost ring runs token-less.
 SWARM_TOKEN = os.environ.get("SHARD_SWARM_TOKEN") or None
 RECEIPTS = os.environ.get("SHARD_RECEIPTS", "") not in ("", "0")
+V4_SEALED_IDS = os.environ.get("V4_SEALED_IDS", "0") == "1"
+V4_TOKEN_PRIVACY_KEY_ID = os.environ.get("V4_TOKEN_PRIVACY_KEY_ID") or None
 
 V4_MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash-0731"
 N_LAYERS = 43                                          # the shipped config's n_layers (not the DSpark stages)
@@ -208,12 +210,13 @@ class _StepTimer:
     That is the whole point on a consumer uplink: a drafted round's frame is `block_size+1` times
     fatter than a greedy one, and only bytes-over-seconds separates "the layers got slower" from
     "the uplink did". `start()` re-bases at a job reset; `report()` prints the per-frame means."""
-    __slots__ = ("tag", "phases", "cuda", "every", "acc", "by", "n", "npos", "t")
+    __slots__ = ("tag", "phases", "cuda", "every", "acc", "by", "n", "npos", "t", "profile")
 
-    def __init__(self, tag, phases, device=None, every=0):
+    def __init__(self, tag, phases, device=None, every=0, profile=None):
         self.tag, self.phases = tag, phases
-        self.cuda = str(device or "").startswith("cuda")
+        self.cuda = str(device or "").startswith("cuda") and (profile is None or V4_TIMING)
         self.every = every
+        self.profile = profile
         self.start()
 
     def start(self):
@@ -225,6 +228,8 @@ class _StepTimer:
     def lap(self, phase, obj=None):
         now = time.perf_counter()
         self.acc[phase] += now - self.t
+        if self.profile is not None:
+            self.profile.record(f"stage.{phase}.host", max(0.0, (now - self.t) * 1000.0))
         self.t = now
         if obj is not None:
             self.by[phase] += _frame_bytes(obj)
@@ -256,11 +261,11 @@ class _StepTimer:
               + f" on_box={on_box:.2f} ms/frame", flush=True)
 
 
-def _timer(tag, phases, device=None):
+def _timer(tag, phases, device=None, profile=None):
     """The serve loop's timer: a real one under V4_TIMING, else the shared no-op."""
-    if not V4_TIMING:
+    if not V4_TIMING and profile is None:
         return _NO_TIMER
-    return _StepTimer(tag, phases, device, V4_TIMING_EVERY)
+    return _StepTimer(tag, phases, device, V4_TIMING_EVERY, profile)
 
 
 def _v4():
@@ -332,6 +337,7 @@ def _payload_bytes(h, ids):
 # needed. The bf16 path is byte-identical when off. The IDS are never packed: they are exact indices
 # into a hash function and a vocab table.
 V4_FP8_WIRE = bool(int(os.environ.get("V4_FP8_WIRE", "0") or 0))
+V4_WIRE_FUSED = os.environ.get("V4_WIRE_FUSED", "0") not in ("", "0")
 
 
 def _pack_t(t):
@@ -373,6 +379,9 @@ def _pack_t(t):
     infinite, and then every FINITE value in the row divides to 0 and the inf itself to NaN. The
     bf16 wire carries a bad value in exactly one slot; without this the fp8 wire would turn it into
     a row of 4096 NaN. With it, the inf saturates to 448 and the rest of the row is untouched."""
+    if V4_WIRE_FUSED and t.is_cuda:
+        import v4_wire_codec
+        return v4_wire_codec.pack(t)
     f = t.detach().float()
     scale = (f.abs().amax(-1, keepdim=True) / 448.0).clamp(
         min=1e-8, max=torch.finfo(torch.bfloat16).max).to(torch.bfloat16)
@@ -385,6 +394,9 @@ def _unpack_t(q, scale):
     product is exact either way (an e4m3 value is 4 significant bits, a bf16 holds 8), and a fp32
     intermediate would transiently double the biggest tensor on the ring — a 8192-token prefill's h
     is 268 MB bf16 against 537 MB fp32, on a stage that is already holding weights."""
+    if V4_WIRE_FUSED and q.is_cuda:
+        import v4_wire_codec
+        return v4_wire_codec.unpack(q, scale)
     return q.to(torch.bfloat16) * scale.unsqueeze(-1)
 
 
@@ -395,7 +407,8 @@ def _wire_bytes(h, ids, hs):
     return _tbytes(h) + _tbytes(ids) + _tbytes(hs)
 
 
-def _recv_hids(msg, signer):
+def _recv_hids(msg, signer, *, device=None, token_privacy=None,
+               stage_lo=0, n_hash_layers=3, is_tail=False, binding=None):
     """Take (h, ids) off a received step frame, upcasting h from fp8 when the wire carried it.
     Returns (h, ids, in_bytes) where in_bytes is the receipt in_root digest over the EXACT received
     wire bytes (None when not signing).
@@ -406,7 +419,24 @@ def _recv_hids(msg, signer):
     sidecar went missing would otherwise sail through `st.forward`'s `h.to(self.dtype)` as a tensor
     scaled by ~1/scale, with no exception, no NaN, and an intact receipt chain (both sides hash the
     same bytes). ValueError is in _STRAY, so a malformed frame resets the edge like any other."""
-    h, ids = msg["h"], _ids_tensor(msg["ids"])
+    h = msg["h"]
+    envelope = msg.get("sealed_ids")
+    if token_privacy is not None:
+        if envelope is None or "ids" in msg or "dnxt" in msg:
+            raise ValueError("sealed ring requires opaque token envelope without plaintext IDs")
+        if "dprev" in msg and type(msg["dprev"]) is not bool:
+            raise ValueError("sealed dprev hint must be a boolean")
+        ids = _ids_tensor(token_privacy.local_ids(envelope, binding, lo=stage_lo,
+            n_hash_layers=n_hash_layers, is_tail=is_tail, shape=list(h.shape[:2])))
+    else:
+        if envelope is not None:
+            raise ValueError("sealed token frame on a legacy stage")
+        ids = _ids_tensor(msg["ids"])
+    def received_bytes(scale=None):
+        if envelope is not None:
+            from v4_privacy import wire_payload_bytes
+            return wire_payload_bytes(_tbytes(h), envelope, _tbytes(scale) if scale is not None else b"")
+        return _wire_bytes(h, ids, scale) if scale is not None else _payload_bytes(h, ids)
     packed = torch.is_tensor(h) and h.dtype == torch.float8_e4m3fn
     if packed != ("h8" in msg):
         raise ValueError(f"step frame: h is {getattr(h, 'dtype', type(h))} but h8 is "
@@ -416,12 +446,18 @@ def _recv_hids(msg, signer):
         if not torch.is_tensor(hs) or hs.shape != h.shape[:-1]:
             raise ValueError(f"step frame: h8 {getattr(hs, 'shape', type(hs))} does not scale "
                              f"h {tuple(h.shape)} per (position, stream)")
-        in_b = _wire_bytes(h, ids, hs) if signer is not None else None
+        in_b = received_bytes(hs) if signer is not None else None
+        if V4_WIRE_FUSED and device is not None and str(device).startswith("cuda"):
+            import v4_wire_codec
+            if v4_wire_codec.can_unpack(h, hs, device=device):
+                # Only a pre-warmed key proven against the original CPU decoder
+                # may move decode onto the GPU. Other shapes retain that decoder.
+                h, hs = h.to(device), hs.to(device)
         return _unpack_t(h, hs), ids, in_b
-    return h, ids, (_payload_bytes(h, ids) if signer is not None else None)
+    return h, ids, (received_bytes() if signer is not None else None)
 
 
-def _make_step_frame(h, ids, start_pos, signer):
+def _make_step_frame(h, ids, start_pos, signer, *, token_envelope=None):
     """Build the forwarded step frame + its receipt out_root digest. fp8-packs h when V4_FP8_WIRE,
     carrying the per-tensor scale as the h8 sidecar; the out digest hashes the packed wire bytes so
     the next stage's in_root matches losslessly. The ids ride int64 in both modes.
@@ -433,6 +469,17 @@ def _make_step_frame(h, ids, start_pos, signer):
     tensor to both is byte-identical by construction — they were always hashing and sending the same
     values, and now they hash and send the same buffer."""
     ids = _ids_tensor(ids)
+    if token_envelope is not None:
+        from v4_privacy import validate_envelope, wire_payload_bytes
+        validate_envelope(token_envelope, shape=list(h.shape[:2]))
+        if V4_FP8_WIRE:
+            qh, sh = _pack_t(h)
+            qh = qh.detach().cpu().contiguous()
+            frame = {"op": "step", "h": qh, "h8": sh, "sealed_ids": token_envelope, "start_pos": start_pos}
+            return frame, (wire_payload_bytes(_tbytes(qh), token_envelope, _tbytes(sh)) if signer else None)
+        hc = h.detach().cpu().contiguous()
+        frame = {"op": "step", "h": hc, "sealed_ids": token_envelope, "start_pos": start_pos}
+        return frame, (wire_payload_bytes(_tbytes(hc), token_envelope) if signer else None)
     if V4_FP8_WIRE:
         qh, sh = _pack_t(h)
         qh = qh.detach().cpu().contiguous()
@@ -748,9 +795,57 @@ def _is_pred_hello(msg):
     return SWARM_TOKEN is None or msg.get("token") == SWARM_TOKEN
 
 
+def _configured_token_privacy(*, trusted=False):
+    if not V4_SEALED_IDS:
+        return None
+    from v4_privacy import TokenPrivacy, read_key_file
+    path = os.environ.get("SHARD_V4_TOKEN_KEY_FILE")
+    if trusted and not path:
+        raise ValueError("head/hash/tail stage requires independently provisioned SHARD_V4_TOKEN_KEY_FILE")
+    return TokenPrivacy(read_key_file(path) if trusted and path else None, key_id=V4_TOKEN_PRIVACY_KEY_ID)
+
+
+def _privacy_job_nonce(nonce):
+    if V4_SEALED_IDS:
+        if nonce is None:
+            import secrets
+            nonce = secrets.token_hex(32)
+        if not isinstance(nonce, str) or len(nonce) != 64 or any(c not in "0123456789abcdef" for c in nonce):
+            raise ValueError("sealed token jobs require a 32-byte lowercase hex nonce")
+    return nonce
+
+
+def _privacy_reset(st, msg):
+    codec = getattr(st, "_token_privacy", None)
+    if codec is not None:
+        codec.verify_descriptor(msg.get("token_privacy"))
+        nonce = msg.get("nonce")
+        if not isinstance(nonce, str) or len(nonce) != 64 or any(c not in "0123456789abcdef" for c in nonce):
+            raise ValueError("sealed token reset requires a fresh 32-byte job nonce")
+        st._privacy_job = {"job_nonce": nonce, "job_id": msg.get("job_id", "job"),
+                           "swarm_id": msg.get("swarm_id", "swarm"), "model_id": V4_MODEL_ID}
+    elif msg.get("token_privacy") is not None:
+        raise ValueError("sealed coordinator cannot reset a legacy stage")
+
+
+def _privacy_binding(st, msg):
+    return {**st._privacy_job, "start_pos": msg["start_pos"], "epoch": msg.get("epoch", 0)}
+
+
+def _reset_capacity_error(st, msg):
+    if msg.get("reset_error"):
+        return str(msg["reset_error"])
+    if getattr(st, "_kv_runtime", None) is not None:
+        limit = st.kv_runtime_status()["max_supported_tokens"]
+        horizon = msg.get("max_pos")
+        if type(horizon) is not int or horizon < 0 or horizon > limit:
+            return f"requested KV horizon {horizon!r} exceeds stage capacity {limit}"
+    return None
+
+
 def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=None, device=None,
                 receipts=None, key_path=None, timeout=600.0, bind="127.0.0.1", ready=None,
-                ret_relay=None, dspark=False, runtime_metrics=None):
+                ret_relay=None, dspark=False, runtime_metrics=None, token_privacy=None):
     """Serve one contiguous layer block [lo:hi) in the fire-forward ring.
 
     head (stage 0)      embeds token ids -> h [b, s, 4, dim], runs its layers, forwards (h, ids).
@@ -797,6 +892,14 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
         st = V4.Stage(lo, hi, args, **options)
         if ckpt_dir is not None:
             st.load(ckpt_dir)
+    st._token_privacy = token_privacy if token_privacy is not None else _configured_token_privacy(
+        trusted=head or tail or lo < getattr(args, "n_hash_layers", 3))
+    st._privacy_job = None
+    if V4_WIRE_FUSED and str(dev).startswith("cuda"):
+        import v4_wire_codec
+        example = torch.zeros(1, 1, args.hc_mult, args.dim, dtype=st.dtype, device=dev)
+        v4_wire_codec.warmup(example)
+        del example
     node_key = load_or_make_node_key(key_path) if receipts else None
     print(f"[s{stage}] {st}", flush=True)
     # THE LEVER AUDIT, here and not later: everything a stage installs is installed by now, and every
@@ -943,7 +1046,8 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
     kw = _KeepWarm(nxt_sock)                                   # cwnd keep-warm on the forward leg (opt-in)
     tag = f"[s{stage}]"
     epoch = 0                                                  # newest speculation generation seen (fence)
-    timer = _timer(tag, ("recv", "pre", "fwd", "out", "send"), getattr(st, "device", None))
+    timer = _timer(tag, ("recv", "pre", "fwd", "out", "send"), getattr(st, "device", None),
+                   getattr(st, "_runtime_profile", None))
     with torch.no_grad():
         while True:
             if queued is not None:
@@ -973,6 +1077,11 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
             if op == "noop":                                  # keep-warm tick from the predecessor: skip
                 continue
             if op == "reset":
+                capacity_error = _reset_capacity_error(st, msg)
+                if capacity_error is not None:
+                    kw.send(dict(msg, reset_error=capacity_error))
+                    continue
+                _privacy_reset(st, msg)
                 timer.start()                                 # a reset opens a job: time it on its own
                 st.reset()
                 _set_job_horizon(msg.get("max_pos"))          # v4_ref_slim; absent key => None => safe
@@ -994,6 +1103,8 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
             if op == "step":
                 timer.lap("recv", msg)
                 if _fenced(msg, epoch):                       # stale speculation: pass it on, untouched
+                    if getattr(st, "_token_privacy", None) is not None:
+                        msg = {key: msg[key] for key in ("op", "start_pos", "epoch", "cpos") if key in msg}
                     msg["fenced"] = True
                     kw.send(msg)
                     continue
@@ -1003,16 +1114,28 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 if head:
                     ids = _ids_tensor(msg["ids"])             # the coordinator sends a plain list
                     h = st.embed(ids)                         # token ids -> h [b, s, hc_mult, dim]
-                    in_b = _payload_bytes(h, ids) if signer is not None else None
+                    codec = getattr(st, "_token_privacy", None)
+                    envelope = codec.seal(ids, _privacy_binding(st, msg), next_token=msg.get("dnxt")) if codec is not None else None
+                    if signer is not None and envelope is not None:
+                        from v4_privacy import wire_payload_bytes
+                        in_b = wire_payload_bytes(_tbytes(h), envelope)
+                    else:
+                        in_b = _payload_bytes(h, ids) if signer is not None else None
                 else:
-                    h, ids, in_b = _recv_hids(msg, signer)    # upcasts fp8; in_b hashes the wire bytes
+                    codec = getattr(st, "_token_privacy", None)
+                    envelope = msg.get("sealed_ids")
+                    h, ids, in_b = _recv_hids(msg, signer, device=getattr(st, "device", None),
+                        token_privacy=codec, stage_lo=lo, n_hash_layers=getattr(getattr(st, "args", None), "n_hash_layers", 3),
+                        binding=_privacy_binding(st, msg) if codec is not None else None)
                 start_pos = int(msg["start_pos"])
                 timer.lap("pre")
                 h = st.forward(h, ids, start_pos)
                 timer.sync()
                 timer.lap("fwd")
-                frame, out_b = _make_step_frame(h, ids, start_pos, signer)  # fp8-packs when V4_FP8_WIRE
+                frame, out_b = _make_step_frame(h, ids, start_pos, signer, token_envelope=envelope)
                 for k in _PASSTHRU:                           # protocol header rides every hop
+                    if k == "dnxt" and envelope is not None:
+                        continue  # token-valued hint is authenticated inside the opaque envelope
                     if k in msg:
                         frame[k] = msg[k]
                 if signer is not None:
@@ -1215,11 +1338,12 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                      name="v4-tail-reaccept").start()
 
     signer = None
+    reply_identity = {}
     temp, gen = 0.0, None                                    # sampling arm, (re)set per job by the reset
     drafter, built = None, {}                                # per-job arm, process-lifetime drafter
     epoch = 0                                                # newest speculation generation seen (fence)
     timer = _timer("[tail]", ("recv", "pre", "fwd", "out", "logits", "draft", "send"),
-                   getattr(st, "device", None))
+                   getattr(st, "device", None), getattr(st, "_runtime_profile", None))
     with torch.no_grad():
         while True:
             msg = queued if queued is not None else recv_msg(pred)
@@ -1228,6 +1352,13 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
             if op == "noop":                                  # keep-warm tick from the predecessor: skip
                 continue
             if op == "reset":
+                reply_identity = ({key: msg.get(key) for key in ("job_id", "swarm_id", "nonce")}
+                                  if msg.get("reply_binding") == 1 else {})
+                capacity_error = _reset_capacity_error(st, msg)
+                if capacity_error is not None:
+                    chan.send({"ok": False, "op": "reset_ok", **reply_identity, "error": capacity_error})
+                    continue
+                _privacy_reset(st, msg)
                 timer.start()                                 # a reset opens a job: time it on its own
                 st.reset()
                 _set_job_horizon(msg.get("max_pos"))          # v4_ref_slim; absent key => None => safe
@@ -1248,7 +1379,8 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                     # so it would see a stall on this job and on every job after it. The reset ack is
                     # the one channel back, and a non-"ok" ack is already a hard failure there.
                     print(f"[tail] dspark unavailable: {type(e).__name__}: {e}", flush=True)
-                    chan.send({"ok": False, "error": f"{type(e).__name__}: {e}"})
+                    chan.send({"ok": False, "op": "reset_ok", **reply_identity,
+                               "error": f"{type(e).__name__}: {e}"})
                     continue
                 signer = (ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                         msg.get("job_id", "job"), lo, hi, nonce=msg.get("nonce"))
@@ -1256,7 +1388,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                 temp = float(msg.get("temp", 0.0))
                 gen = (torch.Generator(device="cpu").manual_seed(int(msg["seed"]))
                        if temp > 0 and msg.get("seed") is not None else None)
-                chan.send("ok")
+                chan.send({"ok": True, "op": "reset_ok", **reply_identity} if reply_identity else "ok")
                 continue
             if op == "receipt":
                 timer.report()                                # the job barrier: one timing line per job
@@ -1268,20 +1400,28 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
             if op == "step":
                 timer.lap("recv", msg)
                 if _fenced(msg, epoch):                       # stale speculation: answer, compute nothing
-                    send_msg(ret, {"fenced": True, "epoch": int(msg.get("epoch", 0)),
-                                   "pos": int(msg["start_pos"])})
+                    chan.send({"fenced": True, "epoch": int(msg.get("epoch", 0)),
+                               "pos": int(msg["start_pos"]), **reply_identity})
                     continue
                 epoch = max(epoch, int(msg.get("epoch", 0)))
                 if "cpos" in msg:                             # settled frontier: free the spent snapshots
                     st.commit(int(msg["cpos"]))
-                h, ids, in_b = _recv_hids(msg, signer)        # upcasts fp8; in_b hashes the wire bytes
+                codec = getattr(st, "_token_privacy", None)
+                envelope = msg.get("sealed_ids")
+                h, ids, in_b = _recv_hids(msg, signer, device=getattr(st, "device", None),
+                    token_privacy=codec, stage_lo=lo, n_hash_layers=getattr(getattr(st, "args", None), "n_hash_layers", 3),
+                    is_tail=True, binding=_privacy_binding(st, msg) if codec is not None else None)
                 start_pos = int(msg["start_pos"])
                 timer.lap("pre")
                 h = st.forward(h, ids, start_pos)
                 timer.sync()
                 timer.lap("fwd")
                 if signer is not None:
-                    signer.observe(in_b, _payload_bytes(h, ids))
+                    if envelope is not None:
+                        from v4_privacy import wire_payload_bytes
+                        signer.observe(in_b, wire_payload_bytes(_tbytes(h), envelope))
+                    else:
+                        signer.observe(in_b, _payload_bytes(h, ids))
                 timer.lap("out")
                 rows = _tail_logit_rows(st, h, start_pos)     # hc_head + norm + lm_head, one row per pos
                 out = {"token": sample_token(rows[-1][0], temp, gen)}
@@ -1292,7 +1432,13 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                 timer.sync()
                 timer.lap("logits")
                 if drafter is not None:                       # dspark: draft the next block locally
-                    out.update(drafter.on_chunk(msg, st, out) or {})
+                    draft_msg = dict(msg, ids=ids) if envelope is not None else msg
+                    if envelope is not None:
+                        hint = codec.open_next_token(envelope, _privacy_binding(st, msg))
+                        if hint is not None:
+                            draft_msg["dnxt"] = hint
+                    out.update(drafter.on_chunk(draft_msg, st, out) or {})
+                out.update(reply_identity)
                 timer.sync()
                 timer.lap("draft")
                 timer.lap("send", chan.send(out))
@@ -1386,35 +1532,91 @@ def connect_ring(head, tail, timeout=600.0, token=None, retry_s=300):
     raise ConnectionError(f"v4 ring not reachable after {retry_s}s: {type(last).__name__}: {last}")
 
 
-def _sweep_receipts(pipe, ret, layer_count, nonce):
+def _sweep_receipts(pipe, ret, layer_count, nonce, *, expected_by_signer=None,
+                    swarm_id=None, job_id=None, cancel_check=None):
     """Sweep the ring once at job end and verify coverage — fail-closed (C10). wire_receipt strips the
     post-sign `stage` debug tag, which is in the signed preimage of nothing and would break the
     signature if a verifier saw it. Returns (receipts, receipts_ok)."""
+    if cancel_check is not None:
+        cancel_check()
     send_msg(pipe, {"op": "receipt", "receipts": []})
     recs = recv_msg(ret) or []
+    if cancel_check is not None:
+        cancel_check()
     if not recs or layer_count is None:
         return recs, None
     wired = [wire_receipt(r) for r in recs]
     try:
-        verify_coverage(wired, int(layer_count), expected_nonce=nonce, check_chain=True)
+        verify_coverage(wired, int(layer_count), expected_by_signer=expected_by_signer,
+                        expected_nonce=nonce, check_chain=True)
+        if ((swarm_id is not None and any(r.get("swarm_id") != swarm_id for r in wired)) or
+                (job_id is not None and any(r.get("job_id") != job_id for r in wired))):
+            return recs, False
         return recs, True
     except ReceiptError:
         return recs, False
 
 
+def _coord_io(cancel_check, on_token, expected_job=None):
+    """Cancellation boundaries around I/O and committed callbacks.
+
+    A service owner also closes its active sockets on cancel/deadline so a
+    blocking receive/send is interrupted. The callback alone cannot wake a socket.
+    """
+    def guard():
+        if cancel_check is not None:
+            cancel_check()
+    awaiting_reset = [False]
+    privacy = _configured_token_privacy()
+    def send(sock, msg):
+        guard()
+        if privacy is not None and msg.get("op") == "reset":
+            msg = dict(msg, token_privacy=privacy.descriptor())
+        if expected_job is not None and msg.get("op") == "reset":
+            msg = dict(msg, reply_binding=1)
+            awaiting_reset[0] = True
+        send_msg(sock, msg)
+        guard()
+    def recv(sock):
+        guard()
+        for _ in range(256):
+            result = recv_msg(sock)
+            guard()
+            if expected_job is None:
+                return result
+            if isinstance(result, dict) and all(result.get(k) == v for k, v in expected_job.items()):
+                if awaiting_reset[0]:
+                    if result.get("op") != "reset_ok":
+                        raise RuntimeError("expected identity-bound reset barrier before token replies")
+                    awaiting_reset[0] = False
+                return result
+            if awaiting_reset[0] and isinstance(result, dict) and ("token" in result or "fenced" in result):
+                continue  # old in-flight replies may arrive on a newly reattached return channel
+            raise RuntimeError("ring reply is not bound to this job/nonce/swarm")
+        raise RuntimeError("too many stale replies before reset barrier")
+    def commit(token):
+        guard()
+        on_token(token)
+    guard()
+    return send, recv, commit if on_token is not None else None
+
+
 def coordinate(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_id="swarm",
                job_id="job", layer_count=None, receipts=False, temp=0.0, seed=0, timeout=600.0,
-               on_token=None):
+               on_token=None, cancel_check=None, expected_by_signer=None, strict_job_binding=False):
     """Greedy sequential decode over the fire-forward ring. Weightless: the head embeds, the tail
     samples, and this loop only threads token ids and the settlement nonce over the sockets.
 
     Returns {ok, tokens, prompt_tokens, receipts, receipts_ok}. `receipts` sweeps the ring once at
     the end and verifies coverage against `layer_count` and the job nonce (fail-closed, C10)."""
+    nonce = _privacy_job_nonce(nonce)
+    _send, _recv, on_token = _coord_io(cancel_check, on_token,
+        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None)
     ret.settimeout(timeout)
-    send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
+    _send(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
                     "temp": float(temp), "seed": int(seed),
                     "max_pos": _job_max_pos(prompt_ids, max_new)})   # greedy: no draft overshoot
-    ack = recv_msg(ret)                                       # the tail acks the whole ring is reset
+    ack = _recv(ret)                                       # the tail acks the whole ring is reset
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 ring reset not acked: {ack!r}")
 
@@ -1423,9 +1625,9 @@ def coordinate(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_
     pos = 0
     toks = []
     for _ in range(max_new):
-        send_msg(pipe, {"op": "step", "ids": [ids], "start_pos": pos})
+        _send(pipe, {"op": "step", "ids": [ids], "start_pos": pos})
         pos += len(ids)
-        rep = recv_msg(ret)
+        rep = _recv(ret)
         tid = int(rep["token"]) if isinstance(rep, dict) else int(rep)
         toks.append(tid)
         if on_token is not None:
@@ -1436,7 +1638,7 @@ def coordinate(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_
 
     recs, receipts_ok = [], None
     if receipts:
-        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce)
+        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce, expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
             "receipts": recs, "receipts_ok": receipts_ok}
 
@@ -1465,7 +1667,8 @@ def _drafter_propose(drafter, ng):
 
 def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_id="swarm",
                     job_id="job", layer_count=None, receipts=False, timeout=600.0, on_token=None,
-                    K=4, ng=3, drafter=None):
+                    K=4, ng=3, drafter=None, cancel_check=None, expected_by_signer=None,
+                    strict_job_binding=False):
     """SPECULATIVE decode over the fire-forward ring — the g-lever that beats the transport ceiling.
     Each round proposes K draft tokens, sends the (cur + drafts) chunk through the ring in ONE
     traversal, the tail returns the model's greedy token at EVERY chunk position, and we commit the
@@ -1479,13 +1682,16 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
     end of the rejected draft.
 
     Returns coordinate()'s dict plus spec stats {rounds, generated, g, accept_hist}."""
+    nonce = _privacy_job_nonce(nonce)
+    _send, _recv, on_token = _coord_io(cancel_check, on_token,
+        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None)
     plan_verify_round = _dspark().plan_verify_round        # ONE accept rule, shared with the tail
     propose = _drafter_propose(drafter, ng)
     ret.settimeout(timeout)
-    send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
+    _send(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
                     "temp": 0.0, "seed": 0, "spec": True,
                     "max_pos": _job_max_pos(prompt_ids, max_new, K + 1)})   # + the draft chunk
-    ack = recv_msg(ret)
+    ack = _recv(ret)
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 spec ring reset not acked: {ack!r}")
 
@@ -1496,8 +1702,8 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
     hist = {}
 
     # prefill: forward the whole prompt as one chunk, take the first generated token
-    send_msg(pipe, {"op": "step", "ids": [ids], "start_pos": 0})
-    rep = recv_msg(ret)
+    _send(pipe, {"op": "step", "ids": [ids], "start_pos": 0})
+    rep = _recv(ret)
     pos = len(ids)                                            # absolute position of `cur` (not yet fed)
     cur = int(rep["token"] if isinstance(rep, dict) else rep)
     ids.append(cur)
@@ -1508,8 +1714,8 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
     while len(toks) < max_new and cur not in eos:
         drafts = propose(ids, K)                              # K proposed continuations of `cur`
         rounds += 1
-        send_msg(pipe, {"op": "step", "ids": [[cur] + drafts], "start_pos": pos})
-        r = recv_msg(ret)["tokens"]                           # model greedy token AFTER each chunk pos (K+1)
+        _send(pipe, {"op": "step", "ids": [[cur] + drafts], "start_pos": pos})
+        r = _recv(ret)["tokens"]                           # model greedy token AFTER each chunk pos (K+1)
         n, committed = plan_verify_round(drafts, r)           # longest matching prefix + the correction
         accepted_total += n
         hist[n] = hist.get(n, 0) + 1
@@ -1529,7 +1735,7 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
 
     recs, receipts_ok = [], None
     if receipts:
-        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce)
+        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce, expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
     gen = len(toks)
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
             "receipts": recs, "receipts_ok": receipts_ok,
@@ -1584,7 +1790,8 @@ def _conf_send_len(confs, thresh, min_send):
 
 def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_id="swarm",
                       job_id="job", layer_count=None, receipts=False, timeout=600.0, on_token=None,
-                      conf_gate=None, conf_thresh=None, conf_min=None, conf_probe=None):
+                      conf_gate=None, conf_thresh=None, conf_min=None, conf_probe=None,
+                      cancel_check=None, expected_by_signer=None, strict_job_binding=False):
     """DSPARK speculative decode over the fire-forward ring — the headline drafted path.
 
     Same propose->verify->accept->rollback contract coordinate_spec proves, with the proposer moved
@@ -1620,6 +1827,9 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     total draft tokens actually offered (< the drafted total when the gate trims), which is how a
     selftest tells "the drafter proposed nothing" apart from "the drafter proposed and was rejected"
     and how a bench reads the gate's effect."""
+    nonce = _privacy_job_nonce(nonce)
+    _send, _recv, on_token = _coord_io(cancel_check, on_token,
+        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None)
     plan_verify_round = _dspark().plan_verify_round        # ONE accept rule, shared with the tail
     gate = V4_DSPARK_CONF_GATE if conf_gate is None else bool(conf_gate)
     thresh = V4_DSPARK_CONF_THRESH if conf_thresh is None else float(conf_thresh)
@@ -1631,11 +1841,11 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     # who set V4_LAZY_DRAFT=1 on a serial ring see a MISMATCH instead of "no-job-yet" forever.
     v4_levers.note("V4_LAZY_DRAFT", False)
     ret.settimeout(timeout)
-    send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
+    _send(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
                     "temp": 0.0, "seed": 0, "spec": True, "dspark": True,
                     # the tail's MTP block size is not knowable here — the fat margin is the answer
                     "max_pos": _job_max_pos(prompt_ids, max_new, _SPEC_POS_MARGIN)})
-    ack = recv_msg(ret)
+    ack = _recv(ret)
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 dspark ring reset not acked: {ack!r}")
 
@@ -1646,8 +1856,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     hist = {}
 
     # prefill: the whole prompt as one chunk. The tail also builds the mtp window from its taps here.
-    send_msg(pipe, {"op": "step", "ids": [ids], "start_pos": 0})
-    rep = recv_msg(ret)
+    _send(pipe, {"op": "step", "ids": [ids], "start_pos": 0})
+    rep = _recv(ret)
     pos = len(ids)                                            # absolute position of `cur` (not yet fed)
     cur = int(rep["token"] if isinstance(rep, dict) else rep)
     ids.append(cur)
@@ -1667,8 +1877,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
         drafted += bool(drafts)
         sent += len(drafts)
         send_hist[len(drafts)] = send_hist.get(len(drafts), 0) + 1
-        send_msg(pipe, {"op": "step", "ids": [[cur] + drafts], "start_pos": pos})
-        rep = recv_msg(ret)
+        _send(pipe, {"op": "step", "ids": [[cur] + drafts], "start_pos": pos})
+        rep = _recv(ret)
         if "n" not in rep:
             raise RuntimeError(
                 "v4 dspark: the tail's reply carries no accept length, so nothing is drafting on it "
@@ -1707,7 +1917,7 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
 
     recs, receipts_ok = [], None
     if receipts:
-        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce)
+        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce, expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
     gen = len(toks)
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
             "receipts": recs, "receipts_ok": receipts_ok,
@@ -1849,7 +2059,8 @@ class _FrameSender(threading.Thread):
 
 def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
                                 swarm_id="swarm", job_id="job", layer_count=None, receipts=False,
-                                timeout=600.0, on_token=None, depth=None, lazy=None, floor=None):
+                                timeout=600.0, on_token=None, depth=None, lazy=None, floor=None,
+                                cancel_check=None, expected_by_signer=None, strict_job_binding=False):
     """DSPARK speculative decode, PIPELINED — the same lossless round, streamed instead of chunked.
 
     Same contract as coordinate_dspark (same reset, same drafter, same accept rule, same emitted
@@ -1925,6 +2136,9 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     flight, and `topup_agree`/`topup_disagree` count exactly how often those two histories differ
     where they overlap. At floor=1 every topup counter is structurally zero and the round is the
     shipped one, frame for frame, hints included."""
+    nonce = _privacy_job_nonce(nonce)
+    _send, _recv, on_token = _coord_io(cancel_check, on_token,
+        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None)
     W = int(depth or V4_SPEC_DEPTH)
     F = int(floor if floor is not None else V4_REFILL_FLOOR)
     if F < 1:
@@ -1939,9 +2153,10 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     v4_levers.note("V4_PIPELINED_SPEC", True)
     v4_levers.note("V4_REFILL_FLOOR", F)
     ret.settimeout(timeout)
-    send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
-                    "temp": 0.0, "seed": 0, "spec": True, "dspark": True, "pipelined": True})
-    ack = recv_msg(ret)
+    _send(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
+                    "temp": 0.0, "seed": 0, "spec": True, "dspark": True, "pipelined": True,
+                    "max_pos": _job_max_pos(prompt_ids, max_new, _SPEC_POS_MARGIN)})
+    ack = _recv(ret)
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 dspark ring reset not acked: {ack!r}")
 
@@ -1951,8 +2166,8 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
 
     # PREFILL is still one multi-token frame — it is the only place the whole chunk goes in at once
     # (the reference's own collapse-then-slice), and it is where the tail builds its mtp window.
-    send_msg(pipe, {"op": "step", "ids": [ids], "start_pos": 0, "epoch": 0})
-    rep = recv_msg(ret)
+    _send(pipe, {"op": "step", "ids": [ids], "start_pos": 0, "epoch": 0})
+    rep = _recv(ret)
     if not isinstance(rep, dict) or "acc" not in rep:
         raise RuntimeError(
             "v4 pipelined dspark: the tail's prefill reply carries no `acc`, so nothing is drafting "
@@ -2087,7 +2302,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 f"v4 pipelined dspark: nothing in flight at position {c} with {len(toks)} of "
                 f"{max_new} tokens generated — the pipeline emptied without stopping")
         try:
-            rep = recv_msg(ret)
+            rep = _recv(ret)
         except Exception:
             if sender.err is not None:
                 raise RuntimeError(f"v4 pipelined dspark: the frame sender died: "
@@ -2276,7 +2491,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                            f"{type(sender.err).__name__}: {sender.err}") from sender.err
     recs, receipts_ok = [], None
     if receipts:
-        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce)
+        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce, expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
     gen = len(toks)
     cycles = cancels + 1
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
@@ -2406,7 +2621,9 @@ GRAPH_MODE_VALUES = frozenset({"0", "1", "island", "on", "whole", "2", "eager"})
 # V4_CUDA_GRAPH (the validated `cuda_graph=` mode — see _graph_env_conflict for why an operator's
 # export of it RAISES rather than quietly winning or quietly losing).
 ENG_ENV = [
-    "V4_FP8_WIRE",                                                              # wire codec
+    "V4_KV_PLACEMENT", "V4_KV_GPU_MIB", "V4_KV_HOST_MIB", "V4_PREFILL_QUERY_CHUNK",
+    "V4_SEALED_IDS", "V4_TOKEN_PRIVACY_KEY_ID",  # public negotiation only; secret files never forwarded
+    "V4_FP8_WIRE", "V4_WIRE_FUSED",                                             # wire codec
     "V4_PIPELINED_SPEC", "V4_SPEC_DEPTH", "V4_LAZY_DRAFT", "V4_REFILL_FLOOR",   # pipelined speculation
     "V4_MOE_GROUPED", "V4_MOE_DECODE", "V4_MOE_MULTI", "V4_MOE_MULTI_MAX",      # MoE kernels
     "V4_FP8_GEMV", "V4_FP8_SHARED",                                             # fp8 GEMV path
@@ -2421,6 +2638,8 @@ ENG_ENV = [
     "V4_DIAL_CONNECT_TIMEOUT", "V4_DIAL_RETRY_S",                               # inter-stage dial
     "V4_TIMING", "V4_TIMING_EVERY",                                             # instrumentation
     "V4_RUNTIME_METRICS",                                                       # signed work/residency observations
+    "V4_PROFILE_RUNTIME", "V4_PROFILE_GPU_EVERY",                               # bounded phase profiling
+    "V4_EXPERT_PREFETCH", "V4_EXPERT_PREFETCH_SLOTS", "V4_EXPERT_PREFETCH_WARMUP", # local prefetch policy
     "V4_EXPERT_PLACEMENT", "V4_EXPERT_CACHE_SLOTS", "V4_EXPERT_CACHE_MIB",         # local experts
     "V4_EXPERT_CACHE_RESERVE_MIB",                                               # measured free VRAM headroom
     "V4_LEVERS_STRICT",                                                         # lever audit
@@ -2779,6 +2998,7 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
     n_layers = args.n_layers
     d = tempfile.mkdtemp(prefix="v4pipe_")
     model = R.build_oracle(args)
+    R.init_fingerprint_fixture(model, args)
     _write_tiny_checkpoint(d, args, model)                     # write BEFORE decoding: a fresh model
     os.environ["V4_DIR"] = d                                   # never carries a used sequence's state
 
@@ -2903,10 +3123,13 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
             for v in fl.values()),
         "floor_receipts_settle": all(v["receipts_ok"] is True and cover(v, d_ranges)
                                      for v in fl.values()),
-        # the depth histogram: at zero accept every judged draft is a depth-1 miss off a cancel
-        # refill, so the block book must carry trials and no hits, and the topup book must be empty
-        "accept_by_depth_scores_the_misses": all(
-            v["accept_by_depth"] and all(h == 0 for h, _ in v["accept_by_depth"].values())
+        # Random drafts can occasionally hit, especially at wider blocks. Verify
+        # the measured book against actual accepted predictions, not a lucky
+        # assumption that every random-model draft must miss.
+        "accept_by_depth_accounts_for_judged_predictions": all(
+            v["accept_by_depth"] and all(type(h) is int and type(n) is int and 0 <= h <= n and n > 0
+                                         for h, n in v["accept_by_depth"].values())
+            and sum(h for h, _ in v["accept_by_depth"].values()) == v["accepted"]
             and v["topup_accept_by_depth"] == {} for v in fl.values()),
     }
     tag = f", tail box = {tail_box_g} GPUs (return relay)" if tail_box_g > 1 else ""
@@ -2954,6 +3177,13 @@ def _encode_prompt(tok, job):
     to a string that already carries the BOS token — hence add_special_tokens=False."""
     if not job.get("messages"):
         return job["promptIds"]
+    enc_dir = os.path.join(_vendored("deepseek_v4_ref"), "encoding")
+    if enc_dir not in sys.path:
+        sys.path.insert(0, enc_dir)
+    from encoding_dsv4 import encode_messages
+    text = encode_messages(job["messages"], "thinking" if job.get("thinking") else "chat",
+                           reasoning_effort=job.get("reasoningEffort"))
+    return tok.encode(text, add_special_tokens=False)
 def _vendored(name):
     """Locate a vendored reference tree, in the repo AND on a deployed box.
 
@@ -2968,15 +3198,6 @@ def _vendored(name):
         if os.path.isdir(cand):
             return os.path.normpath(cand)
     return os.path.join(here, name)
-
-
-    enc_dir = os.path.join(_vendored("deepseek_v4_ref"), "encoding")
-    if enc_dir not in sys.path:
-        sys.path.insert(0, enc_dir)
-    from encoding_dsv4 import encode_messages
-    text = encode_messages(job["messages"], "thinking" if job.get("thinking") else "chat",
-                           reasoning_effort=job.get("reasoningEffort"))
-    return tok.encode(text, add_special_tokens=False)
 
 
 def _coord_cli(a):

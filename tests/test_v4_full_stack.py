@@ -353,22 +353,54 @@ def test_the_ring_recipe_serves_exactly_what_the_default_serves():
 def test_noqat_is_the_one_lever_that_changes_the_stream_and_is_therefore_not_in_the_recipe():
     """V4_REF_SLIM_NOQAT removes a deliberate PRECISION REDUCTION (the reference quantizes KV/Q to
     fp8/fp4 and dequantizes straight back, to simulate an fp8 KV deployment). Dropping it makes the
-    run strictly MORE precise than the reference — which is still a different answer, and on the toy
-    config it moves tokens from step 3 on.
+    run strictly MORE precise than the reference — which changes logits even when a short greedy
+    continuation happens to keep the same argmax tokens.
 
     It is documented APPROXIMATE in v4_ref_slim's module docstring, and the selftest passes with it
     on because the ring and its reference move together. So it must stay OUT of any run whose claim
-    is "bit-identical to greedy", which is the headline claim of the pipelined arm. Asserting the
-    divergence rather than the equality keeps it that way: if a future change makes NOQAT lossless
-    this test fails and someone has to decide deliberately, instead of it drifting into the recipe."""
+    is "bit-identical to greedy", which is the headline claim of the pipelined arm. The sharp
+    cross-config assertion is on complete logits bytes from the SAME fixed teacher inputs, not on
+    an argmax coincidence or two autoregressive paths with different inputs. If a future change
+    makes NOQAT lossless this test fails, rather than letting it drift into the recipe."""
     assert "V4_REF_SLIM_NOQAT" not in RING_RECIPE, "NOQAT is not lossless — keep it out of the recipe"
     base = selftest_streams()
     noqat = selftest_streams(V4_PIPELINED_SPEC=1, V4_REF_SLIM=1, V4_REF_SLIM_NOQAT=1)
-    assert base["ref"] != noqat["ref"], (
-        "NOQAT no longer changes the reference stream — re-derive whether it is now lossless "
+    # Isolate the QAT toggle: indexer slim is on in BOTH fresh interpreters.
+    # The normal selftest above still proves every mode's complete ring parity.
+    teacher_probe = """
+        import hashlib, json, torch, v4_ref_cpu as R
+        args = R.cpu_args()
+        model = R.init_fingerprint_fixture(R.build_oracle(args, seed=0), args)
+        prompt = [168, 15, 493, 72, 22]
+        teacher = [1, 13, 29, 57, 91]
+        _, logits, _ = model(torch.tensor([prompt]))
+        tensors = [logits.clone()]
+        for position, token in enumerate(teacher, len(prompt)):
+            _, logits, _ = model(torch.tensor([[token]]), position)
+            tensors.append(logits.clone())
+        logits = torch.cat(tensors, dim=0).contiguous()
+        assert logits.dtype == torch.float32
+        assert torch.isfinite(logits).all(), "teacher logits must be finite"
+        raw = bytes(logits.view(torch.uint8).flatten().tolist())
+        print("LOGIT_BYTES " + json.dumps({"sha256": hashlib.sha256(raw).hexdigest(),
+            "prompt": prompt, "teacher": teacher, "shape": list(logits.shape),
+            "dtype": str(logits.dtype), "byte_count": len(raw)}))
+    """
+    import json as _json
+    def observation(noqat_flag):
+        out = run_probe(teacher_probe, V4_REF_SLIM=1, V4_REF_SLIM_NOQAT=noqat_flag)
+        return _json.loads(next(line[len("LOGIT_BYTES "):] for line in out.splitlines()
+                                if line.startswith("LOGIT_BYTES ")))
+    qat, unquantized = observation(0), observation(1)
+    assert {k: v for k, v in qat.items() if k != "sha256"} == {
+        k: v for k, v in unquantized.items() if k != "sha256"}, "teacher operands/shapes must agree"
+    assert qat["shape"] == [6, 512] and qat["byte_count"] == 6 * 512 * 4
+    assert qat["sha256"] != unquantized["sha256"], (
+        "NOQAT no longer changes reference logits bytes — re-derive whether it is lossless "
         "before letting it into the recipe")
-    # and it moves every path together, which is why the in-config selftest cannot see it
+    # Each mode must still serve its own reference exactly on every ring path.
     assert noqat["ref"] == noqat["ring"] == noqat["pipe"], noqat
+    assert base["ref"] == base["ring"] == base["pipe"], base
 
 
 # ── where the two biggest levers actually touch ───────────────────────────────────────────────────

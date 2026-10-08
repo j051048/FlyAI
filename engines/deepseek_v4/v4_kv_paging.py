@@ -1,12 +1,11 @@
-"""V4-Dedicated Paged KV Cache and Dual-Tier Working Set Management (Step 10).
+"""Legacy, standalone two-tensor K/V page utility; not the V4 Stage adapter.
 
-Prevents OOM during long-context serving on 32GB GPUs by strictly bounding VRAM:
-  1. GPU Active Working Set: Retains only sliding-window tokens (e.g. recent 2048)
-     and initial attention sinks, keeping GPU VRAM strictly bounded regardless of context length.
-  2. Host RAM Full History: Pinned host memory archives full multi-turn conversation
-     KV pages for long-context recall.
-  3. Speculative Decode Rollback: Deterministically trims unaccepted draft token KV
-     entries back to the last committed token position.
+DeepSeek V4 uses an MLA ring plus learned compressed history, an Indexer and
+two Compressor recurrences. Those cannot be replaced by these generic K/V
+pages. The real optional serving path is v4_kv_runtime.V4KVRuntime, selected by
+Stage(kv_placement='layer') with explicit quotas. This utility is retained for
+its standalone callers/tests; it neither changes V4 attention nor establishes
+a production GPU/pinned-memory bound or recall/sink policy.
 """
 from __future__ import annotations
 

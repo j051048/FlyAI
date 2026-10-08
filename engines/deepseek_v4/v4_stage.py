@@ -68,6 +68,22 @@ through aliases bound LAZILY on first forward (`compressor.kv_cache = self.kv_ca
 model.py:497), which is why `reset()` zeroes the underlying buffers IN PLACE rather than rebuilding
 modules: the aliases are views, so they follow, and the weights survive.
 
+OPTIONAL KV STORAGE AND PREFILL QUERY SEAMS
+  V4_KV_PLACEMENT=layer reserves main window/Compressor state and one explicitly
+  bounded device working area; compressed Attention and Indexer histories live
+  in pinned host memory. The original attention methods read their full valid
+  prefix in that area, so this saves per-layer persistent history but adds PCIe
+  traffic. Its quota limits supported context, not the reference's read set.
+  Rollback snapshots also live on the host. Whole-layer graphs and fast verify
+  are refused with this storage mode; HC/norm graph islands remain possible.
+
+  V4_PREFILL_QUERY_CHUNK splits only independent queries and index scores.
+  Full-prompt projections, Compressor recurrence, MoE/HC and final projection
+  retain their reference shapes. A new shape runs a strict reference output
+  and state gate before it can be used without shadow execution. That first
+  prefill needs reference scratch and costs both paths. This is not tokenwise
+  prefill and does not bound every prompt activation or move expert routing.
+
 WHAT IS A SEAM HERE AND NOT YET A FEATURE
   _spec       arm it and every forward at `start_pos > 0` checkpoints the rollback-able state before
               it is touched, into a position-keyed ring of the last W (`_spec_ckpts`); `_seek` then
@@ -87,6 +103,7 @@ WHAT IS A SEAM HERE AND NOT YET A FEATURE
 """
 import argparse, glob, json, os, sys, torch
 from collections import deque
+from contextlib import nullcontext
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from safetensors import safe_open
@@ -102,10 +119,19 @@ except ImportError:
     from shard.runtime_metrics import RuntimeMetrics
 
 V4_RUNTIME_METRICS = os.environ.get("V4_RUNTIME_METRICS", "0") not in ("", "0")
+V4_PROFILE_RUNTIME = os.environ.get("V4_PROFILE_RUNTIME", "0") not in ("", "0")
+V4_PROFILE_GPU_EVERY = int(os.environ.get("V4_PROFILE_GPU_EVERY", "16"))
+V4_EXPERT_PREFETCH = os.environ.get("V4_EXPERT_PREFETCH", "0") not in ("", "0")
+V4_EXPERT_PREFETCH_SLOTS = int(os.environ.get("V4_EXPERT_PREFETCH_SLOTS", "2"))
+V4_EXPERT_PREFETCH_WARMUP = int(os.environ.get("V4_EXPERT_PREFETCH_WARMUP", "2"))
 V4_EXPERT_PLACEMENT = os.environ.get("V4_EXPERT_PLACEMENT", "gpu")
 V4_EXPERT_CACHE_SLOTS = int(os.environ.get("V4_EXPERT_CACHE_SLOTS", "0"))
 V4_EXPERT_CACHE_MIB = int(os.environ.get("V4_EXPERT_CACHE_MIB", "0"))
 V4_EXPERT_CACHE_RESERVE_MIB = int(os.environ.get("V4_EXPERT_CACHE_RESERVE_MIB", "2048"))
+V4_KV_PLACEMENT = os.environ.get("V4_KV_PLACEMENT", "gpu")
+V4_KV_GPU_MIB = int(os.environ.get("V4_KV_GPU_MIB", "0"))
+V4_KV_HOST_MIB = int(os.environ.get("V4_KV_HOST_MIB", "0"))
+V4_PREFILL_QUERY_CHUNK = int(os.environ.get("V4_PREFILL_QUERY_CHUNK", "0"))
 
 # Nothing here reads the checkpoint at import time (k3_stage's rule): resolving lazily costs one
 # memoized call and lets `import v4_stage` work on a box with no model on disk -- which is every box
@@ -643,12 +669,45 @@ class Stage:
     def __init__(self, lo, hi, args=None, *, head=False, tail=False, dspark=False,
                  device=None, dtype=None, spec_depth=None, fast_verify=None, runtime_metrics=None,
                  expert_placement=None, expert_cache_slots=None, expert_cache_bytes=None,
-                 expert_cache_reserve_bytes=None, expert_cache_reference=False):
+                 expert_cache_reserve_bytes=None, expert_cache_reference=False,
+                 runtime_profile=None, expert_prefetch=None, kv_placement=None,
+                 kv_gpu_budget_bytes=None, kv_host_budget_bytes=None,
+                 kv_reference=False, prefill_query_chunk=None):
+        for name, value in (("runtime_profile", runtime_profile), ("expert_prefetch", expert_prefetch)):
+            if value is not None and type(value) is not bool:
+                raise ValueError(f"{name} must be a boolean or None")
+        if type(kv_reference) is not bool:
+            raise ValueError("kv_reference must be a boolean")
+        self._kv_placement = V4_KV_PLACEMENT if kv_placement is None else kv_placement
+        if self._kv_placement not in ("gpu", "layer"):
+            raise ValueError("kv_placement must be 'gpu' or 'layer'")
+        self._kv_gpu_budget_bytes = V4_KV_GPU_MIB * 1024**2 if kv_gpu_budget_bytes is None else kv_gpu_budget_bytes
+        self._kv_host_budget_bytes = V4_KV_HOST_MIB * 1024**2 if kv_host_budget_bytes is None else kv_host_budget_bytes
+        self._prefill_query_chunk = V4_PREFILL_QUERY_CHUNK if prefill_query_chunk is None else prefill_query_chunk
+        for name in ("_kv_gpu_budget_bytes", "_kv_host_budget_bytes", "_prefill_query_chunk"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
+                raise ValueError(f"{name[1:]} must be a nonnegative integer")
+        self._kv_reference = kv_reference
+        self._kv_runtime = None
+        if self._kv_placement == "layer":
+            if not self._kv_gpu_budget_bytes or not self._kv_host_budget_bytes:
+                raise ValueError("layer KV requires explicit positive GPU and host byte quotas")
+            if _graph_mode() == "whole":
+                raise ValueError("layer KV changes active storage; use V4_CUDA_GRAPH=off or island, not whole")
+            if (V4_FAST_VERIFY if fast_verify is None else fast_verify):
+                raise ValueError("layer KV requires reference verify; set V4_FAST_VERIFY=0")
+        elif kv_reference:
+            raise ValueError("kv_reference requires kv_placement='layer'")
         self.lo, self.hi = lo, hi
         self.args = args if args is not None else config()
         self.device = device or dev
+        if self._kv_placement == "layer" and self._kv_reference != (torch.device(self.device).type == "cpu"):
+            raise ValueError("layer KV needs CUDA, or explicit CPU reference emulation")
         self.dtype = dtype or getattr(torch, V4_DTYPE)
         self.head, self.tail, self._dspark = head, tail, dspark
+        # Serving resets toggle _dspark per job. Calibration describes the
+        # constructor's loaded capability/weights, which must remain stable.
+        self._dspark_capable = dspark
         self._fast = V4_FAST_VERIFY if fast_verify is None else bool(fast_verify)
         self._chunk_cap = V4_FAST_VERIFY_MAX if self._fast else 0
         M = ref()
@@ -691,6 +750,12 @@ class Stage:
                 budget_bytes=None if self._expert_cache_slots else self._expert_cache_bytes,
                 device=self.device, emulation=self._expert_cache_reference)
         block_cls = chunk_block_cls(M) if self._fast else M.Block
+        if self._prefill_query_chunk:
+            import v4_chunked_prefill
+            block_cls = v4_chunked_prefill.query_chunk_block_cls(block_cls, M, self._prefill_query_chunk)
+        if self._kv_placement == "layer":
+            import v4_kv_runtime
+            block_cls = v4_kv_runtime.tiered_block_cls(block_cls, M)
         if self._expert_cache is not None:
             import v4_hybrid
             block_cls = v4_hybrid.hybrid_block_cls(
@@ -759,10 +824,29 @@ class Stage:
         # a rewind past the oldest live checkpoint refuses loudly rather than serving stale state.
         self._spec_depth = spec_depth if spec_depth is not None else int(os.environ.get("V4_SPEC_DEPTH", 16))
         self._spec_ckpts = deque(maxlen=self._spec_depth)
+        if self._kv_placement == "layer":
+            self._kv_runtime = v4_kv_runtime.V4KVRuntime(
+                self.layers, a, device=self.device, dtype=self.dtype,
+                gpu_budget_bytes=self._kv_gpu_budget_bytes, host_budget_bytes=self._kv_host_budget_bytes,
+                spec_depth=self._spec_depth, draft_layers=a.n_mtp_layers if dspark else 0,
+                reference=self._kv_reference, prefill_gate=bool(self._prefill_query_chunk))
         self._last_tap = {}
         self._pos = 0
         self._replaying = False
+        profile = V4_PROFILE_RUNTIME if runtime_profile is None else bool(runtime_profile)
+        if profile:
+            try:
+                from runtime_profile import RuntimeProfiler
+            except ImportError:
+                from shard.runtime_profile import RuntimeProfiler
+            self._runtime_profile = RuntimeProfiler(gpu_sample_every=V4_PROFILE_GPU_EVERY)
+        else:
+            self._runtime_profile = None
+        self._expert_prefetch = V4_EXPERT_PREFETCH if expert_prefetch is None else bool(expert_prefetch)
+        if V4_EXPERT_PREFETCH_SLOTS < 1 or V4_EXPERT_PREFETCH_WARMUP < 0:
+            raise ValueError("expert prefetch slots must be positive and warmup nonnegative")
         enabled = V4_RUNTIME_METRICS if runtime_metrics is None else bool(runtime_metrics)
+        enabled = enabled or profile
         self._runtime_metrics = (RuntimeMetrics(self.device, torch_module=torch,
             mode="gpu_expert_cache" if self._expert_cache is not None and not self._expert_cache_reference else None)
             if enabled else None)
@@ -874,9 +958,14 @@ class Stage:
         `attn.kv_cache[:, win:]` (model.py:497) and `indexer.compressor.kv_cache` IS
         `indexer.kv_cache`, so both follow the buffer they were bound to."""
         self._flush_hybrid_timings()
+        if self._kv_runtime is not None:
+            self._kv_runtime.reset()
         with torch.no_grad():
             for L in self.layers:
                 L.attn.kv_cache.zero_()
+                if hasattr(L.attn, "_prefill_query_chunks"):
+                    L.attn._prefill_query_chunks = 0
+                    L.attn._prefill_gate_checks = 0
                 if L.attn.compress_ratio and L.attn.indexer is not None:
                     L.attn.indexer.kv_cache.zero_()
             for c, _ in self._compressors():
@@ -885,6 +974,13 @@ class Stage:
         self._pos = 0
         self._last_tap = {}
         self._spec_ckpts.clear()
+        profiler = getattr(self, "_runtime_profile", None)
+        if profiler is not None:
+            profiler.snapshot()  # Resolve sampled events at the preceding job's barrier.
+            profiler.reset()
+        for block in getattr(self, "_hybrid_blocks", ()):
+            block.ffn._hybrid_runtime.reset_job()
+        self._kernel_baseline = self._kernel_counters()
         if self._runtime_metrics is not None:
             # A rollback never calls reset: every reset here starts a fresh job's counters.
             self._runtime_metrics.reset()
@@ -897,6 +993,9 @@ class Stage:
         Compressor aliases share backing storage and are deduplicated by RuntimeMetrics.
         Snapshot input activations/ids are not KV; their cost remains in allocator peaks.
         """
+        if self._kv_runtime is not None:
+            for _, tensor in self._kv_runtime.tensors():
+                yield tensor
         layers = list(self.layers)
         if self._runtime_draft is not None:
             layers += list(self._runtime_draft.mtp)
@@ -954,6 +1053,12 @@ class Stage:
         if self._runtime_metrics is None:
             return None
         self._flush_hybrid_timings()
+        profiler = getattr(self, "_runtime_profile", None)
+        if profiler is not None:
+            self._runtime_metrics.performance = profiler.snapshot()
+        observed = self._kernel_counters()
+        self._runtime_metrics.kernel_coverage = {"scope": "job_python_observed", "counters": {
+            key: max(0, value - self._kernel_baseline.get(key, 0)) for key, value in observed.items()}}
         self._runtime_metrics.sample_kv(self._runtime_kv_tensors())
         if self._expert_cache is not None:
             manager = self._expert_cache
@@ -963,14 +1068,46 @@ class Stage:
                 "pinned_host_experts_bytes": sum(p.host_bytes for p in manager.pools.values() if p.pinned),
                 "slots_per_pool": {f"{role}:{layer}": cache.capacity
                                    for (role, layer), cache in manager.caches.items()}}
-        return self._runtime_metrics.snapshot()
+        snapshot = self._runtime_metrics.snapshot()
+        if self._kv_runtime is not None:
+            snapshot["kv_policy"] = self.kv_runtime_status()
+        if self._prefill_query_chunk:
+            snapshot["prefill_policy"] = self.prefill_runtime_status()
+        return snapshot
+
+    def _kernel_counters(self):
+        """Actual Python dispatch observations; graph replays do not rerun counters."""
+        grouped = generic = declined = 0
+        for block in self.layers:
+            moe = block.ffn
+            hybrid = getattr(moe, "_hybrid_runtime", None)
+            grouped += hybrid.grouped_steps if hybrid else getattr(moe, "_grouped_steps", 0)
+            generic += hybrid.generic_steps if hybrid else 0
+            declined += sum(getattr(moe, "_grouped_declined", {}).values())
+        tail = getattr(self, "_runtime_draft", None)
+        moes = [block.ffn for block in tail.mtp] if tail is not None else []
+        shared = [moe.shared_experts for moe in moes]
+        cache_adapters = [m._hybrid_runtime for m in moes if getattr(m, "_hybrid_runtime", None) is not None]
+        return {"main_grouped_calls": grouped, "main_cache_generic_calls": generic,
+            "main_grouped_declines": declined,
+            "draft_grouped_calls": sum(getattr(m, "_draft_steps", 0) for m in moes),
+            "draft_grouped_declines": sum(sum(getattr(m, "_draft_declined", {}).values()) for m in moes),
+            "draft_cuda_grouped_gemms": sum(getattr(m, "_draft_cuda_grouped_gemms", 0) for m in moes),
+            "draft_cache_grouped_calls": sum(r.grouped_steps for r in cache_adapters),
+            "draft_cache_generic_calls": sum(r.generic_steps for r in cache_adapters),
+            "draft_shared_calls": sum(getattr(m, "_shared_steps", 0) for m in shared),
+            "draft_shared_cuda_calls": sum(getattr(m, "_shared_cuda_steps", 0) for m in shared),
+            "draft_shared_declines": sum(sum(getattr(m, "_shared_declined", {}).values()) for m in shared)}
 
     def _observe_hybrid(self, event):
         metrics = getattr(self, "_runtime_metrics", None)
         if metrics is None:
             return
         role, phase = event["role"], event["phase"]
-        if event.get("kind") == "prefetch":
+        if event.get("kind") == "prefetch_quality":
+            keys = ("requested", "used", "wasted", "skipped", "candidate_count")
+            metrics.prefetch_quality({key: event[key] for key in keys})
+        elif event.get("kind") == "prefetch":
             if metrics.mode == "gpu_expert_cache":
                 metrics.prefetch(event["dma_bytes"], event.get("dma_wait_ms", 0.0))
         else:
@@ -1033,12 +1170,28 @@ class Stage:
         caches = self._expert_cache.allocate()
         import v4_hybrid
         v4_hybrid.bind_caches(self._hybrid_blocks, caches)
+        for block in self._hybrid_blocks:
+            runtime = block.ffn._hybrid_runtime
+            runtime.profiler = self._runtime_profile
+            runtime.configure_prefetch(enabled=self._expert_prefetch,
+                max_slots=V4_EXPERT_PREFETCH_SLOTS, warmup_steps=V4_EXPERT_PREFETCH_WARMUP)
         self._hybrid_cache_ready = True
 
     def placement_requirements(self, calibration=None):
         """An explicit measured resource contract, never a guess from checkpoint bytes."""
         import v4_resources  # lazy, and works in the flat deployed engine layout
         return v4_resources.placement_requirements_for_stage(self, calibration)
+
+    def kv_runtime_status(self):
+        """Explicit storage scope/capacity; no assertion of constant-context KV."""
+        return self._kv_runtime.status() if self._kv_runtime is not None else {"mode": "gpu_resident"}
+
+    def prefill_runtime_status(self):
+        return {"mode": "query_chunks" if self._prefill_query_chunk else "reference",
+                "query_chunk_tokens": self._prefill_query_chunk,
+                "gate_checks": sum(getattr(layer.attn, "_prefill_gate_checks", 0) for layer in self.layers),
+                "executed_query_chunks": sum(getattr(layer.attn, "_prefill_query_chunks", 0) for layer in self.layers),
+                "scope": "query/index-score scratch; full projection, Compressor and MoE shapes retained"}
 
     def _snapshot(self):
         """Clone exactly the state a rejected speculation can poison. `_seek` restores it.
@@ -1087,25 +1240,39 @@ class Stage:
 
         The Indexer's own kv_cache needs no window snapshot at all: unlike Attention's it is
         entirely compressed slots, with no ring prefix (model.py:405)."""
+        if self._kv_runtime is not None:
+            self._kv_runtime.order_current_stream()
         win = self.args.window_size
         snap = []
         with torch.no_grad():
             for L in self.layers:
-                snap.append({"win": L.attn.kv_cache[:, :win].clone()})
+                value = L.attn.kv_cache[:, :win]
+                snap.append({"win": self._kv_runtime.snapshot_tensor(value) if self._kv_runtime is not None else value.clone()})
             for c, _ in self._compressors():
-                snap.append({"kv_state": c.kv_state.clone(), "score_state": c.score_state.clone()})
+                snap.append({name: (self._kv_runtime.snapshot_tensor(getattr(c, name))
+                                    if self._kv_runtime is not None else getattr(c, name).clone())
+                             for name in ("kv_state", "score_state")})
         return snap
 
     def _restore(self, snap):
         """Write a `_snapshot()` back in place. `_seek`'s rollback; unused on the greedy path."""
+        if self._kv_runtime is not None:
+            self._kv_runtime.order_current_stream()
         win = self.args.window_size
         with torch.no_grad():
             n = len(self.layers)
             for L, e in zip(self.layers, snap[:n]):
-                L.attn.kv_cache[:, :win].copy_(e["win"])
+                target = L.attn.kv_cache[:, :win]
+                if self._kv_runtime is not None:
+                    self._kv_runtime.restore_tensor(target, e["win"])
+                else:
+                    target.copy_(e["win"])
             for (c, _), e in zip(self._compressors(), snap[n:]):
-                c.kv_state.copy_(e["kv_state"])
-                c.score_state.copy_(e["score_state"])
+                for name in ("kv_state", "score_state"):
+                    if self._kv_runtime is not None:
+                        self._kv_runtime.restore_tensor(getattr(c, name), e[name])
+                    else:
+                        getattr(c, name).copy_(e[name])
 
     def _replay(self, h, ids, start_pos):
         """Re-feed an accepted prefix through the layers to rebuild what a restore rolled back.
@@ -1157,6 +1324,8 @@ class Stage:
         THE FULL-ACCEPT PATH NEVER REACHES ANY OF THIS. A round that accepts all g = s-1 drafts
         commits g+1 tokens, so the next frame opens exactly at `_pos` — the no-op return above.
         Rollback costs exactly nothing on the rounds speculation is winning."""
+        if self._kv_runtime is not None:
+            self._kv_runtime.order_current_stream()
         if start_pos == self._pos:
             return
         if start_pos > self._pos:
@@ -1231,7 +1400,15 @@ class Stage:
             phase = "replay" if self._replaying else "prefill" if start_pos == 0 else "decode"
             if hybrid is not None:
                 hybrid.set_phase(phase, "main")
-            h = bg[i].run(h, ids, start_pos) if graphed else L(h, start_pos, ids)
+                if getattr(self, "_expert_prefetch", False) and not self._replaying:
+                    hybrid.prefetch_for_attention()
+            profiler = getattr(self, "_runtime_profile", None)
+            name = f"main.{phase}.layer"
+            with (profiler.host(name + ".host") if profiler else nullcontext()):
+                with (profiler.gpu(name + ".gpu", torch, self.device) if profiler else nullcontext()):
+                    with (self._kv_runtime.layer(L.attn, start_pos, h.shape[1], h.shape[0])
+                          if self._kv_runtime is not None else nullcontext()):
+                        h = bg[i].run(h, ids, start_pos) if graphed else L(h, start_pos, ids)
             if self._runtime_metrics is not None and hybrid is None:
                 # Outside the graph: count this executed layer once, not its capture/warmups.
                 # world_size=1 is enforced at construction, so each row owns the full top-k.
@@ -1314,6 +1491,8 @@ class Stage:
         if ids.shape[:2] != h.shape[:2]:
             raise RuntimeError(f"v4 stage[{self.lo}:{self.hi}]: ids {tuple(ids.shape)} do not match "
                                 f"the payload's [b, s] = {tuple(h.shape[:2])}")
+        if self._kv_runtime is not None:
+            self._kv_runtime.validate_frame(start_pos, s, h.shape[0])
         self.ensure_expert_cache()
         self._seek(start_pos)
         if self._spec and start_pos > 0:
@@ -1439,6 +1618,7 @@ class Stage:
                 f"{self.dtype} on {self.device} pos={self._pos} "
                 f"kernels={v4_kernels_cpu.backend()} "
                 f"experts={self._expert_placement} "
+                f"kv={self._kv_placement} prefill_query={self._prefill_query_chunk or 'off'} "
                 f"dspark={'on' if self._dspark else 'off'} taps={list(self._tap_ids)} "
                 f"spec={'on' if self._spec else 'off'}/{self._spec_depth} "
                 f"graph={self._graph_mode if self._block_graphs is not None else 'off'} "

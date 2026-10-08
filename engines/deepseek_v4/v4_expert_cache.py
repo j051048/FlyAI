@@ -415,6 +415,19 @@ class FixedSlotCache:
     def is_resident(self, eid):
         return self.lookup(eid) is not None
 
+    def cached_ids(self, *, include_pending=False):
+        """One metadata snapshot for a prediction pass, with no per-ID allocations/locks.
+
+        Pending slots already own a queued copy and should normally be excluded
+        from optional prediction. Demand still checks readiness with its lease.
+        """
+        with self.pool._lock, self._lock:
+            if self.closed or not self.pool.loaded:
+                return set()
+            return {eid for eid, index in self._owners.items()
+                    if self._slots[index].epoch == self.pool.epoch
+                    and (include_pending or self._slots[index].ready.query())}
+
     def _ensure_open(self):
         if self.closed:
             raise ExpertCacheError("cache is closed")
@@ -425,8 +438,9 @@ class FixedSlotCache:
         if not self.emulation and torch.cuda.is_current_stream_capturing():
             raise ExpertCacheError("cache acquisition belongs outside CUDA graph capture")
 
-    def acquire(self, ids, *, demand=True):
+    def acquire(self, ids, *, demand=True, protect_ids=()):
         requested = self._ids(ids)
+        protected_experts = self._ids(protect_ids)
         if len(requested) > self.capacity:
             raise ExpertCacheError("the distinct expert request exceeds fixed slot capacity; split the expert batch")
         with self.pool._lock, self._lock:
@@ -440,6 +454,7 @@ class FixedSlotCache:
                 else:
                     missing.append(eid)
             protected = set(mapping.values())
+            protected.update(self._owners[eid] for eid in protected_experts if eid in self._owners)
             candidates = [index for index, slot in enumerate(self._slots)
                           if slot.references == 0 and index not in protected]
             candidates.sort(key=lambda index: (self._slots[index].owner is not None,
@@ -546,6 +561,49 @@ class FixedSlotCache:
         lease.wait_on(self.copy_stream)
         lease.release(self.copy_stream)
         return lease  # completed/released ticket, not a lease licensed for later compute
+
+    def try_prefetch(self, ids, *, max_copies=2, max_evictions=2,
+                     reserve_slots=1, protect_ids=()):
+        """Optional, bounded prediction: skip invalid/no-room candidates without failing a job.
+
+        Active leases and the most recent working set remain protected. Preflight
+        and acquire share the same locks, so every selected victim obeys the copy,
+        eviction and spare-slot budgets atomically. CUDA/copy faults still fail
+        closed; they are not recoverable prediction misses or valid weights.
+        Returns a released ticket (or None), never a license to consume slots.
+        """
+        for value, name in ((max_copies, "max_copies"), (max_evictions, "max_evictions"),
+                            (reserve_slots, "reserve_slots")):
+            _integer(value, name)
+        try:
+            requested, protected_experts = self._ids(ids), self._ids(protect_ids)
+        except ExpertCacheError:
+            return None
+        with self.pool._lock, self._lock:
+            if self.closed or not self.pool.loaded:
+                return None
+            self._ensure_open()  # actual failed DMA/capture misuse must not masquerade as success
+            existing = [eid for eid in requested if eid in self._owners
+                        and self._slots[self._owners[eid]].epoch == self.pool.epoch]
+            protected = {self._owners[eid] for eid in (*existing, *protected_experts) if eid in self._owners}
+            victims = [index for index, slot in enumerate(self._slots)
+                       if slot.references == 0 and index not in protected]
+            victims.sort(key=lambda index: (self._slots[index].owner is not None,
+                                           self._frequencies.get(self._slots[index].owner, 0),
+                                           self._slots[index].touched, index))
+            limit = max(0, len(victims) - reserve_slots)
+            empty = sum(self._slots[index].owner is None for index in victims[:limit])
+            limit = min(limit, max_copies, empty + max_evictions)
+            missing = [eid for eid in requested if eid not in existing][:limit]
+            chosen = (existing + missing)[:self.capacity]
+            if not chosen:
+                return None
+            lease = self.acquire(chosen, demand=False, protect_ids=protected_experts)
+            try:
+                lease.wait_on(self.copy_stream)
+            finally:
+                lease.release(self.copy_stream)
+            return lease
 
     def _check_reload_safe(self):
         with self._lock:

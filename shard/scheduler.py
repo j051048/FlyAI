@@ -26,6 +26,10 @@ class JoinedNode:
     subnet: str | None = None
     public_ip: str | None = None  # transport information, never physical-host identity
     memory_domain_id: str | None = None
+    layer_ms: float | None = None  # observed whole-layer time, including expert transfers
+    dma_exposed_ms_per_layer: float | None = None
+    expert_misses_per_layer: float | None = None
+    dma_overlap_fraction: float | None = None
 
 
 def _distribute(total: int, caps: list[tuple[str, int]]) -> dict[str, int]:
@@ -107,6 +111,10 @@ class Scheduler:
             "gpu_uuids": self.nodes[nid].gpu_uuids,
             "public_ip": self.nodes[nid].public_ip,
             "memory_domain_id": self.nodes[nid].memory_domain_id,
+            "layer_ms": self.nodes[nid].layer_ms,
+            **{key: getattr(self.nodes[nid], key) for key in
+               ("dma_exposed_ms_per_layer", "expert_misses_per_layer", "dma_overlap_fraction")
+               if getattr(self.nodes[nid], key) is not None},
         } for nid in ids]
         rtt = [[0.0 if a == b else float(self.nodes[a].rtt_ms[b]) for b in ids] for a in ids]
 

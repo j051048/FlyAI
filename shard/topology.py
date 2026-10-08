@@ -173,7 +173,7 @@ def select_and_order(nodes, L, c_out, c_in, k):
 
 # ---- health + capability-aware selection (the self-optimizer's pure core) ----
 # select_and_order picks the lowest-LATENCY ring. select_ring picks the lowest predicted
-# STEP-TIME ring (WAN round-trip + per-stage compute), drops unhealthy/co-located nodes, and
+# STEP-TIME ring (communication + per-stage compute), drops unhealthy/slow nodes, and
 # sizes each block to the node's speed. tok/s = accept_gain / step_ms and accept_gain is ~constant
 # across rings, so minimizing predicted step_ms maximizes usable tok/s. The objective is physical
 # (milliseconds), never hand-tuned weights: a power-capped or far node just shows up as more ms.
@@ -344,6 +344,32 @@ def assign_layers(order, n_layers, caps, layer_ms, floors=None, *, groups=None, 
     return alloc if rem == 0 else None
 
 
+def assign_pipeline_layers(order, n_layers, caps, layer_ms, floors=None, *, groups=None, group_caps=None):
+    """Integer water filling under the same floors, GPU and shared-RAM limits.
+
+    This supplies a balanced candidate. The finite-window resource-calendar
+    objective must still score it against the serial allocation; balance alone
+    is not evidence of a throughput improvement.
+    """
+    alloc = {n: max(1, (floors or {}).get(n, 1)) for n in order}
+    groups, group_caps = groups or {n: n for n in order}, group_caps or {}
+    used = {}
+    for n in order:
+        if alloc[n] > caps[n]:
+            return None
+        used[groups[n]] = used.get(groups[n], 0) + alloc[n]
+    if sum(alloc.values()) > n_layers or any(v > group_caps.get(g, INF) for g, v in used.items()):
+        return None
+    for _ in range(n_layers - sum(alloc.values())):
+        eligible = [n for n in order if alloc[n] < caps[n] and used[groups[n]] < group_caps.get(groups[n], INF)]
+        if not eligible:
+            return None
+        node = min(eligible, key=lambda n: ((alloc[n] + 1) * layer_ms[n], layer_ms[n]))
+        alloc[node] += 1
+        used[groups[node]] += 1
+    return alloc
+
+
 def _is_adjacent_same_host(order, host_id=None):
     """Check if any adjacent stages in a ring order reside on the same physical host.
 
@@ -360,16 +386,16 @@ def _is_adjacent_same_host(order, host_id=None):
     return False
 
 
-def _adjacent_host_loop(nodes, L, c_out, c_in, host_id, require=None, allowed_tails=None):
-    """Cheapest explicit host-separated cycle, including its closing edge.
+def _constrained_loop(nodes, L, c_out, c_in, host_id=None, require=None, allowed_tails=None):
+    """Cheapest loop with permissible ends and optional adjacent-host separation.
 
     Rejecting the unconstrained cheapest order can miss a valid A-B-A-B order.
     Exclude conflicts inside the DP instead; no production isolation is implied.
     """
     idx = list(nodes)
-    if len(idx) == 1:
-        return idx, loop_cost(idx, L, c_out, c_in)
     tails = set(idx) if allowed_tails is None else set(allowed_tails)
+    if len(idx) == 1:
+        return (idx, loop_cost(idx, L, c_out, c_in)) if idx[0] in tails else (None, INF)
     heads = [require] if require is not None else idx
     if len(idx) > 16:
         order, cost = _pin_order_oversize(idx, L, c_out, c_in, heads, tails)
@@ -386,14 +412,14 @@ def _adjacent_host_loop(nodes, L, c_out, c_in, host_id, require=None, allowed_ta
                 if dp[mask][j] == INF:
                     continue
                 for m in range(k):
-                    if mask & (1 << m) or host_id[idx[j]] == host_id[idx[m]]:
+                    if mask & (1 << m) or (host_id and host_id[idx[j]] == host_id[idx[m]]):
                         continue
                     next_mask = mask | (1 << m)
                     candidate = dp[mask][j] + L[idx[j]][idx[m]]
                     if candidate < dp[next_mask][m]:
                         dp[next_mask][m], parent[next_mask][m] = candidate, j
         for j, tail in enumerate(idx):
-            if tail not in tails or host_id[head] == host_id[tail]:
+            if tail not in tails or (host_id and host_id[head] == host_id[tail]):
                 continue
             cost = dp[full][j] + c_in[tail]
             if cost >= best_cost:
@@ -414,7 +440,8 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 prefill_chunks=1, prefill_layer_ms=None, relegate=True,
                 trusted=None, boundary_in=0, boundary_out=0, max_stages=6,
                 tail_floor=0, host_id=None, isolation="none", device_id=None,
-                host_layer_caps=None, host_memory_domain=None, tail_host_layer_caps=None):
+                host_layer_caps=None, host_memory_domain=None, tail_host_layer_caps=None,
+                node_layer_caps=None, tail_reserve_mb=0, objective="serial", cost_model=None):
     """The self-optimizer's pure core. From a candidate POOL, choose the subset + ring order +
     per-node layer split that MINIMIZES predicted request time, subject to:
       * VRAM feasibility — the chosen nodes must hold the whole model (+ KV),
@@ -522,6 +549,8 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
     def _lv(n):
         return layer_vram_mb[n] if isinstance(layer_vram_mb, dict) else layer_vram_mb
     caps = {n: node_capacity(free_vram_mb[n], _lv(n), kv_mb_per_layer) for n in nodes}
+    if node_layer_caps is not None:
+        caps = {n: min(c, node_layer_caps[n]) for n, c in caps.items()}
     usable = [n for n in nodes if caps[n] > 0]
     if isolation == "subnet":
         usable = [n for n in usable if raw_subnets.get(n) not in (None, "")]
@@ -555,32 +584,34 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         if isolation_key(n) in used_sub:
             continue
         used_sub.add(isolation_key(n)); cover.append(n); k_min += 1
-        acc = feasible_cap(cover)
+        # This is a lower bound on ring width. A greedy cover under shared RAM
+        # limits can take three colocated offers even when two other GPUs fit.
+        acc += caps[n]
         if acc >= n_layers:
             break
 
     if len(usable) > _TRIM:                                      # latency funnel, but never trim out nodes feasibility
         keep = sorted(usable, key=lambda n: c_out[n] + c_in[n])[:_TRIM]   # or `require` need
-        must, seen = set(), set()                                # a DISTINCT-subnet cover (+slack) must survive: a
-        for m in by_cap:                                         # subnet-BLIND top-cap `must` starves the pool of
-            if isolation_key(m) in seen:                                # feasible cover when the fattest cards are co-located
-                continue                                         # (that was a false-"infeasible" bug) -> pick fattest
-            seen.add(isolation_key(m)); must.add(m)                     # node per NEW subnet, mirroring the k_min walk
-            if len(must) >= k_min + slack:
+        must, seen, cover = set(), set(), []                     # retain a cover under the selected isolation policy
+        for m in by_cap:
+            if isolation_key(m) in seen:
+                continue
+            seen.add(isolation_key(m)); must.add(m); cover.append(m)
+            if len(must) >= k_min + slack and feasible_cap(cover) >= n_layers:
                 break
-        if require is not None:                                  # ...and a REQUIRE-compatible cover: `require`
-            must.add(require)                                    # sits in every ring, so its subnet's slot is
-            seen, acc, cover = {isolation_key(require)}, caps[require], [require]         # spent on IT (a same-subnet fat card can never
-            for m in by_cap:                                     # join it) -> keep OTHER-subnet fat nodes until
-                if isolation_key(m) in seen:                            # they cover the model, else a require-blind
-                    continue                                     # `must` starves the pool the same way (that
-                seen.add(isolation_key(m)); must.add(m); cover.append(m); acc = feasible_cap(cover) # was false-"infeasible" bug #3)
+        if require is not None:                                  # retain a cover compatible with the mandatory head
+            must.add(require)
+            seen, acc, cover = {isolation_key(require)}, caps[require], [require]
+            for m in by_cap:
+                if isolation_key(m) in seen:
+                    continue
+                seen.add(isolation_key(m)); must.add(m); cover.append(m); acc = feasible_cap(cover)
                 if acc >= n_layers:
                     break
         if pin:                                                  # ...and a TRUSTED cover: both ring ends (+ the
             seen, kept_t = set(), 0                              # boundary layers) must sit on trusted nodes, and
             for m in by_cap:                                     # the low-RTT `keep` may hold none -> keep the
-                if m not in trust or isolation_key(m) in seen:          # fattest trusted card per distinct subnet (+slack)
+                if m not in trust or isolation_key(m) in seen:    # preserve trusted ends under the selected policy
                     continue                                     # so pinning can't be starved into false-infeasible
                 seen.add(isolation_key(m)); must.add(m); kept_t += 1
                 if kept_t >= 2 + slack:
@@ -610,6 +641,11 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                     EL[a][b] = (1 + D) * L[a][b] + pf_a + D * dc_a
 
     def _score(order, alloc):
+        if cost_model is not None:
+            predicted = cost_model(order, alloc)
+            step = predict_step_ms(order, alloc, L, c_out, c_in, layer_ms,
+                                   up_mbps if aware else None, decode_bytes)
+            return predicted["predicted_request_ms"], step, 0.0
         step = predict_step_ms(order, alloc, L, c_out, c_in, layer_ms,
                                up_mbps if aware else None, decode_bytes)
         if not aware:
@@ -624,6 +660,25 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         if group in tail_host_layer_caps:
             limits[group] = min(limits.get(group, tail_host_layer_caps[group]), tail_host_layer_caps[group])
         return limits
+
+    def role_caps(order, subset_caps):
+        result = dict(subset_caps)
+        if tail_reserve_mb:
+            tail = order[-1]
+            result[tail] = min(result[tail], max(0, node_capacity(
+                free_vram_mb[tail] - tail_reserve_mb, _lv(tail), kv_mb_per_layer)))
+        return result
+
+    def allocate(order, subset_caps, floors):
+        effective = role_caps(order, subset_caps)
+        args = dict(groups=memory_groups, group_caps=memory_limits(order))
+        serial = assign_layers(order, n_layers, effective, layer_ms, floors, **args)
+        if objective != "pipeline" or serial is None:
+            return serial
+        balanced = assign_pipeline_layers(order, n_layers, effective, layer_ms, floors, **args)
+        if balanced is None or cost_model is None:
+            return balanced or serial
+        return min((serial, balanced), key=lambda alloc: _score(order, alloc)[0])
 
     def _pin_floors(order, subset_caps):
         """Layer floors that FORCE the boundary onto a trusted CONTIGUOUS prefix/suffix of `order`,
@@ -713,8 +768,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                         if tail_floor > 0:
                             floors = dict(floors)
                             floors[order[-1]] = max(floors.get(order[-1], 0), tail_floor)
-                        alloc = assign_layers(order, n_layers, subset_caps, layer_ms, floors,
-                                              groups=memory_groups, group_caps=memory_limits(order))
+                        alloc = allocate(order, subset_caps, floors)
                         if alloc is None:
                             continue
                         if not _boundary_nodes(order, alloc, n_layers, b_in, b_out) <= trust:
@@ -722,12 +776,39 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                         rank, step, pf = _score(order, alloc)
                         if found is None or rank < found[0]:
                             found = (rank, order, alloc, k, step, pf)
-                        break                                            # cost-ordered -> first valid is this subset's best
+                        if cost_model is None and not tail_reserve_mb:
+                            break                                        # legacy latency-ordered first valid
                     continue
-                if isolation == "adjacent_host":
+                if isolation == "adjacent_host" or tail_host_layer_caps or tail_reserve_mb or cost_model is not None:
                     matrices = (EL, Eout, Ein) if aware else (L, c_out, c_in)
-                    order, _ = _adjacent_host_loop(subset, *matrices, host_id, require,
-                                                   {n for n in subset if subset_caps[n] >= max(1, tail_floor)})
+                    # Tail reservations belong to its shared memory domain. Try
+                    # another tail when the cheapest order cannot hold its pool;
+                    # rejecting the whole subset would lose a valid deployment.
+                    tails = set()
+                    for tail in subset:
+                        trial = [n for n in subset if n != tail] + [tail]
+                        floors = {tail: tail_floor} if tail_floor > 0 else None
+                        if allocate(trial, subset_caps, floors) is not None:
+                            tails.add(tail)
+                    if cost_model is not None or tail_reserve_mb:
+                        # Role budgets and finite-window costs depend on which
+                        # node is tail. Compare each feasible tail, not just the
+                        # unconstrained cheapest network orientation.
+                        for tail in sorted(tails):
+                            order, _ = _constrained_loop(subset, *matrices,
+                                host_id if isolation == "adjacent_host" else None, require, {tail})
+                            if order is None:
+                                continue
+                            floors = {tail: tail_floor} if tail_floor > 0 else None
+                            alloc = allocate(order, subset_caps, floors)
+                            if alloc is None:
+                                continue
+                            rank, step, pf = _score(order, alloc)
+                            if found is None or rank < found[0]:
+                                found = (rank, order, alloc, k, step, pf)
+                        continue
+                    order, _ = _constrained_loop(subset, *matrices,
+                        host_id if isolation == "adjacent_host" else None, require, tails)
                     if order is None:
                         continue
                 else:
@@ -738,8 +819,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 if isolation == "adjacent_host" and _is_adjacent_same_host(order, host_id):
                     continue
                 floors = {order[-1]: tail_floor} if tail_floor > 0 else None
-                alloc = assign_layers(order, n_layers, subset_caps, layer_ms, floors,
-                                      groups=memory_groups, group_caps=memory_limits(order))
+                alloc = allocate(order, subset_caps, floors)
                 if alloc is None:
                     continue
                 rank, step, pf = _score(order, alloc)

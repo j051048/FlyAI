@@ -77,6 +77,10 @@ co-location does not manufacture missing resource measurements. Shared SSD quota
 also need verification by the admission/deployment layer, rather than treating this isolation
 policy as a complete disk or I/O resource scheduler.
 
+`memory_domain_id` may identify a verified, separately allocated RAM partition, for example a
+VM with its own memory quota. Without it, offers sharing a known `host_id` share one RAM budget.
+Assigning different labels to the same unpartitioned pool does not provide independent capacity.
+
 Offers on one host must report compatible resource evidence. The scheduler needs a conservative
 single host limit or a verified allocation partition rather than summing contradictory free-memory
 claims. GPU-local cache/graph/activation budgets remain per-device. Shared PCIe, CPU and memory

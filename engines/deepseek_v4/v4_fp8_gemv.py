@@ -79,9 +79,9 @@ WHAT THIS DOES NOT CLAIM, so nobody over-reads it:
     `weights_proj` / gate — `F.linear` paths, not fp8_gemm's. Next in line, not this file.
   * act_quant's ~0.12 ms/layer of latency-bound launches — fusing it into the GEMM prologue is a
     numerics-bearing change and a separate, gated decision.
-  * A drafter block's shared expert — RingDrafter builds its DSparkBlocks lazily, long after
-    `Stage.__init__` ran the layout; those keep the reference path (their per-matrix GEMMs still
-    ride V4_FP8_GEMV).
+  * The drafter's shared experts use install_drafter_shared() after MTP construction, before
+    checkpoint loading. This instance-only layout/binding also works when routed experts live
+    in pinned RAM; it never creates a full routed bank. The same M<=32 numeric gate applies.
 
 Registered in phase0/v4_levers.py (V4_FP8_GEMV / V4_FP8_SHARED), carried by v4_pipe.ENG_ENV.
 Sweep + measured GB/s per (shape, tile): research/v4_fp8_gemv_bench.py.
@@ -89,6 +89,7 @@ Sweep + measured GB/s per (shape, tile): research/v4_fp8_gemv_bench.py.
 self-test (needs a CUDA device):  python3 phase0/v4_fp8_gemv.py
 """
 import os
+import types
 
 import torch
 
@@ -411,10 +412,17 @@ def _lay_shared(e):
     if w1 is None or w3 is None or w1.weight.dtype != torch.float8_e4m3fn \
             or w3.weight.dtype != torch.float8_e4m3fn:
         return False
+    if w1.weight.ndim != 2 or w3.weight.ndim != 2 or w1.weight.is_meta or w3.weight.is_meta:
+        return False
     inter, dim = w1.weight.shape
     if tuple(w3.weight.shape) != (inter, dim) or inter % 128 or dim % 128:
         return False
     dev = w1.weight.device
+    scales = (getattr(w1, "scale", None), getattr(w3, "scale", None))
+    if w3.weight.device != dev or any(not isinstance(scale, torch.Tensor) or scale.is_meta
+            or scale.device != dev or tuple(scale.shape) != (inter // 128, dim // 128) for scale in scales) \
+            or scales[0].dtype != scales[1].dtype:
+        return False
     with torch.no_grad():
         bank = torch.empty(2 * inter, dim, dtype=w1.weight.dtype, device=dev)
         sbank = torch.empty(2 * (inter // 128), dim // 128, dtype=w1.scale.dtype, device=dev)
@@ -445,6 +453,66 @@ def shared_bank_layout(module):
     return sum(1 for m in mods
                if getattr(m, "shared_experts", None) is not None
                and _lay_shared(m.shared_experts))
+
+
+def install_drafter_shared(dstail, mod=None):
+    """Bank/bind ONLY the drafter's resident shared experts, never routed experts.
+
+    DSparkTail calls this after construction and before load, including RAM mode.
+    Existing state_dict names and weight.scale aliases remain the loader contract.
+    It does not rebind Expert.forward on the class; the runtime per-shape numeric
+    probe/fallback is the same _shared_forward used by the main-layer lever.
+    Returns installed shared instances, not hardware kernel execution coverage.
+    """
+    if not V4_FP8_SHARED:
+        return 0
+    global _MOD, _REF_FP8_GEMM, _REF_EXPERT_FORWARD
+    mod = mod or getattr(getattr(dstail, "stage", None), "_M", None) or _MOD
+    if mod is None:
+        raise RuntimeError("drafter shared layout requires the live V4 reference module")
+    _MOD = mod
+    if not getattr(mod.fp8_gemm, "_v4_fp8_gemv", False):
+        # A caller can construct this live module after another standalone probe.
+        # Prefer its unpatched oracle over a stale capture from another module.
+        _REF_FP8_GEMM = mod.fp8_gemm
+    elif _REF_FP8_GEMM is None:
+        raise RuntimeError("tiled fp8 dispatch has no captured reference GEMM")
+    if not getattr(mod.Expert.forward, "_v4_fp8_shared", False):
+        _REF_EXPERT_FORWARD = mod.Expert.forward
+    elif _REF_EXPERT_FORWARD is None:
+        raise RuntimeError("shared dispatch has no captured reference Expert.forward")
+    installed = 0
+    for block in dstail.mtp:
+        shared = getattr(getattr(block, "ffn", None), "shared_experts", None)
+        if shared is None:
+            continue
+        _lay_shared(shared)
+        if getattr(shared, "_v4_w13", None) is None:
+            continue
+        # An inherited class binding is insufficient to show MTP instance coverage.
+        shared.forward = types.MethodType(_shared_forward, shared)
+        installed += 1
+    return installed
+
+
+def drafter_shared_coverage(dstail):
+    """Observed shared layouts/calls, with CPU stand-ins separated from CUDA fusion.
+
+    These Python counters are eager/capture observations, not CUDA graph replay
+    token counts. Numeric gate declines remain visible per actual shared instance.
+    """
+    result = {}
+    for block in dstail.mtp:
+        shared = getattr(getattr(block, "ffn", None), "shared_experts", None)
+        forward = getattr(shared, "__dict__", {}).get("forward")
+        result[block.layer_id] = {
+            "banked": getattr(shared, "_v4_w13", None) is not None,
+            "instance_bound": getattr(getattr(forward, "__func__", None), "_v4_fp8_shared", False),
+            "steps": getattr(shared, "_shared_steps", 0),
+            "cuda_steps": getattr(shared, "_shared_cuda_steps", 0),
+            "declined": dict(getattr(shared, "_shared_declined", {})),
+        }
+    return result
 
 
 def _probe_shared(N2, K, tl_dtype):
@@ -542,6 +610,8 @@ def _shared_forward(self, x, weights=None):
     if weights is not None:
         h = weights * h
     self._shared_steps = getattr(self, "_shared_steps", 0) + 1
+    if x.is_cuda:
+        self._shared_cuda_steps = getattr(self, "_shared_cuda_steps", 0) + 1
     return self.w2(h.to(dtype))
 
 

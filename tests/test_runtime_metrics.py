@@ -133,6 +133,53 @@ def test_shared_gpu_process_omits_peaks_without_resetting_another_stage():
     assert cuda.resets == 2  # the next job is exclusive again
 
 
+def test_calibration_allocator_interval_preserves_load_peaks_and_job_counters():
+    from shard.runtime_metrics import external_allocator_interval
+    class Cuda:
+        resets = 0
+        def reset_peak_memory_stats(self, device):
+            self.resets += 1
+        def memory_allocated(self, device):
+            return 10
+        def memory_reserved(self, device):
+            return 20
+        max_memory_allocated = memory_allocated
+        max_memory_reserved = memory_reserved
+    cuda = Cuda()
+    with external_allocator_interval("cuda:27"):
+        observer = RuntimeMetrics("cuda:27", torch_module=SimpleNamespace(cuda=cuda))
+        observer.resident_routes(6)
+        assert observer.snapshot()["totals"]["resident_hits"] == 6
+        assert "gpu_memory" not in observer.snapshot()
+        observer.reset()
+        with external_allocator_interval("cuda:27"):
+            observer.reset()
+        assert cuda.resets == 0
+    observer.reset()
+    assert cuda.resets == 1 and "gpu_memory" in observer.snapshot()
+
+
+def test_external_allocator_owner_suppresses_existing_job_peak_label():
+    from shard.runtime_metrics import external_allocator_interval
+    class Cuda:
+        def reset_peak_memory_stats(self, device):
+            pass
+        def memory_allocated(self, device):
+            return 10
+        def memory_reserved(self, device):
+            return 20
+        max_memory_allocated = memory_allocated
+        max_memory_reserved = memory_reserved
+    observer = RuntimeMetrics("cuda:28", torch_module=SimpleNamespace(cuda=Cuda()))
+    assert "gpu_memory" in observer.snapshot()
+    with pytest.raises(RuntimeError):
+        with external_allocator_interval("cuda:28"):
+            assert "gpu_memory" not in observer.snapshot()
+            raise RuntimeError("probe abort")
+    observer.reset()
+    assert "gpu_memory" in observer.snapshot()
+
+
 def test_unindexed_cuda_uses_current_device_for_shared_peak_ownership():
     class Cuda:
         def __init__(self):

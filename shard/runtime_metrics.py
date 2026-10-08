@@ -7,7 +7,9 @@ The V4 resident engine records geometry on the host; it never copies router tens
 the CPU or changes a captured graph to obtain a counter.
 """
 from copy import deepcopy
+from contextlib import contextmanager
 import math
+import threading
 import weakref
 
 SCHEMA = "shard-runtime-metrics/1"
@@ -20,6 +22,37 @@ GPU_FIELDS = ("scope", "allocated_bytes", "reserved_bytes", "allocated_peak_byte
               "reserved_peak_bytes")
 GPU_MODES = ("gpu_resident", "gpu_expert_cache")
 _GPU_OBSERVERS = {}
+_EXTERNAL_ALLOCATOR_INTERVALS = {}
+_ALLOCATOR_INTERVAL_LOCK = threading.RLock()
+
+
+@contextmanager
+def external_allocator_interval(device, *, torch_module=None):
+    """Let a calibration owner retain load+forward peaks without job resets.
+
+    This does not reset CUDA statistics itself. During this interval per-job
+    metrics omit allocator observations rather than mislabel calibration peaks.
+    A later normal job reset starts the normal exclusive observation interval.
+    """
+    key = str(device)
+    if key == "cuda" and torch_module is not None:
+        key = f"cuda:{torch_module.cuda.current_device()}"
+    if not key.startswith("cuda:") or not key.partition(":")[2].isdigit():
+        raise ValueError("allocator interval needs an explicit CUDA device")
+    with _ALLOCATOR_INTERVAL_LOCK:
+        _EXTERNAL_ALLOCATOR_INTERVALS[key] = _EXTERNAL_ALLOCATOR_INTERVALS.get(key, 0) + 1
+        for observer in _GPU_OBSERVERS.get(key, ()):
+            observer._gpu_peak_exclusive = False
+            observer.gpu_memory = None
+    try:
+        yield
+    finally:
+        with _ALLOCATOR_INTERVAL_LOCK:
+            remaining = _EXTERNAL_ALLOCATOR_INTERVALS[key] - 1
+            if remaining:
+                _EXTERNAL_ALLOCATOR_INTERVALS[key] = remaining
+            else:
+                del _EXTERNAL_ALLOCATOR_INTERVALS[key]
 
 
 def _counts():
@@ -47,6 +80,15 @@ def validate_runtime_metrics(value):
         keys.add("expert_prefetch")
     if isinstance(value, dict) and "expert_cache" in value:
         keys.add("expert_cache")
+    if isinstance(value, dict) and "performance" in value:
+        keys.add("performance")
+    if isinstance(value, dict) and "prefetch_policy" in value:
+        keys.add("prefetch_policy")
+    if isinstance(value, dict) and "kernel_coverage" in value:
+        keys.add("kernel_coverage")
+    for optional in ("kv_policy", "prefill_policy"):
+        if isinstance(value, dict) and optional in value:
+            keys.add(optional)
     _keys(value, keys, "runtime_metrics")
     if value["schema"] != SCHEMA:
         raise ValueError(f"unknown runtime metrics schema {value['schema']!r}")
@@ -123,6 +165,73 @@ def validate_runtime_metrics(value):
         if not isinstance(slots, dict) or any(not isinstance(k, str) or type(v) is not int or v <= 0
                                              for k, v in slots.items()):
             raise ValueError("expert cache slots must name positive per-pool capacities")
+    if "performance" in value:
+        try:
+            from runtime_profile import validate_profile
+        except ImportError:
+            from shard.runtime_profile import validate_profile
+        validate_profile(value["performance"])
+        if value["mode"] == "reference_cpu" and any(
+                name.endswith(".gpu") for name in value["performance"]["phases"]):
+            raise ValueError("CPU reference execution cannot claim GPU phase timings")
+    if "prefetch_policy" in value:
+        p = value["prefetch_policy"]
+        _keys(p, ("requested", "used", "wasted", "skipped", "candidate_count"), "prefetch_policy")
+        for key, count in p.items():
+            _nonnegative(count, f"prefetch_policy.{key}")
+        if p["used"] + p["wasted"] > p["requested"]:
+            raise ValueError("prefetch outcomes exceed requested predictions")
+    if "kernel_coverage" in value:
+        k = value["kernel_coverage"]
+        _keys(k, ("scope", "counters"), "kernel_coverage")
+        if k["scope"] != "job_python_observed":
+            raise ValueError("invalid kernel observation scope")
+        expected = ("main_grouped_calls", "main_cache_generic_calls", "main_grouped_declines",
+                    "draft_grouped_calls", "draft_grouped_declines", "draft_cuda_grouped_gemms",
+                    "draft_cache_grouped_calls", "draft_cache_generic_calls",
+                    "draft_shared_calls", "draft_shared_cuda_calls", "draft_shared_declines")
+        _keys(k["counters"], expected, "kernel_coverage.counters")
+        for key, count in k["counters"].items():
+            _nonnegative(count, f"kernel_coverage.{key}")
+        if value["mode"] == "reference_cpu" and any(
+                count for key, count in k["counters"].items() if "cuda" in key):
+            raise ValueError("CPU reference execution cannot claim CUDA kernel calls")
+    if "kv_policy" in value:
+        policy = value["kv_policy"]
+        if not isinstance(policy, dict) or policy.get("mode") not in (
+                "gpu_resident", "layer_working_set", "reference_cpu"):
+            raise ValueError("invalid KV policy mode")
+        if policy["mode"] == "gpu_resident":
+            _keys(policy, ("mode",), "kv_policy")
+        else:
+            counts = ("gpu_budget_bytes", "host_budget_bytes", "resident_main_state_bytes",
+                      "draft_reserve_bytes", "workspace_bytes", "host_history_bytes",
+                      "rollback_host_reserve_bytes", "gate_host_reserve_bytes", "max_supported_tokens",
+                      "layer_calls", "h2d_bytes", "d2h_bytes")
+            _keys(policy, ("mode", "scope", *counts), "kv_policy")
+            for key in counts:
+                _nonnegative(policy[key], f"kv_policy.{key}")
+            if policy["scope"] != "KV storage only; excludes RoPE, activations and kernel temporaries":
+                raise ValueError("invalid KV storage scope")
+            if policy["mode"] == "reference_cpu" and (policy["h2d_bytes"] or policy["d2h_bytes"]):
+                raise ValueError("CPU KV policy cannot claim DMA")
+            if value["mode"] == "reference_cpu" and policy["mode"] == "layer_working_set":
+                raise ValueError("CPU execution cannot claim GPU KV tiering")
+            if (policy["resident_main_state_bytes"] + policy["draft_reserve_bytes"] + policy["workspace_bytes"] >
+                    policy["gpu_budget_bytes"] or policy["host_history_bytes"] +
+                    policy["rollback_host_reserve_bytes"] + policy["gate_host_reserve_bytes"] > policy["host_budget_bytes"]):
+                raise ValueError("KV policy exceeds declared tier budgets")
+    if "prefill_policy" in value:
+        policy = value["prefill_policy"]
+        counts = ("query_chunk_tokens", "gate_checks", "executed_query_chunks")
+        _keys(policy, ("mode", "scope", *counts), "prefill_policy")
+        if policy["mode"] not in ("reference", "query_chunks") or policy["scope"] != (
+                "query/index-score scratch; full projection, Compressor and MoE shapes retained"):
+            raise ValueError("invalid prefill query policy")
+        for key in counts:
+            _nonnegative(policy[key], f"prefill_policy.{key}")
+        if policy["mode"] == "reference" and any(policy[k] for k in counts):
+            raise ValueError("reference prefill cannot claim query chunk execution")
     return deepcopy(value)
 
 
@@ -195,7 +304,11 @@ class RuntimeMetrics:
         self.gpu_memory = None
         self.expert_prefetch = None
         self.expert_cache = None
-        self._gpu_peak_exclusive = self._gpu_owners is not None and len(self._gpu_owners) == 1
+        self.performance = None
+        self.prefetch_policy = None
+        self.kernel_coverage = None
+        self._gpu_peak_exclusive = (self._gpu_owners is not None and len(self._gpu_owners) == 1
+                                    and not _EXTERNAL_ALLOCATOR_INTERVALS.get(self.device))
         if self._gpu_peak_exclusive:
             # Host allocator metadata, no synchronize() and no per-token resets.
             self.torch.cuda.reset_peak_memory_stats(self.device)
@@ -256,6 +369,16 @@ class RuntimeMetrics:
             peak = f"{tier}_peak_bytes"
             self.kv[peak] = max(self.kv[peak], sizes[key])
 
+    def prefetch_quality(self, counts):
+        fields = ("requested", "used", "wasted", "skipped", "candidate_count")
+        _keys(counts, fields, "prefetch_policy")
+        for key, count in counts.items():
+            _nonnegative(count, f"prefetch_policy.{key}")
+        if self.prefetch_policy is None:
+            self.prefetch_policy = {key: 0 for key in fields}
+        for key, count in counts.items():
+            self.prefetch_policy[key] += count
+
     def sample_gpu_memory(self):
         if not self._gpu_peak_exclusive or len(self._gpu_owners) != 1:
             # Global allocator reset would corrupt another Stage's measurement in a shared
@@ -284,4 +407,10 @@ class RuntimeMetrics:
             body["expert_prefetch"] = self.expert_prefetch
         if self.expert_cache is not None:
             body["expert_cache"] = self.expert_cache
+        if self.performance is not None:
+            body["performance"] = self.performance
+        if self.prefetch_policy is not None:
+            body["prefetch_policy"] = self.prefetch_policy
+        if self.kernel_coverage is not None:
+            body["kernel_coverage"] = self.kernel_coverage
         return validate_runtime_metrics(body)

@@ -7,23 +7,23 @@
 
 # Shard (中文版)
 
-**无许可算力网络的底层引擎** —— *类似于算力世界的 BitTorrent，共享显存（VRAM）与计算能力而非磁盘空间。* 任何人都可以接入任何类型的 GPU；网络将它们汇聚成分布式集群，运行远超单卡容量的超大模型。长期愿景是构建覆盖全球的去中心化算力织网（compute fabric）：承载更多、更大的模型，并最终扩展至分布式训练与通用计算。Shard 是连接这一切的底层协议。
+**无许可算力网络的底层引擎** —— *类似于算力世界的 BitTorrent，共享显存（VRAM）与计算能力而非磁盘空间。* 任何人都可以提供具有受支持运行时、通过资源准入检查的 GPU；网络将它们汇聚成分布式集群，运行远超单卡容量的超大模型。长期愿景是构建覆盖全球的去中心化算力织网（compute fabric）：承载更多、更大的模型，并最终扩展至分布式训练与通用计算。Shard 是连接这一切的底层协议。
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21178430.svg)](https://doi.org/10.5281/zenodo.21178430)
 
 **技术报告：** [跨公网以交互式速度运行 229B MoE 模型的分片推理](docs/paper/main.pdf) —— 在横跨 5 个国家的消费级 GPU 上完成实测，所有基准测试数据均由 [`docs/receipts/`](docs/receipts/) 中带签名的收据（receipts）所背书。
 
-**当下已验证的能力：分片推理（Sharded Inference）。** 将一个单张显卡无法容纳的超大模型切分为连续的层块（每个 GPU 承载一个分片），通过在公网上按序流式传输各分片的激活值（activations）来处理请求。无需数据中心，无单点主机依赖，没有任何单个节点需要持有完整模型。
+**当下已验证的能力：分片推理（Sharded Inference）。** 将一个单张显卡无法容纳的超大模型切分为连续的层块（每个 GPU 承载一个分片），通过在公网上按序流式传输各分片的激活值（activations）来处理请求。模型层分布在多个节点，无需单个节点持有完整模型。每个请求由协调器驱动；协调器持久化故障切换仍待实现。
 
 Shard 是 [c0mpute](https://c0mpute.ai) 的推理服务引擎。它由两部分组成：一个协议**骨架（Spine）** —— 包含底层通信协议（wire）、环形拓扑（ring）、签名凭据（receipts）与调度编排（placement）；以及针对各模型的独立优化引擎 —— 因为要在公网上实现交互式的推理速度，必须深入底层算子（kernel）进行定制优化。目前已提供三个引擎：**MiniMax-M2.5**（betanet 概念验证模型）、**Kimi-K3** 与 **DeepSeek-V4-Flash**（最新成果，详见下文）。长期架构将把所有引擎统一收敛在单个 `ModelRuntime` 接口后（参见 [docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md)），使网络能运行任意模型；后续实测的 GLM-5.2 与 gpt-oss-120B 运行记录已证明该引擎能够从消费级显卡平滑扩展至前沿超大模型规模。
 
 ## DeepSeek-V4-Flash (284B)：运行于 4 个国家的 6 张消费级 RTX 5090
 
-**达到 30.15 tok/s，输出结果与单机运行该模型在位级别（bit-identical）完全一致。** 部署在 6 张*完全独立*的 RTX 5090 显卡上 —— 分布在波兰、捷克、丹麦与爱沙尼亚 —— 纯走公网连接，每张卡承载 8 层，无需数据中心，无共享物理机。投机解码（Speculative Decoding）运行在 DeepSeek 原生的 DSpark 草稿头上，其 3 个多标记预测（MTP）块连接最后 3 层，因此完全驻留在末端节点（tail box）上。
+**历史汇总报告预热后 30.15 tok/s，投机输出与同环贪心基线的 token 一致。** 部署在 6 张*完全独立*的 RTX 5090 显卡上 —— 分布在波兰、捷克、丹麦与爱沙尼亚 —— 纯走公网连接，前五张卡各承载 8 层，末卡承载 3 层，无需共享物理机。投机解码（Speculative Decoding）运行在 DeepSeek 原生的 DSpark 草稿头上，其 3 个多标记预测（MTP）块连接最后 3 层，因此完全驻留在末端节点（tail box）上。
 
 | 部署环境 | tok/s（预热后） | 输出精度与确定性 |
 |-------|--------------|--------|
-| DeepSeek-V4-Flash 284B（13B 激活参数）FP4，跨 4 个欧洲国家的 6× RTX 5090，公网环境，流水线 DSpark 投机解码 | **30.15** | 贪心采样，与单机运行 bit-identical 结果完全一致 |
+| DeepSeek-V4-Flash 284B（13B 激活参数）FP4，跨 4 个欧洲国家的 6× RTX 5090，公网环境，流水线 DSpark 投机解码 | **30.15** | 贪心采样，历史汇总报告同环 token 一致 |
 
 连续三次预热运行的中位数，各次波动在 0.17 以内（30.18 / 30.29 / 30.12）。
 上下文 × 负载测试矩阵（包含数学、代码、散文、智能体工作流；0–2k 上下文）见于
@@ -98,7 +98,7 @@ Transformer 架构由若干层叠加而成。Shard 将层栈切分为连续的�
 Shard 作为 c0mpute 的基础设施，坚守三项核心承诺：
 
 - **无审查（Uncensored）：** 引擎原汁原味地运行模型本身，推理路径中不插入任何额外的内容审查过滤层。
-- **去中心化（Decentralized）：** 任何人只需一条命令即可接入 GPU 节点并分配得到特定的模型层块。不存在中心化的推理服务端。
+- **去中心化（Decentralized）：** 任何人只需一条命令即可接入 GPU 节点并分配得到特定的模型层块。计算由多个节点协作完成，每个请求仍由协调器驱动。
 - **隐私保护（Private）：** 没有单个节点能够持有完整模型 —— 这是一个良好的开端，但并非终点。传输线缆完全密封（经认证的加密传输，无 pickle 隐患），因此传输链路不存在泄漏；但*参与运算的节点*必须解密后才能计算其所属层，因此能看到经由它的中间激活值。恶意节点仍有可能从局部激活值中逆向推测出用户的少量 token。我们的应对方案 —— 将易泄露的边界层固定在受信任节点上、按请求动态安全路由、绝不过度宣称安全性 —— 详细规划见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。这是团队视作头等优先级并全力攻克的核心课题。
 
 ## gpt-oss-120B 在公网上达到 ~40 tok/s —— 消费级显卡实证
@@ -143,19 +143,13 @@ docs/        ARCHITECTURE、ROADMAP、MODEL_RUNTIME、NETWORK、INTEGRATION、PR
 - **Phase 1 —— 广域网环境适配：** 支持 NAT 内网穿透、中继回退、激活值量化压缩与边际链路监控。
 - **Phase 2 —— 投机解码加速：** 在集群上实现草稿与验证分离 —— **已在 GLM-5.2 744B 上达成公网贪心 ~30 tok/s**（以及 gpt-oss-120B 的 ~18–25 tok/s）。现已支持**无损的 Temperature / Top-p / Top-k 采样**（[`phase0/specsample.py`](phase0/specsample.py)），实测收据：[docs/receipts/sampling-lossless-20260623.json](docs/receipts/sampling-lossless-20260623.json)。
 - **Phase 3 —— 无许可弹性集群：** 单行命令入网、跨异构 GPU 的动态层切分分配、按 Token 结算收益、故障容错与自愈 —— **已验证请求过程中途节点故障自愈**（生成中途剔除节点，请求自动在备用节点恢复并完成；`phase0/heal.py`，[收据](docs/receipts/fault-tolerance-20260623.json)）。
-- **DeepSeek-V4 双资源混合运行时与专家缓存（11 步改造全量落地）：**
-  遵循严格依赖顺序完成可验证专家缓存、受控预取、KV 分页与兜底扩展（全量 193 项单测 100% 通过）：
-  1. **固定正确性基线与性能验收条件**（✅ 已完成）：完善基准脚本，锁定版本、量化、内核开关与 prompt，固定 4×5090 ≥40、6×5090 ≥30 tok/s 验收线（[docs/V4_BENCHMARK.md](docs/V4_BENCHMARK.md)）。
-  2. **补齐运行时监测和签名收据**（✅ 已完成）：在签名前写入专家路由、命中率、DMA 指标、CPU 补算及显存/内存 KV 占用（[docs/RUNTIME_METRICS.md](docs/RUNTIME_METRICS.md)）。
-  3. **建立 GPU＋RAM 的双资源放置合同**（✅ 已完成）：扩展 `ModelRuntime` 资源声明，probe 测量可用/锁页内存与 H2D 带宽，约束 tail 节点 MTP 预算与 40–42 层同属（[docs/RESOURCE_CONTRACT.md](docs/RESOURCE_CONTRACT.md)）。
-  4. **改造 V4 实际加载器，建立双权重池**（✅ 已完成）：注意力/路由器/共享专家/归一化驻留 GPU，路由专家以 FP4 保留于宿主机锁页内存，保留全驻留回退（`engines/deepseek_v4/v4_stage.py`）。
-  5. **实现固定槽位的本机 GPU 专家缓存**（✅ 已完成）：固定地址权重槽、映射表与使用状态，严格受控于显存预算（`engines/deepseek_v4/v4_expert_cache.py`）。
-  6. **接入按需 H2D，并适配 CUDA Graph**（✅ 已完成）：未命中专家 DMA 搬运至 GPU 槽并与计算重叠，调整捕获边界，保持逻辑专家累加语义（`engines/deepseek_v4/v4_hybrid.py`）。
-  7. **让调度器真正使用双资源合同**（✅ 已完成）：`scheduler.py` / `plan.py` / `topology.py` 综合 RAM、GPU、DMA 成本与 WAN 延迟评分，落地 `min(vram_cap, ram_cap)` 瓶颈算法（`tests/test_v4_scheduler_plan.py`）。
-  8. **完成第一轮四卡／六卡硬件验收**（✅ 已完成）：全驻留 vs 缓存模式对比，验证 4 卡省 2 次 WAN 跳数净赚 ~20ms 时延（`phase0/v4_acceptance.py`，`tests/test_v4_acceptance.py`）。
-  9. **实现分块预填充和受控预取**（✅ 已完成）：跨块预填充状态管理削减显存峰值，结合 DSpark 草稿提示与 EMA 热度预取，未命中安全回退（`engines/deepseek_v4/v4_chunked_prefill.py`）。
-  10. **实现 V4 专用的 KV 驻留上限与分页**（✅ 已完成）：滑动窗口活跃工作集 + 内存全量历史归档双层存储，杜绝长文本 OOM，支持精确推测回滚（`engines/deepseek_v4/v4_kv_paging.py`）。
-  11. **通过速度线后，再扩展能力**（✅ 已完成）：SwiGLU CPU 专家计算兜底保证零 OOM，支持跨节点超热专家副本自动协商（`engines/deepseek_v4/v4_expansion.py`）。
+- **DeepSeek-V4 双资源与生产加固（实际执行路径已接入，GPU 集群验收待完成）：**
+  1. 固定槽位 RAM 专家池、按需 DMA、受控预取与签名指标已接入，GPU 的命中/未命中性能需要实测。
+  2. 可选逐层 KV 工作集保留原压缩器数学，将压缩历史放主机内存；显式 GPU/host 配额也包含回滚预算，支持的上下文受工作区容量约束。
+  3. 预填充仅分块 Attention/Indexer 查询，保留原投影、Compressor 与 MoE 形状；首次实际形状需通过输出与状态的数值门控，首次峰值仍需完整参考路径。
+  4. 密封 token IDs、身份绑定收据、认证串行服务、租户公平队列、取消/期限和原请求重放恢复已实现；激活值仍可见，服务尚不具备持续批处理与持久化 HA。
+  5. 同机多 GPU 准入检查共享 RAM/锁页预算与同时 H2D 带宽。历史跑分不能认证新增路径；4×5090 ≥40、6×5090 ≥30 tok/s 仍为待验证目标。
+  部署与限制见 [docs/V4_NEXT_PHASE.md](docs/V4_NEXT_PHASE.md)，固定速度验收见 [docs/V4_BENCHMARK.md](docs/V4_BENCHMARK.md)。跨节点专家副本与 CPU 主推理路径不在当前 V4 服务范围。
 - **统一引擎架构（进行中）：** 将所有服务路径抽象收敛于统一的 `ModelRuntime` 接口（[`shard/node.py`](shard/node.py)），使网络能运行*任意*开源模型；模型层接入生态标准，核心壁垒（环拓扑、高效传输、投机验证）保持自研。规划见 [docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md)。
 - **远景目标 —— 超越推理：** 利用相同的无许可基础底座（节点身份、安全传输、内容寻址权重分发、去中心化验证与结算通道）承载通用算力与分布式大模型训练。
 
@@ -172,7 +166,7 @@ docs/        ARCHITECTURE、ROADMAP、MODEL_RUNTIME、NETWORK、INTEGRATION、PR
 [English](README.md) | [独立中文页面 (README_CN.md)](README_CN.md)
 
 **The engine for a permissionless compute network** — *BitTorrent, but you share
-VRAM and compute instead of disk.* Anyone plugs in a GPU of any kind; the network
+VRAM and compute instead of disk.* Anyone can offer a GPU with a supported runtime and measured resource admission; the network
 pools them into swarms that run models far larger than any single card holds. The
 long arc is a worldwide compute fabric: many models, ever bigger, and eventually
 training and general compute. Shard is the protocol that connects it.
@@ -184,7 +178,7 @@ training and general compute. Shard is the protocol that connects it.
 **Proven today: sharded inference.** A model too large for any single card is split
 into contiguous blocks of layers — one shard per GPU — and a request is served by
 streaming activations through the shards in order, over the open internet. No
-datacenter, no single host, and no node ever holds the whole model.
+single host holding the full model is required. A coordinator drives each request; durable coordinator failover remains future work.
 
 Shard is the serving engine for [c0mpute](https://c0mpute.ai). It is a protocol **spine**
 — wire, ring, receipts, placement — plus one engine per model, because getting a model to
@@ -197,15 +191,15 @@ cards to frontier size.
 
 ## DeepSeek-V4-Flash (284B) on six consumer RTX 5090s in four countries
 
-**30.15 tok/s, bit-identical to running the same model on one machine.** Six *distinct*
+**Historical summary: 30.15 warm tok/s, with speculative tokens matching same-ring greedy controls.** Six *distinct*
 RTX 5090s — Poland, Czechia, Denmark, Estonia — connected over the public internet, 8 layers
-per card, no datacenter and no shared host. Speculative decoding runs on DeepSeek's own DSpark
+on each of the first five cards and three on the tail, with distinct hosts. Speculative decoding runs on DeepSeek's own DSpark
 drafter, whose three MTP blocks tap the last three layers and therefore live entirely on the
 tail box.
 
 | Setup | tok/s (warm) | Output |
 |-------|--------------|--------|
-| DeepSeek-V4-Flash 284B (13B active) FP4, 6× RTX 5090 across 4 EU countries, WAN, pipelined DSpark speculation | **30.15** | greedy, bit-identical to single-machine |
+| DeepSeek-V4-Flash 284B (13B active) FP4, 6× RTX 5090 across 4 EU countries, WAN, pipelined DSpark speculation | **30.15** | greedy, historical same-ring token parity |
 
 Median of three consecutive warm runs within 0.17 of each other (30.18 / 30.29 / 30.12).
 A context × workload matrix (math, code, prose, agentic; 0–2k context) is in
@@ -319,7 +313,7 @@ Shard is c0mpute infrastructure, held to its three guarantees:
 
 - **Uncensored.** The engine runs models as-is. No content filter in the inference path.
 - **Decentralized.** Anyone can join a GPU with one command and be assigned a block of
-  layers. No central inference server.
+  layers. Distributed execution is driven by a per-request coordinator.
 - **Private.** No node holds the whole model — a real start, not the whole story. The
   wire is sealed (authenticated encryption, pickle-free), so the leak is not on the
   path; but a *participating* node must decrypt to run its layer, so it sees the
@@ -395,19 +389,13 @@ part that matters, and it is already a test rather than a convention.
   across heterogeneous GPUs, per-token payouts, fault tolerance — **mid-request heal demonstrated**
   (kill a node mid-generation, the request resumes on a spare and completes; `phase0/heal.py`,
   [receipt](docs/receipts/fault-tolerance-20260623.json)).
-- **DeepSeek-V4 Dual-Resource & Expert Cache Track (11-Step Sequence Fully Implemented):**
-  Strict implementation dependency: complete verifiable local expert cache, prefetching, paging KV, and fallback expansion (193 tests 100% pass):
-  1. **Baseline Correctness & Performance Acceptance Gates** (✅ Done): lock model checkpoint, kernels, prompts; targets: 4×5090 ≥40, 6×5090 ≥30 tok/s ([docs/V4_BENCHMARK.md](docs/V4_BENCHMARK.md)).
-  2. **Runtime Telemetry & Signed Receipts** (✅ Done): route counts, hit rate, DMA metrics, CPU fallback, and GPU/RAM KV footprints signed in receipts ([docs/RUNTIME_METRICS.md](docs/RUNTIME_METRICS.md)).
-  3. **GPU + Host RAM Dual-Resource Placement Contract** (✅ Done): `ModelRuntime` resource declaration, RAM/pinned/H2D bandwidth probes, tail MTP and layers 40–42 co-location ([docs/RESOURCE_CONTRACT.md](docs/RESOURCE_CONTRACT.md)).
-  4. **Refactor V4 Stage Loader with Dual Weight Pools** (✅ Done): GPU resident params vs pinned host RAM FP4 routed experts, all-resident rollback retained (`engines/deepseek_v4/v4_stage.py`).
-  5. **Fixed-Slot Local GPU Expert Cache** (✅ Done): fixed-address slots, ID mapping, lease tracking within bounded GPU budget (`engines/deepseek_v4/v4_expert_cache.py`).
-  6. **On-Demand H2D DMA & CUDA Graph Adaptation** (✅ Done): miss DMA overlapping compute, graph boundaries, logic expert order preserved (`engines/deepseek_v4/v4_hybrid.py`).
-  7. **Scheduler Enforcement of Dual-Resource Contract** (✅ Done): `scheduler.py` / `plan.py` / `topology.py` consume RAM, GPU, DMA cost, and WAN RTT with `min(vram_cap, ram_cap)` bottleneck (`tests/test_v4_scheduler_plan.py`).
-  8. **Phase 1 Hardware Acceptance (4-Node & 6-Node)** (✅ Done): all-resident vs cache comparison, 4-node WAN hop savings vs DMA overhead evaluation (`phase0/v4_acceptance.py`, `tests/test_v4_acceptance.py`).
-  9. **Chunked Prefill & Controlled Prefetching** (✅ Done): cross-chunk prefill state management, speculative decode prefetch heuristic with safe on-demand fallback (`engines/deepseek_v4/v4_chunked_prefill.py`).
-  10. **V4-Dedicated KV Bounds & Paging** (✅ Done): sliding-window active working set + host RAM full history archive with lossless rollback (`engines/deepseek_v4/v4_kv_paging.py`).
-  11. **Post-Speedline Capability Expansion** (✅ Done): verified SwiGLU CPU fallback, and cross-node hot expert replicas coordinator (`engines/deepseek_v4/v4_expansion.py`).
+- **DeepSeek-V4 dual-resource production hardening (integrated opt-in paths; GPU acceptance pending):**
+  1. Local pinned expert pools, fixed GPU slots, demand DMA, bounded prediction and signed observations are integrated.
+  2. Layer-local KV working sets preserve Compressor semantics while keeping compressed histories on the host. Explicit tier quotas include rollback; supported context is bounded by workspace capacity.
+  3. Prefill chunks Attention/Indexer queries only. Projection, Compressor and MoE shapes are preserved; the first real shape must pass output/state parity and still pays a full reference peak.
+  4. Sealed token IDs, identity-bound receipts, an authenticated serial gateway, fair tenant queues, cancellation/deadlines and original-request replay recovery are implemented. Activations remain visible; continuous batching and durable HA are not provided by this V4 gateway.
+  5. Co-located GPU admission checks shared host RAM/pinning and simultaneous H2D I/O. Historical runs do not certify these new paths: four-card >=40 and six-card >=30 tok/s remain hardware gates.
+  See [docs/V4_NEXT_PHASE.md](docs/V4_NEXT_PHASE.md) and [docs/V4_BENCHMARK.md](docs/V4_BENCHMARK.md). Cross-node expert replicas and a CPU main inference path are outside the current V4 service.
 - **One engine, every model.** The serve path is being generalized behind a single
   `ModelRuntime` interface (`shard/node.py`) so the network runs *any* model, not one
   hand-ported architecture — the model layer is inherited from the ecosystem; the moat

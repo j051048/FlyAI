@@ -155,6 +155,32 @@ def test_shared_host_budget_finds_an_alternative_layer_assignment():
     assert result["layers"][2] == 2
 
 
+def test_tail_host_budget_searches_a_more_expensive_valid_order():
+    nodes, _, outgoing, incoming, options = mesh(
+        3, cap=2, layers=6, require=0, slack=0,
+        host_id={0: "A", 1: "A", 2: "B"},
+        host_layer_caps={"A": 4, "B": 2}, tail_host_layer_caps={"A": 3, "B": 2})
+    latency = [[0.0, 10.0, 1.0], [1.0, 0.0, 10.0], [1.0, 1.0, 0.0]]
+    # [0,2,1] is cheapest but tails host A, which then has room for only 3
+    # layers. All three GPUs must carry 2, so [0,1,2] is the feasible order.
+    result = select_ring(nodes, latency, outgoing, incoming, **options)
+    assert_tiling(result, 6)
+    assert result["order"] == [0, 1, 2]
+    assert result["layers"] == {0: 2, 1: 2, 2: 2}
+
+
+def test_saturated_host_cover_does_not_overestimate_minimum_ring_width():
+    result = select(3, cap=4, layers=8, require=0, slack=0,
+                    host_id={0: "A", 1: "A", 2: "B"},
+                    host_layer_caps={"A": 6, "B": 4})
+    # Walking static caps in node order sees A=4, then A=6, then B and
+    # mistakenly calls three stages the minimum. GPU 0 + GPU 2 already fit 8.
+    assert_tiling(result, 8)
+    assert result["k"] == 2
+    assert result["order"] == [0, 2]
+    assert result["layers"] == {0: 4, 2: 4}
+
+
 def test_co_location_does_not_relax_trusted_boundaries_pinned_head_or_tail_floor():
     result = select(4, cap=2, layers=8, host_id={n: "box" for n in range(4)},
                     trusted={0, 3}, boundary_in=2, boundary_out=2, tail_floor=2,
@@ -251,6 +277,36 @@ def test_shared_host_ram_uses_the_lower_known_free_and_pinnable_budget():
     nodes, latency = pool(2, gpu_mb=4 * 1024, ram_mb=8 * 1024)
     nodes[1]["pinnable_ram_mb"] = 5 * 1024  # conservative shared-host report
     assert plan_ring(nodes, latency, model=profile(ram=True)) is None
+
+
+def test_strict_host_policy_chooses_a_known_host_head_when_the_central_node_is_unknown():
+    nodes, _ = pool(3, gpu_mb=4 * 1024, ram_mb=5 * 1024)
+    nodes[0].pop("host_id")
+    nodes[1]["host_id"], nodes[2]["host_id"] = "A", "B"
+    # Node 0 is the RTT center, but cannot be the mandatory head of a strict
+    # host-isolated ring. The two identified hosts can still cover all layers.
+    latency = [[0.0, 1.0, 1.0], [1.0, 0.0, 10.0], [1.0, 10.0, 0.0]]
+    result = plan_ring(nodes, latency, model=profile(ram=True), isolation="host")
+    assert_tiling(result, 6)
+    assert result["head"] != "node-0"
+    assert set(result["order"]) == {"node-1", "node-2"}
+
+
+@pytest.mark.parametrize("missing", ["free_ram_mb", "pinnable_ram_mb"])
+def test_explicit_gpu_layer_cap_cannot_bypass_unknown_ram_or_pinning(missing):
+    nodes, latency = pool(2, gpu_mb=4 * 1024, ram_mb=5 * 1024)
+    for index, node in enumerate(nodes):
+        node["host_id"] = f"host-{index}"
+        node["cap_layers"] = 99  # an announced GPU ceiling is not host-memory evidence
+        node.pop(missing)
+    assert plan_ring(nodes, latency, model=profile(ram=True)) is None
+
+
+def test_nonfinite_pinnable_ram_report_is_rejected():
+    nodes, latency = pool(2, gpu_mb=4 * 1024, ram_mb=5 * 1024)
+    nodes[0]["pinnable_ram_mb"] = float("nan")
+    with pytest.raises(ValueError):
+        plan_ring(nodes, latency, model=profile(ram=True))
 
 
 def test_plan_ring_detects_overlapping_aggregate_gpu_uuids():

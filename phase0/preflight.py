@@ -1,10 +1,8 @@
-"""P0-3 Preflight cluster & node validation gate.
+"""Legacy local capacity and endpoint checks, with co-location allowed.
 
-Strict gate before forming a distributed inference ring:
-- Host RAM >= 64GB (accommodates host expert pools & KV paging)
-- Usable Disk >= 300GB (safetensors weights & checkpoint storage)
-- Duplicate IP / NAT hairpin probe (detects co-located container deadlock)
-- Peer RTT latency matrix (fails fast on broken edges or WAN stalls)
+Explicit --min-* thresholds are optional operator requirements. Runtime placement
+uses measured per-stage contracts via shard.deployment, rather than these totals.
+Repeated public addresses are a route diagnostic, not evidence of a broken route.
 """
 import argparse
 import os
@@ -34,7 +32,7 @@ def get_total_ram_gb() -> float:
         try:
             return (os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')) / (1024.0 ** 3)
         except Exception:
-            return 64.0  # Safe default if unsupported
+            return 0.0  # Unknown capacity never becomes a passing invented measurement.
 
 
 def get_disk_free_gb(path: str = ".") -> float:
@@ -50,16 +48,16 @@ def get_disk_free_gb(path: str = ".") -> float:
 def measure_tcp_rtt_ms(host: str, port: int, timeout: float = 3.0) -> Optional[float]:
     """Measure single TCP handshake RTT in milliseconds."""
     t0 = time.perf_counter()
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
+    s = None
     try:
-        s.connect((host, port))
+        s = socket.create_connection((host, port), timeout=timeout)
         t1 = time.perf_counter()
         return (t1 - t0) * 1000.0
     except Exception:
         return None
     finally:
-        s.close()
+        if s is not None:
+            s.close()
 
 
 def detect_hairpin_hazard(endpoints: List[str]) -> List[str]:
@@ -77,21 +75,24 @@ def detect_hairpin_hazard(endpoints: List[str]) -> List[str]:
     for host, stages in ip_map.items():
         if len(stages) > 1:
             hazards.append(
-                f"NAT Hairpin Hazard: Host IP {host!r} is shared by multiple distinct stages {stages}. "
-                f"Vast.ai containers on the same physical host cannot route to each other's public port without hairpin NAT support!"
+                f"NAT Hairpin Hazard diagnostic: endpoint address {host!r} is shared by stages {stages}. "
+                f"Verify each actual route; repeated addresses alone do not imply failure or one physical host."
             )
     return hazards
 
 
 def run_preflight_checks(
     work_dir: str = "/root",
-    min_ram_gb: float = 64.0,
-    min_disk_gb: float = 300.0,
+    min_ram_gb: float = 0.0,
+    min_disk_gb: float = 0.0,
     endpoints: Optional[List[str]] = None,
     enforce: bool = True,
 ) -> Dict:
     """Execute all preflight gate assertions. Returns dictionary of findings."""
-    reasons = []
+    import math
+    if any(isinstance(x, bool) or not math.isfinite(x) or x < 0 for x in (min_ram_gb, min_disk_gb)):
+        raise ValueError("resource thresholds must be finite nonnegative GiB")
+    reasons, warnings = [], []
     
     # 1. RAM check
     actual_ram = get_total_ram_gb()
@@ -113,7 +114,7 @@ def run_preflight_checks(
     # 3. Hairpin hazard detection
     if endpoints:
         hazards = detect_hairpin_hazard(endpoints)
-        reasons.extend(hazards)
+        warnings.extend(hazards)
 
     # 4. Latency matrix (if endpoints provided and accessible)
     rtt_matrix = {}
@@ -121,17 +122,19 @@ def run_preflight_checks(
         for ep in endpoints:
             if not ep or ep == "none":
                 continue
-            parts = ep.split(":")
-            if len(parts) == 2:
-                host, port_str = parts
-                try:
-                    port = int(port_str)
-                    rtt = measure_tcp_rtt_ms(host, port, timeout=1.0)
-                    rtt_matrix[ep] = rtt
-                    if rtt is not None and rtt > 250.0:
-                        reasons.append(f"Excessive WAN Latency: endpoint {ep} RTT is {rtt:.1f}ms (>250ms threshold). Ring pipeline throughput will collapse.")
-                except ValueError:
-                    pass
+            host, sep, port_str = ep.rpartition(":")
+            try:
+                port = int(port_str)
+                if not sep or not host or not 1 <= port <= 65535:
+                    raise ValueError("invalid endpoint")
+                rtt = measure_tcp_rtt_ms(host.strip("[]"), port, timeout=1.0)
+                rtt_matrix[ep] = rtt
+                if rtt is None:
+                    reasons.append(f"Unreachable endpoint: {ep}")
+                elif rtt > 250.0:
+                    warnings.append(f"High handshake latency: {ep} measured {rtt:.1f}ms; price the actual route in placement")
+            except ValueError:
+                reasons.append(f"Malformed endpoint: {ep}")
 
     passed = len(reasons) == 0
     result = {
@@ -140,6 +143,8 @@ def run_preflight_checks(
         "disk_free_gb": round(actual_disk, 1),
         "rtt_matrix": rtt_matrix,
         "reasons": reasons,
+        "warnings": warnings,
+        "scope": "local totals and TCP reachability; not measured runtime placement or ring readiness",
     }
 
     if not passed and enforce:
@@ -150,7 +155,7 @@ def run_preflight_checks(
         )
 
     if passed:
-        print(f"[preflight] PASS: RAM={actual_ram:.1f}GB (>= {min_ram_gb}GB), Disk={actual_disk:.1f}GB (>= {min_disk_gb}GB). Cluster admission granted.", flush=True)
+        print(f"[preflight] PASS: local thresholds RAM={actual_ram:.1f}GiB, Disk={actual_disk:.1f}GiB. Use measured deployment validation for runtime admission.", flush=True)
 
     return result
 
@@ -158,8 +163,8 @@ def run_preflight_checks(
 def main():
     parser = argparse.ArgumentParser(description="FlyAI cluster node preflight admission gate.")
     parser.add_argument("--dir", default="/root", help="Working directory to check disk capacity")
-    parser.add_argument("--min-ram", type=float, default=64.0, help="Minimum RAM in GB")
-    parser.add_argument("--min-disk", type=float, default=300.0, help="Minimum free disk in GB")
+    parser.add_argument("--min-ram", type=float, default=0.0, help="Optional minimum total RAM in GiB")
+    parser.add_argument("--min-disk", type=float, default=0.0, help="Optional minimum free disk in GiB")
     parser.add_argument("--endpoints", default="", help="Comma-separated stage endpoints (host:port)")
     parser.add_argument("--no-enforce", action="store_true", help="Print findings without exiting non-zero")
     args = parser.parse_args()

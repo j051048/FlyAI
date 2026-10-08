@@ -307,6 +307,11 @@ class DSparkTail:
             for blk in self.mtp:
                 blk.block_size = self.block_size
         self.mtp.eval()
+        # MTP blocks may be built long after Stage's main shared-expert layout.
+        # Bind only these resident shared experts; RAM-mode routed pools remain
+        # canonical CPU banks and never pass through a full-GPU bank layout.
+        import v4_fp8_gemv
+        self._shared_banked = v4_fp8_gemv.install_drafter_shared(self, mod=M)
         self.alias_missing = []
         self._pos = None
         self.last_spec = None

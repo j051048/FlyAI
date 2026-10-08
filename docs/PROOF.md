@@ -14,55 +14,66 @@ The cheap fakes we're ruling out:
 3. **Cherry-picked / fabricated tok/s** — a number with nothing reproducible behind it.
 4. **Wrong output** — a fast pipeline that doesn't actually compute the model correctly.
 
-The receipt is designed so each of these fails an independent check.
+The checks below retain evidence for independent reproduction. A signed declaration alone cannot exclude all fabricated hardware or computation claims.
 
-## The four proofs
+## Evidence and verification boundaries
 
-**1. The nodes are genuinely distinct, distributed machines.**
-The receipt records, per node: public **IP**, **geolocation** (city/region, from the host
-provider), **GPU UUID**, and GPU model. Distinct IPs across different ASNs/regions and
-distinct GPU UUIDs can't come from one box. *Verify:* the IPs resolve to different
-networks/cities; the GPU UUIDs are all different physical GPUs.
+**1. Node identity and deployment provenance.**
+Retain declared host identity, GPU UUID, signing key, reachable endpoint and software/source
+versions. Distinct addresses or UUID strings are not remote hardware attestation. Independent
+inventory and measurement provide provenance for a WAN claim. Co-located distinct GPUs are a
+valid production assignment; their shared host budgets must be accounted once.
 
 **2. The links are real WAN, not localhost.**
 The receipt records the **measured RTT of every pipeline edge** (`phase0/mesh.py`, app-level
 round-trip over the live transport). Real inter-city internet is tens-to-hundreds of ms;
 localhost is <1 ms. *Verify:* the edge RTTs are WAN-scale and match the geographic distances.
 
-**3. The output is correct — and reproducible bit-for-bit.**
-Shard uses **greedy decoding**, so the swarm's output is **token-identical** to a single-node
-reference run of the same model + prompt. The receipt includes the prompt, the generated
-token ids, and their hash. *Verify:* run the same prompt through the reference (or any
-standard inference of the same model) and confirm the tokens match the hash. A pipeline that
-faked the compute would not reproduce.
+**3. Output parity within an explicit numerical contract.**
+The current V4 benchmark compares committed token IDs against a greedy control on the same
+running ring, checkpoint, wire mode and frozen prompt. This does not prove all intermediate
+floats or a different single-machine backend are bit-identical. Reference/eager, kernel,
+graph, state and rollback parity require separate tests with pinned hardware and numerics.
 
 **4. Anyone can re-run the whole thing.**
 The engine is open source (Apache-2.0). The receipt embeds the exact commit, model, layer→node
 assignment, and launch commands. *Verify:* stand up your own nodes and reproduce — same code,
 same result.
 
-**5. Stage Activation Commitments & Interactive Fraud Proof (无法做恶与逐 Stage 责任判定).**
-In permissionless Web3 inference networks, trusting nodes without accountability is unsafe.
-Shard provides a zero-overhead **Activation Commitment Protocol** and **Single-Stage Fraud Proof**:
-- **Lightweight Online Commitments:** During live ring execution, each stage computes and commits
-  a 32-byte cryptographic hash of its input and output activations (`phase0/activation_proof.py`).
-  These hashes are signed and bound into the run receipt envelope (`stage_commitments`). No heavy
-  tensors are transferred during inference.
-- **Interactive Single-Stage Adjudication:** If output is challenged, only the disputed stage is
-  re-executed on a validator (`phase0/fraud_proof.py`). If the output hash mismatches recomputed
-  activations, the cheating node is definitively slashed (penalty).
-- **Same-Microarchitecture Protection:** Different GPU architectures (e.g. Blackwell sm120 vs Ada
-  sm89) exhibit ULP-level floating-point rounding differences. Shard strictly enforces same-arch
-  arbitration or tolerance thresholds, preventing honest heterogeneous nodes from being falsely slashed.
+**5. Signed execution records and local dispute primitives.**
+The live service signs activation roots and validates the assigned signers, complete layer
+coverage, adjacent roots, job/swarm identity and fresh nonce. Hashing has a cost; receipt
+signatures attest the declared bytes, not complete model execution or physical hardware.
 
-**6. Anti-Sybil & Anti-Hairpin Topology Constraint (拓扑抗合谋与防 NAT 回流).**
-- **Strict Host Isolation:** Ring planning (`shard/topology.py`) strictly forbids two nodes on the
-  same physical host or public IP from being adjacent stages. This completely eliminates NAT
-  hairpinning deadlocks on shared subnets and stops Sybil attackers from monopolizing consecutive
-  stages to spoof intermediate activations.
+`phase0/activation_proof.py` and `phase0/fraud_proof.py` provide optional local commitment and
+arbitration helpers. They bind logical tensor bytes, input/output snapshots, stage/step,
+engine identity and a challenge deadline. Same-architecture replay is required; optional
+tolerance compares only the committed output snapshot. Their result explicitly reports
+`onchain_executed=False`. There is no asset escrow, chain transaction or automatic slashing
+in these helpers, and they are not a per-step production proof collector.
+
+A real validator must independently load the pinned weights/backend and recover the exact
+KV, Compressor and position state before replay. An arbitrary caller-supplied replay function
+or self-declared architecture is not sufficient evidence. Billing and dispute settlement
+remain the external control plane's responsibility.
+
+**6. Configurable Placement Isolation (可选的部署隔离).**
+- **Co-location Allowed in Production:** Ring planning (`shard/topology.py`) defaults to
+  `isolation="none"`: distinct GPUs on one mining host or subnet may serve adjacent stages.
+  Explicit `host`, `subnet` and `adjacent_host` policies remain available for deployments that
+  require them. A public IP does not identify a physical host; topology declarations alone do
+  not prove Sybil resistance. Reachable, measured local/private routes address NAT hairpinning.
+  Duplicate declared GPU UUIDs cannot contribute capacity twice, and known shared RAM budgets
+  are checked once across the host's stages. See [COLOCATION_POLICY.md](COLOCATION_POLICY.md).
+- **WAN Evidence:** A co-located deployment is a valid inference run, but does not establish a
+  distinct-host WAN result. Such benchmark claims retain their independent inventory and
+  evidence requirements.
 - **Staked Boundary Pinning:** Sensitive input/output layers (embedding and lm_head) are pinned to
-  high-reputation staked nodes (`staked: true`), ensuring permissionless stages only execute
-  masked, intermediate transformer blocks.
+  high-reputation staked nodes (`staked: true`), providing a placement preference, not cryptographic concealment. Legacy V4 frames carry token
+  IDs to every stage. Opt-in sealed-ID mode hides IDs from keyless score-routed middle stages,
+  including pipelined token hints, while activations remain visible. Head, every hash-layer
+  recipient and the tail remain trusted. Co-located processes controlled by one operator share
+  that operator's trust domain. See [V4_TRUST_BOUNDARIES.md](V4_TRUST_BOUNDARIES.md).
 
 ## Receipt schema (`docs/receipts/<run_id>.json`)
 

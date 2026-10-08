@@ -163,7 +163,7 @@ def source_identity(root: Path = ROOT) -> dict:
     paths = set()
     for directory in (root / "engines" / "deepseek_v4", root / "vendor" / "deepseek_v4_ref", root / "shard"):
         paths.update(directory.rglob("*.py"))
-    for name in ("phase0/wire.py", "phase0/v4_benchmark.py"):
+    for name in ("phase0/wire.py", "phase0/v4_benchmark.py", "phase0/v4_soak.py"):
         if (root / name).is_file():
             paths.add(root / name)
     files = [{"name": p.relative_to(root).as_posix(), "sha256": file_digest(p)} for p in sorted(paths)]
@@ -285,6 +285,9 @@ def protocol_errors(p: dict) -> list[str]:
         if len(nodes) not in TARGETS:
             errors.append("hardware must identify exactly four or six single-GPU stages")
         identities, keys, hosts = set(), set(), set()
+        isolation = p.get("isolation", "host")
+        if isolation not in ("host", "none"):
+            errors.append("benchmark isolation must be host or none")
         cursor = 0
         for node in nodes:
             required = ("node_id", "host_id", "gpu_uuid", "gpu_name", "driver", "cuda", "torch", "tilelang",
@@ -302,7 +305,7 @@ def protocol_errors(p: dict) -> list[str]:
             if not _integer(node.get("vram_bytes"), 30 * 1024**3) or node["vram_bytes"] > 34 * 1024**3:
                 errors.append("node must report actual 32 GB class VRAM in bytes")
             if (node.get("gpu_uuid") in identities or node.get("signer_pubkey") in keys
-                    or node.get("host_id") in hosts):
+                    or (isolation == "host" and node.get("host_id") in hosts)):
                 errors.append("each baseline stage must have a distinct GPU, signer and host")
             identities.add(node.get("gpu_uuid")); keys.add(node.get("signer_pubkey")); hosts.add(node.get("host_id"))
             lo, hi = node.get("layer_start"), node.get("layer_end")
@@ -422,11 +425,12 @@ class LiveRingAdapter:
                                                   token=self.vp.SWARM_TOKEN, retry_s=retry_s)
 
     def generate(self, prompt_ids, max_new, *, mode, nonce, job_id, on_token):
+        self._job_id = job_id
         methods = {"greedy": self.vp.coordinate, "dspark": self.vp.coordinate_dspark,
                    "pipelined": self.vp.coordinate_dspark_pipelined}
         kw = dict(eos_ids=(), nonce=nonce, swarm_id=self.swarm_id, job_id=job_id,
                   layer_count=self.layer_count, receipts=False, timeout=self.timeout,
-                  on_token=on_token)
+                  on_token=on_token, strict_job_binding=True)
         if mode == "greedy":
             kw.update(temp=0.0, seed=0)
         elif mode == "pipelined":
@@ -436,7 +440,11 @@ class LiveRingAdapter:
         return methods[mode](self.pipe, self.ret, prompt_ids, max_new, **kw)
 
     def sweep(self, nonce):
-        return self.vp._sweep_receipts(self.pipe, self.ret, self.layer_count, nonce)
+        assignment = {node["signer_pubkey"]: (node["layer_start"], node["layer_end"])
+                      for node in self.protocol["hardware"]}
+        return self.vp._sweep_receipts(self.pipe, self.ret, self.layer_count, nonce,
+                                       expected_by_signer=assignment, swarm_id=self.swarm_id,
+                                       job_id=self._job_id)
 
     def close(self):
         # Disconnect the coordinator; do not send stop to the user's running stages.
@@ -653,6 +661,7 @@ def _prepare(args):
     p = seal_protocol({
         "schema": PROTOCOL_SCHEMA, "model_id": MODEL_ID, "layer_count": 43,
         "checkpoint": inventory, "source": source, "env": env, "hardware": _read(args.hardware),
+        "isolation": args.isolation,
         "prompts": prompts,
         "run": {"prompt_tokens": args.prompt_tokens, "max_new": args.max_new,
                 "warm_reps": 3, "warmup_reps": 1, "mode": args.mode,
@@ -675,6 +684,8 @@ def main(argv=None) -> int:
     prep = sub.add_parser("prepare", help="freeze local checkpoint, tokenizer, prompts and node inventory")
     prep.add_argument("--dir", required=True)
     prep.add_argument("--hardware", required=True, help="JSON array of pinned node/GPU/signer assignments")
+    prep.add_argument("--isolation", choices=("host", "none"), default="host",
+                      help="host preserves scattered-WAN baseline; none admits distinct GPUs on shared hosts")
     prep.add_argument("--env-file", help="JSON object overriding the explicit baseline recipe")
     prep.add_argument("--prompt-tokens", type=int, default=512)
     prep.add_argument("--max-new", type=int, default=512)

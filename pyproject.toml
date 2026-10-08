@@ -19,6 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+v4 = ["einops>=0.7", "safetensors>=0.5", "transformers>=4.48"]
 # Apple-silicon backend: shard/mlx_runtime.py imports these lazily (Mac-only)
 mlx = ["mlx>=0.21", "mlx-lm>=0.20"]
 # Kimi-K3 stage (phase0/k3_stage.py). Moonshot's reference decoder, vendored at

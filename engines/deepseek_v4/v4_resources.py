@@ -351,16 +351,27 @@ def load_calibration(path_or_dict, *, checkpoint_id=None):
     return requirements
 
 
-def runtime_config_identity(stage):
+def runtime_config_payload(stage):
+    """Export the exact configuration whose canonical JSON is calibrated/signed."""
     args = asdict(stage.args) if is_dataclass(stage.args) else dict(vars(stage.args))
     body = {"args": args, "lo": stage.lo, "hi": stage.hi, "head": stage.head,
-            "tail": stage.tail, "dspark": stage._dspark, "dtype": str(stage.dtype),
+            "tail": stage.tail, "dspark": getattr(stage, "_dspark_capable", stage._dspark), "dtype": str(stage.dtype),
             "runtime_metrics_enabled": getattr(stage, "_runtime_metrics", None) is not None,
+            "runtime_profile_enabled": getattr(stage, "_runtime_profile", None) is not None,
+            "profile_gpu_sample_every": getattr(getattr(stage, "_runtime_profile", None), "every", None),
+            "expert_prefetch_enabled": getattr(stage, "_expert_prefetch", False),
+            "expert_prefetch_pools": [block.ffn._hybrid_runtime.prefetch_config()
+                                      for block in getattr(stage, "_hybrid_blocks", ())],
             "expert_placement": getattr(stage, "_expert_placement", "gpu"),
             "expert_cache_reference": getattr(stage, "_expert_cache_reference", False),
             "expert_cache_slots": getattr(stage, "_expert_cache_slots", 0),
             "expert_cache_bytes": getattr(stage, "_expert_cache_bytes", 0),
             "expert_cache_reserve_bytes": getattr(stage, "_expert_cache_reserve_bytes", 0),
+            "kv_placement": getattr(stage, "_kv_placement", "gpu"),
+            "kv_reference": getattr(stage, "_kv_reference", False),
+            "kv_gpu_budget_bytes": getattr(stage, "_kv_gpu_budget_bytes", 0),
+            "kv_host_budget_bytes": getattr(stage, "_kv_host_budget_bytes", 0),
+            "prefill_query_chunk_tokens": getattr(stage, "_prefill_query_chunk", 0),
             "environment": {key: value for key, value in sorted(os.environ.items()) if key.startswith("V4_")}}
     import sys
     torch_module = sys.modules.get("torch")
@@ -370,7 +381,11 @@ def runtime_config_identity(stage):
     directory = Path(__file__).resolve().parent
     body["engine_source_sha256"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                                      for path in sorted(directory.glob("v4_*.py"))}
-    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return body
+
+
+def runtime_config_identity(stage):
+    return hashlib.sha256(json.dumps(runtime_config_payload(stage), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _load_engine_module(name):
@@ -393,7 +408,8 @@ def placement_requirements_for_stage(stage, calibration=None, checkpoint_dir=Non
     if directory is None:
         raise ResourceError("the loaded checkpoint directory is required to verify calibration identity")
     inventory = inspect_checkpoint(directory, expected_checkpoint_id=requirements.provenance.checkpoint_id)
-    stage_storage_inventory(inventory, stage.lo, stage.hi, head=stage.head, tail=stage.tail, dspark=stage._dspark)
+    stage_storage_inventory(inventory, stage.lo, stage.hi, head=stage.head, tail=stage.tail,
+                            dspark=getattr(stage, "_dspark_capable", stage._dspark))
     if (requirements.layer_start, requirements.layer_end) != (stage.lo, stage.hi):
         raise ResourceError("calibration layer span mismatch")
     if requirements.provenance.runtime_config_sha256 != runtime_config_identity(stage):
@@ -460,9 +476,18 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
         for key, cache in manager.caches.items():
             for bank_name, tensor in cache.banks.items():
                 record(f"expert_cache.{key}.{bank_name}", tensor, "expert_cache")
+    kv_runtime = getattr(stage, "_kv_runtime", None)
+    if kv_runtime is not None:
+        for name, tensor in kv_runtime.tensors():
+            record(f"kv_runtime.{name}", tensor, "kv")
     for name, module, _ in modules:
         for buffer_name, tensor in module.named_buffers():
             record(f"{name}.{buffer_name}", tensor, "state")
+        for sub_name, child in module.named_modules():
+            runtime = getattr(child, "_hybrid_runtime", None)
+            if runtime is not None:
+                for scratch_name, tensor in runtime.router_scratch_tensors():
+                    record(f"{name}.{sub_name}.router.{scratch_name}", tensor, "staging")
     walked = set()
     def walk_state(name, obj, depth=0):
         if isinstance(obj, torch.Tensor):
@@ -514,10 +539,11 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
     return {"schema": "v4-resource-measurement/1", "calibration_status": "measured",
             "model_id": MODEL_ID, "checkpoint_id": checkpoint_id,
             "runtime_config_sha256": runtime_config_identity(stage),
+            "runtime_config_payload": runtime_config_payload(stage),
             "measured_at": datetime.now(timezone.utc).isoformat(), "node_id": socket.gethostname(),
             "lo": stage.lo, "hi": stage.hi, "head": stage.head, "tail": stage.tail,
-            "dspark": bool(getattr(stage, "_dspark", False)), "hardware": hardware,
-            "draft_measurement_status": "measured" if draft_module is not None else "missing" if getattr(stage, "_dspark", False) else "not_requested",
+            "dspark": bool(getattr(stage, "_dspark_capable", getattr(stage, "_dspark", False))), "hardware": hardware,
+            "draft_measurement_status": "measured" if draft_module is not None else "missing" if getattr(stage, "_dspark_capable", getattr(stage, "_dspark", False)) else "not_requested",
             "module_storage": {"gpu_bytes": gpu_bytes, "host_bytes": host_bytes,
                                "host_pinned_bytes": sum(entry["storage_bytes"] for entry in entries if entry["pinned"]),
                                "by_kind": totals, "storages": entries},
@@ -525,6 +551,8 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
             "unattributed_components": {"graph_bytes": None, "workspace_bytes": None,
                                          "activation_bytes": None, "cuda_context_bytes": None},
             "placement_requirements": None,
+            "kv_policy": stage.kv_runtime_status() if hasattr(stage, "kv_runtime_status") else None,
+            "prefill_policy": stage.prefill_runtime_status() if hasattr(stage, "prefill_runtime_status") else None,
             "note": "Actual module storage and process allocator evidence, not an enabled hybrid loader or a calibrated placement profile"}
 
 
@@ -544,49 +572,54 @@ def measure_checkpoint(checkpoint_dir, lo, hi, *, head=False, tail=False, dspark
     v4_stage = _load_engine_module("v4_stage")
     args = v4_stage.config(str(Path(checkpoint_dir).resolve()))
     args.max_seq_len, args.max_batch_size = max_seq, 1
-    torch.set_default_device(device)
-    torch.set_default_dtype(torch.bfloat16)
-    torch.cuda.reset_peak_memory_stats(device)
-    stage = v4_stage.Stage(lo, hi, args, head=head, tail=tail, dspark=dspark, device=device, runtime_metrics=False)
-    stage.load(str(Path(checkpoint_dir).resolve()))
-    drafter = None
-    if dspark:
-        ring_drafter = _load_engine_module("v4_dspark_draft").ring_drafter
-        drafter = ring_drafter(stage, str(Path(checkpoint_dir).resolve()))
-    torch.cuda.synchronize(device)
-    load_stats = {"peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
-                  "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
-                  "after_load_allocated_bytes": torch.cuda.memory_allocated(device),
-                  "after_load_reserved_bytes": torch.cuda.memory_reserved(device)}
-    # One interval includes load and the real forwards, including lazy graph allocation.
-    with torch.inference_mode():
-        stage.reset()
-        if drafter is not None:
-            drafter.tail.reset()
-        predicted = None
-        for position, count in [(0, prefill_tokens)] + [(prefill_tokens + i, 1) for i in range(decode_tokens)]:
-            ids = predicted.reshape(1, 1) if predicted is not None else torch.arange(position, position + count, device=device).remainder(args.vocab_size).reshape(1, count)
-            hidden = stage.embed(ids) if stage.embed_tokens is not None else torch.zeros(1, count, args.hc_mult, args.dim, device=device, dtype=stage.dtype)
-            hidden = stage.forward(hidden, ids, position)
-            if not torch.isfinite(hidden).all().item():
-                raise ResourceError("calibration forward produced nonfinite hidden states")
-            if tail:
-                logits = stage.logits_all(hidden, full_logits=False)
-                if not torch.isfinite(logits).all().item():
-                    raise ResourceError("calibration forward produced nonfinite logits")
-                predicted = logits.argmax(dim=-1).reshape(1)
+    try:
+        from runtime_metrics import external_allocator_interval
+    except ImportError:
+        from shard.runtime_metrics import external_allocator_interval
+    with external_allocator_interval(device, torch_module=torch):
+        torch.set_default_device(device)
+        torch.set_default_dtype(torch.bfloat16)
+        torch.cuda.reset_peak_memory_stats(device)
+        stage = v4_stage.Stage(lo, hi, args, head=head, tail=tail, dspark=dspark, device=device)
+        stage.load(str(Path(checkpoint_dir).resolve()))
+        drafter = None
+        if dspark:
+            ring_drafter = _load_engine_module("v4_dspark_draft").ring_drafter
+            drafter = ring_drafter(stage, str(Path(checkpoint_dir).resolve()))
+        torch.cuda.synchronize(device)
+        load_stats = {"peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+                      "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+                      "after_load_allocated_bytes": torch.cuda.memory_allocated(device),
+                      "after_load_reserved_bytes": torch.cuda.memory_reserved(device)}
+        # One interval includes load and the real forwards, including lazy graph allocation.
+        with torch.inference_mode():
+            stage.reset()
             if drafter is not None:
-                tap = stage.tail_main_hidden()
-                if position == 0:
-                    drafter.tail.prefill(predicted, tap)
-                else:
-                    drafter.tail.advance_and_draft(predicted.reshape(1, 1), tap, position)
-    report = measure_stage_resources(stage, drafter, checkpoint_id=inventory["checkpoint_id"], peak_interval_started=True)
-    report.update(storage_inventory=stage_inventory, load_interval=load_stats,
-                  workload={"kind": "synthetic_resource_probe", "prefill_tokens": prefill_tokens,
-                            "decode_tokens": decode_tokens, "max_seq": max_seq, "batch": 1,
-                            "route_coverage": "sampled routes; not a throughput or cache-hit benchmark"})
-    return report
+                drafter.tail.reset()
+            predicted = None
+            for position, count in [(0, prefill_tokens)] + [(prefill_tokens + i, 1) for i in range(decode_tokens)]:
+                ids = predicted.reshape(1, 1) if predicted is not None else torch.arange(position, position + count, device=device).remainder(args.vocab_size).reshape(1, count)
+                hidden = stage.embed(ids) if stage.embed_tokens is not None else torch.zeros(1, count, args.hc_mult, args.dim, device=device, dtype=stage.dtype)
+                hidden = stage.forward(hidden, ids, position)
+                if not torch.isfinite(hidden).all().item():
+                    raise ResourceError("calibration forward produced nonfinite hidden states")
+                if tail:
+                    logits = stage.logits_all(hidden, full_logits=False)
+                    if not torch.isfinite(logits).all().item():
+                        raise ResourceError("calibration forward produced nonfinite logits")
+                    predicted = logits.argmax(dim=-1).reshape(1)
+                if drafter is not None:
+                    tap = stage.tail_main_hidden()
+                    if position == 0:
+                        drafter.tail.prefill(predicted, tap)
+                    else:
+                        drafter.tail.advance_and_draft(predicted.reshape(1, 1), tap, position)
+        report = measure_stage_resources(stage, drafter, checkpoint_id=inventory["checkpoint_id"], peak_interval_started=True)
+        report.update(storage_inventory=stage_inventory, load_interval=load_stats,
+                      workload={"kind": "synthetic_resource_probe", "prefill_tokens": prefill_tokens,
+                                "decode_tokens": decode_tokens, "max_seq": max_seq, "batch": 1,
+                                "route_coverage": "sampled routes; not a throughput or cache-hit benchmark"})
+        return report
 
 
 def main(argv=None):

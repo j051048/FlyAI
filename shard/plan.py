@@ -221,6 +221,10 @@ V4_ALL_RESIDENT_PROFILE = {
     "cap_layers": 8,                 # 32 GB GPU ceiling all-resident: max 8 layers
     "head_layer_ms_mult": 1.2,
     "placement": "gpu",
+    "prefill_bytes": 4096 * 4096 * 4 * 2.0,
+    "decode_bytes": 4096 * 4 * 2.0,  # one greedy/pipelined s=1 four-stream frame
+    "decode_steps": 256,
+    "prefill_chunks": 1,           # query chunks do not imply wire-prefill pipelining
 }
 
 V4_DUAL_RESOURCE_PROFILE = {
@@ -229,7 +233,7 @@ V4_DUAL_RESOURCE_PROFILE = {
     "layer_host_ram_mb": _V4_ROUTED_HOST_MB,  # 3264.0 MB pinned host RAM per layer
     "tail_host_reserve_mb": 3 * _V4_ROUTED_HOST_MB,  # MTP pools; charged once to the tail's RAM domain
     "kv_mb_per_layer": 150.0,
-    "layer_ms_base": 0.75,           # includes DMA overlap execution
+    "layer_ms_base": 0.75,           # fallback compute estimate; exposed DMA priced separately
     "reserve_mb": 2048.0,
     "head_reserve_mb": 3500.0,
     "tail_reserve_mb": 5500.0,
@@ -239,6 +243,10 @@ V4_DUAL_RESOURCE_PROFILE = {
     "expert_slot_bytes": _V4_EXPERT_BYTES,
     "expert_count_per_layer": _V4_EXPERTS_PER_LAYER,
     "default_expert_cache_slots": 32,
+    "prefill_bytes": 4096 * 4096 * 4 * 2.0,
+    "decode_bytes": 4096 * 4 * 2.0,
+    "decode_steps": 256,
+    "prefill_chunks": 1,
 }
 
 PROFILES = {
@@ -292,7 +300,46 @@ def density_cap_layers(cap_layers, total_vram_mb):
     return max(0, int(round(int(cap_layers) * float(total_vram_mb) / _PROVEN_CAP_VRAM_MB)))
 
 
-def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=None):
+def ram_dma_overhead_ms(node, model):
+    """Decode transfer cost in milliseconds; h2d_gbps is decimal GB/s.
+
+    A measured full layer already includes its cache misses. Only an unmeasured
+    layer needs a transfer estimate; optional observed exposed wait takes priority
+    over the fallback miss count / overlap fraction.
+    """
+    if node.get("layer_ms") is not None:
+        return 0.0
+    def number(value):
+        if isinstance(value, bool):
+            raise ValueError("RAM transfer calibration must be numeric, not boolean")
+        try:
+            return float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("RAM transfer calibration must be numeric") from error
+    def calibration(name, default):
+        value = node.get(name)
+        if value is None:
+            value = model.get(name)
+        return number(default if value is None else value)
+    measured = node.get("dma_exposed_ms_per_layer")
+    if measured is not None:
+        value = number(measured)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("measured DMA exposure must be finite nonnegative milliseconds")
+        return value
+    bandwidth = calibration("h2d_gbps", 20.0)
+    misses = calibration("expert_misses_per_layer", 1.8)
+    overlap = calibration("dma_overlap_fraction", .7)
+    size = number(model.get("expert_slot_bytes", 13369344))
+    if not all(math.isfinite(v) for v in (bandwidth, misses, overlap, size)) or \
+            bandwidth <= 0 or misses < 0 or size <= 0 or not 0 <= overlap <= 1:
+        raise ValueError("invalid RAM transfer calibration (GB/s, misses, overlap, expert bytes)")
+    # Bytes / bytes-per-second: multiplying by eight here would price GB/s as Gb/s.
+    return misses * size / (bandwidth * 1e9) * 1000.0 * (1.0 - overlap)
+
+
+def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=None,
+                    head_choice=None, joint_roles=False, objective="serial", cost_model=None):
     """Place a deployable sharded ring from announced capabilities + a measured RTT mesh.
 
     nodes: [{"id": <hashable>, "free_vram_mb": float, "subnet": str,
@@ -346,7 +393,13 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=Non
             or model.get("calibration_status") in {"structural", "unmeasured"}):
         raise ValueError("structural/resource evidence is not a calibrated scalar GPU placement profile; "
                          "the memory-aware planner has not been enabled")
-    m = {**M25_PROFILE, **(model or {})}
+    # A supplied profile is its own model; never inherit another model's wire
+    # geometry or boundary reserves. Partial generic callers retain neutral defaults.
+    generic = dict(kv_mb_per_layer=0.0, layer_ms_base=1.0, reserve_mb=0.0,
+                   head_reserve_mb=0.0, tail_reserve_mb=0.0, head_layer_ms_mult=1.0,
+                   prefill_bytes=0.0, decode_bytes=0.0, decode_steps=1, prefill_chunks=1)
+    m = dict(M25_PROFILE) if model is None else {**generic, **model}
+    m.setdefault("cap_layers", m["n_layers"])
     isolation = m.get("isolation", "none") if isolation is None else isolation
     if isolation not in ("none", "subnet", "host", "adjacent_host"):
         raise ValueError("isolation must be none, subnet, host or adjacent_host")
@@ -390,7 +443,10 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=Non
                 if pinnable_ram is None or free_ram is None:
                     # Fail-closed: unmeasured pinnable memory cannot host pinned expert pool
                     return 0
-                avail_ram = min(float(free_ram), float(pinnable_ram))
+                budgets = (float(free_ram), float(pinnable_ram))
+                if not all(math.isfinite(v) and v >= 0 for v in budgets):
+                    raise ValueError("RAM and pinned-memory budgets must be finite nonnegative MiB")
+                avail_ram = min(budgets)
             else:
                 avail_ram = pinnable_ram if pinnable_ram is not None else free_ram
             if avail_ram is not None:
@@ -398,12 +454,17 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=Non
                 return min(vram_cap, ram_cap)
         return vram_cap
 
-    free = {i: min(max(nodes[i]["free_vram_mb"] - float(m["reserve_mb"])
+    raw_free = {i: max(nodes[i]["free_vram_mb"] - float(m["reserve_mb"])
                        - float(nodes[i].get("load_peak_extra_mb")
-                               or m.get("load_peak_extra_mb") or 0.0), 0.0),
-                   _node_cap(i) * per_layer[i])
-            for i in range(n)}
+                               or m.get("load_peak_extra_mb") or 0.0), 0.0) for i in range(n)}
+    node_caps = {i: _node_cap(i) for i in range(n)}
+    free = (dict(raw_free) if joint_roles else
+            {i: min(raw_free[i], node_caps[i] * per_layer[i]) for i in range(n)})
     cap_ok = [i for i in range(n) if free[i] >= per_layer[i]]
+    if isolation == "subnet":
+        cap_ok = [i for i in cap_ok if nodes[i].get("subnet") not in (None, "")]
+    elif isolation in ("host", "adjacent_host"):
+        cap_ok = [i for i in cap_ok if host_map[i] is not None]
     if not cap_ok:
         return None                                          # no node can hold even one layer
 
@@ -458,7 +519,12 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=Non
     head_pool = [i for i in head_pool if _connected_cap(i) >= int(m["n_layers"])]
     if not head_pool:
         return None                              # no candidate head can REACH enough capacity to serve
-    head = min(head_pool, key=centrality)
+    if head_choice is not None:
+        if head_choice not in head_pool:
+            return None
+        head = head_choice
+    else:
+        head = min(head_pool, key=centrality)
     free[head] = max(free[head] - float(m["head_reserve_mb"]), 0.0)
 
     # 3) launch-bound per-layer time: base * the node's cpu_factor; the head pays a coordinator
@@ -468,15 +534,12 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=Non
     layer_ms = {i: (float(nodes[i]["layer_ms"]) if nodes[i].get("layer_ms") is not None
                     else float(m["layer_ms_base"]) * float(nodes[i].get("cpu_factor", 1.0)))
                 for i in range(n)}
+    if any(not math.isfinite(value) or value < 0 for value in layer_ms.values()):
+        raise ValueError("layer timings must be finite nonnegative milliseconds")
     layer_ms[head] *= float(m["head_layer_ms_mult"])
     if m.get("placement") == "ram":
         for i in range(n):
-            h2d_gbps = float(nodes[i].get("h2d_gbps", 20.0))
-            if h2d_gbps > 0:
-                slot_bytes = float(m.get("expert_slot_bytes", 13369344))
-                # ~1.8 expected misses per step; 30% of transfer exposed outside shared expert overlap
-                dma_overhead_ms = (1.8 * slot_bytes * 8.0) / (h2d_gbps * 1e9) * 1000.0 * 0.3
-                layer_ms[i] += dma_overhead_ms
+            layer_ms[i] += ram_dma_overhead_ms(nodes[i], m)
 
     # 4) coordinator entry/return hops are measured relative to the chosen head.
     c_out = [rtt[head][i] if i != head else 1.0 for i in range(n)]
@@ -489,6 +552,9 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=Non
     extra = {"isolation": isolation, "host_id": host_map, "device_id": devices,
              "host_layer_caps": host_caps, "host_memory_domain": memory_map,
              "tail_host_layer_caps": tail_host_caps}
+    if joint_roles:
+        extra.update(node_layer_caps=node_caps, tail_reserve_mb=float(m["tail_reserve_mb"]),
+                     objective=objective, cost_model=cost_model)
     if aware:
         extra.update({"up_mbps": {i: float(ups[i]) for i in range(n)},
                  "prefill_bytes": float(m.get("prefill_bytes", 0.0)),
@@ -534,7 +600,7 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=Non
             return None
         tail_i = spec["order"][-1]
         lo, hi = spec["blocks"][tail_i]
-        if tail_reserve == 0.0 or base_free[tail_i] >= (hi - lo) * per_layer[tail_i] + tail_reserve:
+        if joint_roles or tail_reserve == 0.0 or base_free[tail_i] >= (hi - lo) * per_layer[tail_i] + tail_reserve:
             break                                # the landed tail fits block + reserve in its budget
         if tail_i in docked:
             return None                          # reserve already modeled and it STILL can't fit
@@ -568,6 +634,9 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=Non
         st = {"id": ids[i], "index": k, "lo": lo, "hi": hi,
               "head": k == 0, "tail": k == last, "layers": hi - lo}
         if m.get("placement") == "ram":
+            st["layer_ms"] = layer_ms[i]
+            st["latency_source"] = ("measured_layer" if nodes[i].get("layer_ms") is not None else
+                "measured_dma" if nodes[i].get("dma_exposed_ms_per_layer") is not None else "estimated_dma")
             st["placement"] = "ram"
             st["expert_cache_slots"] = int(m.get("default_expert_cache_slots", 32))
             st["host_pinned_mb"] = (hi - lo) * float(m.get("layer_host_ram_mb", 0.0))

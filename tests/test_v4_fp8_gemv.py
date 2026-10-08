@@ -23,6 +23,7 @@ Run: python3 -m pytest tests/test_v4_fp8_gemv.py -q
 """
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -307,6 +308,145 @@ def test_stage_layout_walks_moes_by_duck_type(shared_on, monkeypatch):
     assert FG.shared_bank_layout(m) == 0, "already banked: nothing to do"
 
 
+def test_drafter_shared_default_off_does_not_read_or_bind_instances(monkeypatch):
+    monkeypatch.setattr(FG, "V4_FP8_SHARED", False)
+    assert FG.install_drafter_shared(SimpleNamespace(mtp=[object()])) == 0
+
+
+def _instance_shared_setup(mod, monkeypatch):
+    monkeypatch.setattr(FG, "V4_FP8_SHARED", True)
+    original = FG._REF_EXPERT_FORWARD if getattr(mod.Expert.forward, "_v4_fp8_shared", False) else mod.Expert.forward
+    monkeypatch.setattr(FG, "_REF_EXPERT_FORWARD", original)
+    oracle = FG._REF_FP8_GEMM if getattr(mod.fp8_gemm, "_v4_fp8_gemv", False) else mod.fp8_gemm
+    monkeypatch.setattr(FG, "_REF_FP8_GEMM", oracle)
+    monkeypatch.setattr(FG, "_MOD", mod)
+    return original
+
+
+def test_mtp_shared_is_instance_bound_idempotent_and_preserves_routed_forward(ref_mod, monkeypatch):
+    _instance_shared_setup(ref_mod, monkeypatch)
+    class_forward = ref_mod.Expert.forward
+    class_moe_forward = ref_mod.MoE.forward
+    shared = _fp8_expert(ref_mod, seed=11)
+    routed = _fp8_expert(ref_mod, seed=12)
+    router_sentinel = lambda *_: None
+    moe = SimpleNamespace(shared_experts=shared, experts=[routed], forward=router_sentinel)
+    tail = SimpleNamespace(mtp=[SimpleNamespace(layer_id=43, ffn=moe)])
+    routed_pointers = [getattr(routed, name).weight.data_ptr() for name in ("w1", "w2", "w3")]
+    assert FG.install_drafter_shared(tail, mod=ref_mod) == 1
+    bank = shared._v4_w13
+    assert FG.install_drafter_shared(tail, mod=ref_mod) == 1
+    assert shared._v4_w13 is bank
+    assert shared.forward.__func__ is FG._shared_forward
+    assert "forward" not in routed.__dict__ and not hasattr(routed, "_v4_w13")
+    assert ref_mod.Expert.forward is class_forward and ref_mod.MoE.forward is class_moe_forward
+    assert moe.forward is router_sentinel
+    assert [getattr(routed, name).weight.data_ptr() for name in ("w1", "w2", "w3")] == routed_pointers
+    detail = FG.drafter_shared_coverage(tail)[43]
+    assert detail == dict(banked=True, instance_bound=True, steps=0, cuda_steps=0, declined={})
+
+
+def test_mtp_shared_uses_live_unpatched_oracles_after_a_standalone_probe(ref_mod, monkeypatch):
+    reference = FG._REF_EXPERT_FORWARD if getattr(ref_mod.Expert.forward, "_v4_fp8_shared", False) else ref_mod.Expert.forward
+    monkeypatch.setattr(ref_mod.Expert, "forward", reference)
+    monkeypatch.setattr(FG, "V4_FP8_SHARED", True)
+    monkeypatch.setattr(FG, "_MOD", None)
+    monkeypatch.setattr(FG, "_REF_FP8_GEMM", lambda *_: None)
+    monkeypatch.setattr(FG, "_REF_EXPERT_FORWARD", lambda *_: None)
+    shared = _fp8_expert(ref_mod, seed=44)
+    tail = SimpleNamespace(mtp=[SimpleNamespace(layer_id=43, ffn=SimpleNamespace(shared_experts=shared))])
+    assert FG.install_drafter_shared(tail, mod=ref_mod) == 1
+    assert FG._REF_FP8_GEMM is ref_mod.fp8_gemm and FG._REF_EXPERT_FORWARD is reference
+    x = torch.randn(8, 256, dtype=torch.bfloat16)
+    with torch.no_grad():
+        assert torch.equal(reference(shared, x), shared(x))
+
+
+@pytest.mark.parametrize("rows", [1, 8, 32, 33])
+def test_mtp_shared_instance_forward_is_exact_and_visible_at_production_width(ref_mod, monkeypatch, rows):
+    reference = _instance_shared_setup(ref_mod, monkeypatch)
+    original = _fp8_expert(ref_mod, seed=13)
+    optimized = _fp8_expert(ref_mod, seed=13)
+    tail = SimpleNamespace(mtp=[SimpleNamespace(layer_id=43, ffn=SimpleNamespace(shared_experts=optimized))])
+    assert FG.install_drafter_shared(tail, mod=ref_mod) == 1
+    x = torch.randn(rows, 256, dtype=torch.bfloat16) * 0.5
+    with torch.no_grad():
+        assert torch.equal(reference(original, x), optimized(x))
+    detail = FG.drafter_shared_coverage(tail)[43]
+    assert detail["cuda_steps"] == 0
+    assert detail["steps"] == (1 if rows <= 32 else 0)
+    assert detail["declined"] == ({} if rows <= 32 else {"m>32": 1})
+
+
+def test_shared_mtp_checkpoint_load_writes_through_bank_and_keeps_scale_aliases(ref_mod, monkeypatch):
+    reference = _instance_shared_setup(ref_mod, monkeypatch)
+    source = _fp8_expert(ref_mod, seed=21)
+    optimized = _fp8_expert(ref_mod, seed=22)
+    before_keys = set(optimized.state_dict())
+    tail = SimpleNamespace(mtp=[SimpleNamespace(layer_id=43, ffn=SimpleNamespace(shared_experts=optimized))])
+    assert FG.install_drafter_shared(tail, mod=ref_mod) == 1
+    pointers = tuple(t.data_ptr() for t in optimized._v4_w13)
+    optimized.load_state_dict(source.state_dict(), strict=True)
+    assert set(optimized.state_dict()) == before_keys
+    assert tuple(t.data_ptr() for t in optimized._v4_w13) == pointers
+    assert optimized.w1.weight.scale is optimized.w1.scale
+    assert optimized.w3.weight.scale is optimized.w3.scale
+    x = torch.randn(8, 256, dtype=torch.bfloat16)
+    with torch.no_grad():
+        assert torch.equal(reference(source, x), optimized(x))
+
+
+def test_ram_mtp_shared_layout_leaves_canonical_routed_pool_and_hybrid_dispatch_untouched(ref_mod, monkeypatch):
+    from v4_expert_cache import HostExpertPool
+    _instance_shared_setup(ref_mod, monkeypatch)
+    args = ref_mod.ModelArgs(dim=256, moe_inter_dim=128, n_routed_experts=8,
+                            n_activated_experts=6, n_shared_experts=1, n_hash_layers=0,
+                            expert_dtype="fp4", dtype="bf16", vocab_size=64)
+    with ref_mod.set_dtype(torch.bfloat16):
+        moe = ref_mod.MoE(43, args)
+    moe.shared_experts = _fp8_expert(ref_mod, seed=30)
+    pool = HostExpertPool.from_moe(moe, pin=False, emulation=True)
+    pointers = {name: bank.data_ptr() for name, bank in pool.banks.items() if bank is not None}
+    hybrid_forward = lambda *_: None
+    moe.forward = hybrid_forward
+    tail = SimpleNamespace(mtp=[SimpleNamespace(layer_id=43, ffn=moe)])
+    assert FG.install_drafter_shared(tail, mod=ref_mod) == 1
+    assert moe.forward is hybrid_forward
+    assert not getattr(moe, "_grouped_bank", None)
+    assert {name: bank.data_ptr() for name, bank in pool.banks.items() if bank is not None} == pointers
+    assert all(parameter.device.type == "cpu" for expert in moe.experts for parameter in expert.parameters())
+    assert not pool.loaded, "shared layout must not claim that routed host weights loaded"
+
+
+def test_shared_layout_refuses_meta_missing_and_malformed_scales(ref_mod):
+    for problem in ("meta", "missing", "shape"):
+        expert = _fp8_expert(ref_mod)
+        if problem == "meta":
+            expert.w1.weight = torch.nn.Parameter(torch.empty(128, 256, dtype=torch.float8_e4m3fn, device="meta"))
+        elif problem == "missing":
+            expert.w1.scale = None
+        else:
+            expert.w1.scale.data = torch.ones(2, 2, dtype=expert.w1.scale.dtype)
+        assert not FG._lay_shared(expert)
+        assert not hasattr(expert, "_v4_w13")
+
+
+def test_drafter_constructor_layout_seam_runs_before_any_checkpoint_load(ref_mod, monkeypatch):
+    import v4_ref_cpu
+    import v4_stage
+    import v4_dspark_draft
+    args = v4_ref_cpu.cpu_args(n_mtp_layers=3, compress_ratios=(0, 0, 4, 8, 4, 8, 4, 0, 0, 0, 0))
+    stage = v4_stage.Stage(0, args.n_layers, args, head=True, tail=True, dspark=True, device="cpu")
+    observed = []
+    def install(tail, mod=None):
+        observed.append((tail, mod, len(tail.mtp)))
+        return 0
+    monkeypatch.setattr(FG, "install_drafter_shared", install)
+    tail = v4_dspark_draft.DSparkTail(stage)
+    assert observed == [(tail, ref_mod, 3)]
+    assert tail._shared_banked == 0
+
+
 # ── install / registration ───────────────────────────────────────────────────────────────────────
 
 def test_install_is_idempotent_and_captures_the_reference_once(monkeypatch):
@@ -411,3 +551,30 @@ def test_hw_the_fused_shared_launch_is_bit_exact_at_real_dims():
         FG._REF_FP8_GEMM = mod.fp8_gemm
     ok, why = FG._probe_shared(4096, 4096, "float8_e8m0fnu")
     assert ok, why
+
+
+@pytest.mark.hardware
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("rows", [8, 32])
+def test_hw_mtp_shared_instance_fusion_fires_and_matches_reference(rows, monkeypatch):
+    import v4_moe_grouped
+    mod = v4_moe_grouped._load_model_module()
+    monkeypatch.setattr(mod, "scale_dtype", torch.float8_e8m0fnu)
+    monkeypatch.setattr(mod, "scale_fmt", "ue8m0")
+    reference = _instance_shared_setup(mod, monkeypatch)
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            original = _fp8_expert(mod, dim=4096, inter=2048, seed=43)
+            optimized = _fp8_expert(mod, dim=4096, inter=2048, seed=43)
+            x = torch.randn(rows, 4096, dtype=torch.bfloat16) * 0.5
+        tail = SimpleNamespace(mtp=[SimpleNamespace(layer_id=43, ffn=SimpleNamespace(shared_experts=optimized))])
+        assert FG.install_drafter_shared(tail, mod=mod) == 1
+        with torch.no_grad():
+            want, got = reference(original, x), optimized(x)
+        assert torch.equal(want, got)
+        detail = FG.drafter_shared_coverage(tail)[43]
+        assert detail["cuda_steps"] == 1 and detail["declined"] == {}
+    finally:
+        torch.set_default_dtype(previous_dtype)

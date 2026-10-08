@@ -246,6 +246,56 @@ def build_oracle(args=None, seed=0):
     return init_random(model, seed).eval()
 
 
+def init_fingerprint_fixture(model, args):
+    """Depth-scale the random CPU selftest's main residual output projections.
+
+    Call exactly once after build_oracle and BEFORE writing its tiny checkpoint
+    or decoding its reference stream. This is explicit synthetic initialization,
+    not an inference optimization, a seed search or a change to the reference.
+    Ordinary build_oracle and real checkpoint loading do not call it.
+
+    The generic N(0,.02) initializer gives every layer the same output variance:
+    at the toy dimensions even the first random attention branch is larger than
+    the token embedding. Eight such branches can turn the greedy continuation
+    into a constant, making dropped-frame tests unable to discriminate. Scaling
+    Attention.wo_b and each routed/shared Expert.w2 by sqrt(2*main_depth) keeps
+    the aggregate random residual contribution controlled as depth increases.
+    All norms, routing, embeddings, head, Compressor parameters/state and MTP
+    weights retain their original seeded bytes. No random draws are consumed.
+
+    This helper deliberately accepts only the CPU, unquantized random-fixture
+    path. It must never rescale trained checkpoint weights.
+    """
+    import math
+    depth = args.n_layers
+    if type(depth) is not int or depth < 1 or len(model.layers) != depth:
+        raise ValueError("fingerprint fixture needs a positive matching main layer depth")
+    if args.dtype != "bf16" or args.expert_dtype is not None:
+        raise ValueError("fingerprint initialization requires unquantized CPU fixture weights")
+    if any(parameter.device.type != "cpu" for parameter in model.parameters()):
+        raise ValueError("fingerprint initialization is only for the synthetic CPU selftest")
+    if getattr(model, "_fingerprint_fixture_init", None) is not None:
+        raise ValueError("fingerprint fixture was already initialized; do not scale it twice")
+    weights, seen = [], set()
+    for layer in model.layers:
+        outputs = [layer.attn.wo_b.weight, layer.ffn.shared_experts.w2.weight]
+        outputs.extend(expert.w2.weight for expert in layer.ffn.experts)
+        for weight in outputs:
+            if id(weight) in seen:
+                continue
+            if weight.dtype not in (torch.bfloat16, torch.float32) or not torch.isfinite(weight).all():
+                raise ValueError("fingerprint output projections must be finite unquantized fixture tensors")
+            seen.add(id(weight))
+            weights.append(weight)
+    divisor = math.sqrt(2 * depth)
+    with torch.no_grad():
+        for weight in weights:
+            weight.div_(divisor)
+    model._fingerprint_fixture_init = {"rule": "main_residual_depth", "main_layers": depth,
+                                       "divisor": divisor}
+    return model
+
+
 def _smoke():
     """model.py's own __main__, on CPU and at cpu_args() scale."""
     args = cpu_args()

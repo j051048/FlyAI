@@ -18,13 +18,15 @@ the drains but explicitly not the launch count — its header says so).
 WHY THE s == 1 GROUPED KERNEL COULD NOT SIMPLY CLAIM s > 1, and what this does instead. The M2.5
 finding stands: grouped-AND-PADDED MoE is not token-count invariant — padding an expert's group to a
 common M reassociates its K-reduction and moves bits. But the drafter's shape does not need padding.
-A block routes T x k = `dspark_block_size * n_activated_experts` = 30 (row, expert) PAIRS at the
+A block routes T x k = `dspark_block_size * n_activated_experts` (row, expert) PAIRS at the
 shipped config, and `v4_moe_grouped`'s kernel is not a padded-group kernel at all: its grid is one
 block per (N-tile, slot), each slot g computing C[g] = A[g] @ W[g] as an INDEPENDENT single-row
 GEMV — the A tile is shared, only row g is stored, and no output element ever reduces across rows.
 So the pairs go in AS the slots: A holds the pair's quantized activation row, W holds the pair's
-gathered expert, one launch fills every pair of a matrix kind, and 30 <= block_M = 32 means the
-shipped shape fits the existing kernel with zero kernel changes. RENT-NOT-REWRITE: the kernel, the
+gathered expert. The trained width 5 routes 30 pairs and fits one launch. Width 8 routes 48 pairs:
+bounded, consecutive chunks of at most block_M=32 fill those pairs with two launches per matrix
+kind, then concatenate in the original row-major pair order. This never changes block_M/K or the
+per-output reduction chain. RENT-NOT-REWRITE: the kernel, the
 bank layout, and the fp4 gather are all `v4_moe_grouped`'s, called, not copied.
 
 THE DISPATCH, per drafter MoE — compare `v4_moe_grouped.grouped_forward`, which is this at T == 1:
@@ -134,21 +136,39 @@ def _take_rows(t, idx):
     return u[idx].view(t.dtype).view(len(idx), *t.shape[1:])
 
 
+def _grouped_pair_chunks(a, scales, flat, weights, weight_scales, scale_dtype):
+    """Independent pair GEMVs in bounded native tiles, retaining row-major output order.
+
+    Splitting the leading pair axis does not split any K reduction. A token's
+    six pairs may span a chunk boundary; concatenation puts them back before the
+    existing per-token ascending-expert fold. No padding or host tensor readback.
+    """
+    G = _grouped()
+    count = flat.numel()
+    if count <= 0 or a.size(0) != count or scales.size(0) != count:
+        raise ValueError("pair GEMM requires matching nonempty activation/scale/expert rows")
+    parts = []
+    for lo in range(0, count, G._BLOCK_M):
+        hi = min(lo + G._BLOCK_M, count)
+        ids = flat[lo:hi]
+        parts.append(G.grouped_fp4_gemm(a[lo:hi], scales[lo:hi],
+                                      G._gather_fp(weights, ids), G._gather_fp(weight_scales, ids),
+                                      scale_dtype))
+    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+
+
 def _pair_gemms_cuda(xq, xs, flat, bank, scale_dtype):
-    """CUDA: both matrix kinds as one grouped launch each, every pair an independent slot.
+    """CUDA: each matrix kind in ceil(pairs/32) bounded grouped launches.
 
     The gathers are `v4_moe_grouped._gather_fp` (device-side, no host sync) and the kernel is its
     `grouped_fp4_gemm` — slot g stores C[g] = A[g] @ W[g], which for slot = (row, expert) pair is
     exactly the reference's per-expert GEMM row (module docstring: ROW-INVARIANCE)."""
-    G = _grouped()
     rows = _row_of_pair(xq.size(0), flat.numel() // xq.size(0), xq.device)
     a, s = _take_rows(xq, rows), _take_rows(xs, rows)
-    both = G.grouped_fp4_gemm(a, s, G._gather_fp(bank["w13"], flat),
-                              G._gather_fp(bank["w13_s"], flat), scale_dtype)
+    both = _grouped_pair_chunks(a, s, flat, bank["w13"], bank["w13_s"], scale_dtype)
 
     def w2(hq, hs):
-        return G.grouped_fp4_gemm(hq, hs, G._gather_fp(bank["w2"], flat),
-                                  G._gather_fp(bank["w2_s"], flat), scale_dtype)
+        return _grouped_pair_chunks(hq, hs, flat, bank["w2"], bank["w2_s"], scale_dtype)
     return both, w2
 
 
@@ -221,8 +241,6 @@ def draft_forward(self, x, input_ids):
         return _decline(self, "world_size>1", x, input_ids)
     if self.gate.hash:
         return _decline(self, "hash-routed", x, input_ids)
-    if T * k > _grouped()._BLOCK_M:
-        return _decline(self, "pairs>block_M", x, input_ids)
     bank = getattr(self, "_grouped_bank", None)
     if not bank:
         # no bank, no lazy stack: the tail is the wrong box to duplicate 3.2 GiB on (module doc)
@@ -273,6 +291,16 @@ def draft_forward(self, x, input_ids):
         y += outT[:, j]
     y += self.shared_experts(xv)
     self._draft_steps = getattr(self, "_draft_steps", 0) + 1
+    pairs = T * k
+    self._draft_pairs = getattr(self, "_draft_pairs", 0) + pairs
+    widths = getattr(self, "_draft_pair_widths", None)
+    if widths is None:
+        widths = self._draft_pair_widths = {}
+    widths[pairs] = widths.get(pairs, 0) + 1
+    if xv.is_cuda:
+        chunks = (pairs + _grouped()._BLOCK_M - 1) // _grouped()._BLOCK_M
+        self._draft_cuda_chunks = getattr(self, "_draft_cuda_chunks", 0) + chunks
+        self._draft_cuda_grouped_gemms = getattr(self, "_draft_cuda_grouped_gemms", 0) + 2 * chunks
     return y.type_as(xv).view(shape)
 
 
@@ -320,9 +348,26 @@ def coverage(dstail):
     return out
 
 
+def coverage_details(dstail):
+    """Shape-aware observations; CPU reference execution never counts CUDA launches.
+
+    Retains coverage()'s legacy tuple API. Counts describe forwards actually
+    executed, not merely an installed flag or bank; captured graph replays do
+    not rerun Python counters.
+    """
+    return {blk.ffn.layer_id: {
+        "steps": getattr(blk.ffn, "_draft_steps", 0),
+        "pairs": getattr(blk.ffn, "_draft_pairs", 0),
+        "pair_widths": dict(getattr(blk.ffn, "_draft_pair_widths", {})),
+        "cuda_chunks_per_matrix": getattr(blk.ffn, "_draft_cuda_chunks", 0),
+        "cuda_grouped_gemms": getattr(blk.ffn, "_draft_cuda_grouped_gemms", 0),
+        "declined": dict(getattr(blk.ffn, "_draft_declined", {})),
+    } for blk in dstail.mtp}
+
+
 # ── the fp4 toy harness (tests + research/v4_profile_draft.py) ───────────────────────────────────
 
-def swap_in_fp4_moes(dstail, moe_inter_dim=128, seed=0):
+def swap_in_fp4_moes(dstail, moe_inter_dim=128, seed=0, shared_fp8=False):
     """Give a CPU-toy DSparkTail REAL fp4 routed experts, so the pair path has something to claim.
 
     The bf16 toy harness (v4_ref_cpu.cpu_args) keeps experts unquantized, which the lever rightly
@@ -330,7 +375,8 @@ def swap_in_fp4_moes(dstail, moe_inter_dim=128, seed=0):
     for one with valid packed-fp4 + e8m0 weights (through the reference's own `fp4_act_quant`,
     the v4_moe_grouped harness's approach) at the drafter's own dim/topk/expert count, banks it
     with `preserve=True` (the weights are real and must survive), and leaves the gate score-routed.
-    The shared expert stays bf16 — both paths call it identically, so it proves nothing quantized."""
+    The shared expert stays bf16 by default. shared_fp8=True builds valid fp8/scale
+    weights for the combined MTP shared-fusion parity harness, with no class rebind."""
     from kernel import fp4_act_quant
     import v4_stage
     mod = v4_stage.ref()
@@ -344,7 +390,13 @@ def swap_in_fp4_moes(dstail, moe_inter_dim=128, seed=0):
     g = torch.Generator().manual_seed(seed)
     for bi, blk in enumerate(dstail.mtp):
         with mod.set_dtype(torch.bfloat16):
-            moe = mod.MoE(blk.layer_id, a)
+            previous = mod.default_dtype
+            try:
+                if shared_fp8:
+                    mod.default_dtype = torch.float8_e4m3fn
+                moe = mod.MoE(blk.layer_id, a)
+            finally:
+                mod.default_dtype = previous
         with torch.no_grad():
             for i in range(a.n_routed_experts):
                 e = moe.experts[i]
@@ -356,7 +408,13 @@ def swap_in_fp4_moes(dstail, moe_inter_dim=128, seed=0):
                     lin.weight.data.copy_(w)
                     lin.scale.data.copy_(s)
             for lin in (moe.shared_experts.w1, moe.shared_experts.w2, moe.shared_experts.w3):
-                lin.weight.data.normal_(0, 0.02, generator=g)
+                if shared_fp8:
+                    value = torch.randn(lin.weight.shape, generator=g, dtype=torch.bfloat16) * 0.02
+                    weight, scale = _grouped()._fp8_block_quant(value)
+                    lin.weight.data.copy_(weight)
+                    lin.scale.data.copy_(scale)
+                else:
+                    lin.weight.data.normal_(0, 0.02, generator=g)
             moe.gate.weight.data.normal_(0, 0.02, generator=g)
             moe.gate.bias.data.normal_(0, 0.02, generator=g)
         # Bank HERE, preserve=True — the weights just written are real and must survive. This is

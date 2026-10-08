@@ -93,14 +93,16 @@ def test_generate_report_and_markdown_summary():
     harness = V4AcceptanceHarness(rtt_ms=10.0, h2d_gbps=20.0)
     report = harness.generate_report()
 
-    assert report["overall_status"] == "ACCEPTANCE_PASSED"
+    assert report["overall_status"] == "SIMULATION_TARGETS_MET"
+    assert report["hardware_verified"] is False and report["speed_pass"] is False
     assert "wan_hop_advantage" in report
     adv = report["wan_hop_advantage"]
     assert adv["4_node_vs_6_node_wan_ms_saved"] > 0
     assert adv["net_step_latency_advantage_ms"] > 0
 
     summary_md = harness.render_markdown_summary(report)
-    assert "# DeepSeek-V4 Phase 1 Hardware Acceptance Report" in summary_md
+    assert "# DeepSeek-V4 Placement and Cache Simulation" in summary_md
+    assert "Hardware acceptance is pending" in summary_md
     assert "4-Node vs 6-Node WAN Hop Advantage" in summary_md
     assert "speculative_rollback" in summary_md
 
@@ -109,5 +111,6 @@ def test_cli_acceptance_tool_roundtrip():
     cmd = [sys.executable, "-m", "phase0.v4_acceptance", "--rtt-ms", "10.0", "--json"]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     payload = json.loads(proc.stdout)
-    assert payload["overall_status"] == "ACCEPTANCE_PASSED"
+    assert payload["overall_status"] == "SIMULATION_TARGETS_MET"
+    assert payload["hardware_verified"] is False and payload["speed_pass"] is False
     assert len(payload["stress_scenarios"]) == 5

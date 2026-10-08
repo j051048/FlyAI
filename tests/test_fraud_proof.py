@@ -30,6 +30,8 @@ from phase0.proof_receipt import build, verify
 from shard.plan import plan_ring
 from shard.topology import select_ring, _is_adjacent_same_host
 
+ENGINE_HASH = hashlib.sha256(b"tested-local-engine").hexdigest()
+
 
 # ---------------------------------------------------------------------------
 # Stage 1: Activation commitments & receipt verification
@@ -48,8 +50,8 @@ def test_activation_commitment_chain_and_receipt_verify(tmp_path):
 
     # 2. Stage tracker & hash chain
     tracker0 = StageCommitmentTracker(stage_idx=0)
-    comm0 = tracker0.record_step(step=0, in_hash="in0_hash", out_hash="out0_hash")
-    comm1 = tracker0.record_step(step=1, in_hash="in1_hash", out_hash="out1_hash")
+    comm0 = tracker0.record_step(step=0, in_hash=h1, out_hash=h2)
+    comm1 = tracker0.record_step(step=1, in_hash=h2, out_hash=h1)
     assert comm0 != comm1
     records0 = tracker0.history()
     assert len(records0) == 2
@@ -61,14 +63,14 @@ def test_activation_commitment_chain_and_receipt_verify(tmp_path):
 
     # Corrupted chain detection
     corrupted_records = copy.deepcopy(records0)
-    corrupted_records[1]["out_hash"] = "tampered_hash"
+    corrupted_records[1]["out_hash"] = hash_activation(b"tampered")
     ok_bad, err_bad = verify_commitment_chain(corrupted_records)
     assert ok_bad is False
     assert "computed" in err_bad
 
     # 3. Receipt envelope binding
     tracker1 = StageCommitmentTracker(stage_idx=1)
-    tracker1.record_step(step=0, in_hash="out0_hash", out_hash="final_hash")
+    tracker1.record_step(step=0, in_hash=h2, out_hash=h1)
     records1 = tracker1.history()
 
     stage_commitments = [
@@ -165,6 +167,7 @@ def test_fraud_proof_catches_cheating_node_and_slashes():
         declared_in_hash=in_hash,
         declared_out_hash=fake_out_hash,
         defender_arch="sm120",
+        engine_sha256=ENGINE_HASH,
     )
 
     # Defender submits disputed raw snapshot
@@ -180,6 +183,7 @@ def test_fraud_proof_catches_cheating_node_and_slashes():
         challenge,
         replay_stage_fn=replay_stage,
         validator_arch="sm120",
+        validator_engine_sha256=ENGINE_HASH,
     )
 
     assert verdict["verdict"] == "SLASH_DEFENDER"
@@ -190,7 +194,8 @@ def test_fraud_proof_catches_cheating_node_and_slashes():
 
 
 def test_fraud_proof_catches_unsubmitted_snapshot():
-    """Test that a defender who abandons the dispute without snapshot is slashed immediately."""
+    """A local timeout recommendation requires the challenge window to expire."""
+    in_hash, out_hash = hash_activation([1]), hash_activation([2])
     challenge = create_challenge(
         challenge_id="ch_002",
         run_id="run_fraud_02",
@@ -200,18 +205,25 @@ def test_fraud_proof_catches_unsubmitted_snapshot():
         defender_id="node_offline",
         challenger_deposit=1000,
         defender_deposit=5000,
-        declared_commitment="dummy_comm",
-        declared_in_hash="dummy_in",
-        declared_out_hash="dummy_out",
+        declared_commitment=compute_step_commitment(2, 10, in_hash, out_hash),
+        declared_in_hash=in_hash,
+        declared_out_hash=out_hash,
         defender_arch="sm120",
+        engine_sha256=ENGINE_HASH,
+        now=100.0,
+        challenge_window_s=10.0,
     )
     assert challenge.status == "OPEN"
 
-    # Adjudication without snapshot submission
+    with pytest.raises(FraudProofError, match="has not expired"):
+        adjudicate_challenge(challenge, lambda x: x, "sm120", ENGINE_HASH, now=110.0)
+    # Adjudication after the actual deadline
     verdict = adjudicate_challenge(
         challenge,
         replay_stage_fn=lambda x: x,
         validator_arch="sm120",
+        validator_engine_sha256=ENGINE_HASH,
+        now=111.0,
     )
     assert verdict["verdict"] == "SLASH_DEFENDER"
     assert verdict["slashed_node"] == "node_offline"
@@ -241,6 +253,7 @@ def test_fraud_proof_protects_honest_node_from_malicious_challenge():
         declared_in_hash=in_hash,
         declared_out_hash=out_hash,
         defender_arch="sm120",
+        engine_sha256=ENGINE_HASH,
     )
 
     submit_dispute_snapshot(challenge, input_tensor, honest_output)
@@ -252,6 +265,7 @@ def test_fraud_proof_protects_honest_node_from_malicious_challenge():
         challenge,
         replay_stage_fn=replay_stage,
         validator_arch="sm120",
+        validator_engine_sha256=ENGINE_HASH,
     )
 
     assert verdict["verdict"] == "CHALLENGE_FAILED"
@@ -272,10 +286,11 @@ def test_same_arch_enforcement_prevents_cross_gpu_misjudgment():
         defender_id="defender",
         challenger_deposit=1000,
         defender_deposit=5000,
-        declared_commitment="comm",
+        declared_commitment=compute_step_commitment(1, 2, hash_activation([1.0]), hash_activation([2.0])),
         declared_in_hash=hash_activation([1.0]),
         declared_out_hash=hash_activation([2.0]),
         defender_arch="sm120",  # Blackwell
+        engine_sha256=ENGINE_HASH,
     )
     submit_dispute_snapshot(challenge, [1.0], [2.0])
 
