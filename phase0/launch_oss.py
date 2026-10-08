@@ -68,9 +68,13 @@ def fire(inst, cmd, timeout=25):
     can hold the channel open via child fds, but the setsid survives and readiness is
     polled separately. so a TimeoutExpired here is not a failure."""
     try:
-        rssh(inst, cmd, timeout)
+        result = rssh(inst, cmd, timeout)
     except subprocess.TimeoutExpired:
-        pass
+        return
+    if result.returncode:
+        # SSH success and a managed child listening are separate barriers. Do
+        # not hide a failed spawn behind the readiness poll or expose its env.
+        raise RuntimeError(f"managed launch failed on node {inst['id']} (exit {result.returncode}); inspect the owned process log")
 
 
 class RemoteCommand(str):
@@ -199,7 +203,7 @@ def main():
         label, ok = warm_stage(stages[k], f"stage{k} {stages[k]['id']}")
         print(f"  {'OK ' if ok else 'FAIL '}{label}", flush=True)
         if not ok:
-            print("[abort] stage failed to warm", flush=True); return
+            raise SystemExit(f"stage failed to warm: {label}")
 
     # wait for the draft server
     for _ in range(60):
@@ -208,7 +212,7 @@ def main():
             print("[draft] ready", flush=True); break
         time.sleep(10)
     else:
-        print("[draft] not ready:", rssh(coord, "tail -6 /root/FlyAI/.shard-processes/oss-draft.log", 20).stdout[-500:], flush=True); return
+        raise SystemExit("draft failed to become ready; inspect .shard-processes/oss-draft.log on the coordinator")
 
     head_ep = f"{eps[0][0]}:{eps[0][1]}"
     tail_ep = f"{eps[nstages-1][0]}:{eps[nstages-1][1]}"
@@ -253,7 +257,7 @@ def main():
                 break
             time.sleep(3)
         else:
-            print("[gateway] did NOT bind:", rssh(coord, "tail -5 /root/gateway.log", 20).stdout[-400:], flush=True)
+            raise SystemExit("gateway failed to bind; inspect .shard-processes/oss-demo-gateway.log on the coordinator")
         print("[done] stages + gateway warm; teardown: vastai destroy instance <id>", flush=True)
         return
 

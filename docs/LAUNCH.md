@@ -1,6 +1,6 @@
 # Launch acceptance and historical upstream record
 
-Current guidance aligned with `c2ab623` on 2026-10-08. The July–August notes below are an upstream operational archive, not the current single source of truth. References to external c0mpute PRs, worker/npm releases, live websites, prices, payout flags or account infrastructure describe that period; this repository review did not recheck their present deployment.
+Current guidance covers `c2ab623` and the 2026-10-08 afternoon legacy regression fixes. The July–August notes below are an upstream operational archive, not the current single source of truth. References to external c0mpute PRs, worker/npm releases, live websites, prices, payout flags or account infrastructure describe that period; this repository review did not recheck their present deployment.
 
 ## Current release gates
 
@@ -11,7 +11,90 @@ Current guidance aligned with `c2ab623` on 2026-10-08. The July–August notes b
 - Keep public participation open while authenticating node RPC, assigned ring neighbors and tenant HTTP requests. Public V4/GPT-OSS HTTP listeners require TLS. Secrets remain in protected files; deployment environment goes through SSH stdin.
 - Gate release claims on real GPU numerical, state/rollback, kernel and sustained service tests for the actual build. Record novel/copy/code/long-context separately and include retries/proof collection in service timing. V4's new-path four/six-card goals remain 40/30 tok/s, not completed hardware acceptance.
 
-The selected local non-GPU regression set for this change reported **985 passed, 3 skipped**. It is not full-repository CI, a production fleet rehearsal, a new speed result or an external payment verification. Per-ring work remains serial; job history/idempotency is in memory; durable coordinator HA and automatic on-chain slashing are not implemented.
+The selected local non-GPU regression set for `c2ab623` reported **985 passed, 3 skipped**. It is not full-repository CI, a production fleet rehearsal, a new speed result or an external payment verification. Per-ring work remains serial; job history/idempotency is in memory; durable coordinator HA and automatic on-chain slashing are not implemented.
+
+After the afternoon regression fixes, the expanded **58-file** local CPU/socket
+set reported **1113 passed, 3 skipped**. It includes delayed legacy startup,
+direct-return classification, authenticated sessions, context admission, plan
+generation, installation-flow simulation, deployment and existing service paths.
+The rented GPU cluster still needs a fresh run of this repaired build.
+
+## 2026-10-08 legacy ring reproduction
+
+The afternoon OpenClaw report tested **GPT-OSS-120B**, using three stage GPUs from
+four rented RTX 5090 nodes. The report's `886e6ae` failure and `53f078c` success
+are an A/B regression observation, not DeepSeek-V4 hardware acceptance. The
+explicit `--legacy-protocol` migration is intentional; a raw-op ring failing its
+first `reset` after that option is supplied is a compatibility bug.
+
+The startup fix preserves the configured legacy edge deadline while waiting for
+the predecessor's first message; strict HELLO retains its bounded handshake.
+The eager direct-return tail now identifies both channels by message content,
+and synchronous/compare n-gram runs use the local drafter. Errors include the
+actual coordinator socket peer, pending operation and send/receive phase.
+Debian `rich` without a pip `RECORD` receives a targeted overlay in the installer,
+followed by a metadata check; an isolated `--venv` installation is also supported.
+
+The following commands reproduce the reported logical chain with existing SSH
+forwarding. They do not create tunnels or infer routing from the public IP.
+Verify these exact dial addresses from the machine running each caller:
+
+| Caller | Destination | Caller-local dial address |
+| --- | --- | --- |
+| coordinator on N0 | head on N1, listener 29501 | `127.0.0.1:39601` |
+| head on N1 | middle on N0, listener 29502 | `127.0.0.1:29502` |
+| middle on N0 | tail on N2, listener 29503 | `127.0.0.1:29503` |
+| coordinator on N0 | tail on N2, listener 29503 | `127.0.0.1:29503` |
+
+Each `127.0.0.1` is relative to its own caller/container. Identical container
+addresses such as `172.17.0.2` are not proof of shared network reachability.
+N3 is a spare in this example. Direct leaf-to-leaf connectivity is unnecessary
+when all four listed logical routes actually work.
+
+On each stage and the coordinator, use the full checkout and the same protected
+PSK file, with the interpreter in which the model dependencies were installed:
+
+```sh
+cd /root/FlyAI
+export SHARD_PSK="$(cat /root/.shard_psk)"
+export SHARD_TRANSPORT=tcp
+MODEL=/root/models/gpt-oss-120b
+```
+
+Run in separate terminals, tail first, waiting for each listener before starting
+its predecessor. This particular split requires the model config to have 36
+layers; choose a validated split for any other model.
+
+```sh
+# N2: tail
+python3 phase0/specpipe.py --legacy-protocol --stage 2 --nstages 3 \
+  --model "$MODEL" --lo 24 --hi 36 --listen-port 29503 \
+  --fast --direct-return --max-ctx 2048 --timeout 600
+
+# N0: middle
+python3 phase0/specpipe.py --legacy-protocol --stage 1 --nstages 3 \
+  --model "$MODEL" --lo 12 --hi 24 --listen-port 29502 \
+  --next 127.0.0.1:29503 --fast --direct-return --max-ctx 2048 --timeout 600
+
+# N1: head
+python3 phase0/specpipe.py --legacy-protocol --stage 0 --nstages 3 --served-head \
+  --model "$MODEL" --lo 0 --hi 12 --listen-port 29501 \
+  --next 127.0.0.1:29502 --fast --direct-return --max-ctx 2048 --timeout 600
+
+# N0: coordinator, after all three stages are ready
+python3 phase0/specpipe.py --legacy-protocol --coordinator --nstages 3 \
+  --model "$MODEL" --next 127.0.0.1:39601 --tail 127.0.0.1:29503 \
+  --direct-return --ngram-draft --ngram-n 2 --pipe --K 8 --depth 4 \
+  --max-ctx 2048 --max-new 128 --timeout 600 --reasoning low \
+  --prompt 'Explain decentralized computing in two sentences.' --json-result
+```
+
+For a sequential baseline use `--depth 1`; for a greedy target-only reference
+use `--K 0 --depth 1`. Reuse the same prompt, checkpoint and runtime, and compare
+output token IDs as well as timing. Copy and novel workloads must remain separate.
+The selected CPU socket regressions exercise protocol behavior; they cannot
+establish this cluster's GPU token rate. For authenticated deployment, use the
+plan generator and complete steps in [GPT-OSS production](GPT_OSS_PRODUCTION.md).
 
 ## Historical July–August 2026 archive
 

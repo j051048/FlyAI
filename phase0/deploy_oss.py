@@ -51,14 +51,24 @@ class RingDeployment:
         from shard.pipeline_plan import validate_plan
         self.plan = validate_plan(plan)
         self.nodes, self.executor = dict(nodes), executor
-        for stage in self.plan["stages"]:
-            if stage["node_id"] not in self.nodes:
+        self.coordinator_id = self.plan["coordinator"].get("node_id", self.plan["stages"][0]["node_id"])
+        if not isinstance(self.coordinator_id, str) or self.coordinator_id not in self.nodes:
+            raise ValueError("coordinator requires an SSH deployment entry")
+        selected_ids = {stage["node_id"] for stage in self.plan["stages"]} | {self.coordinator_id}
+        for node_id in selected_ids:
+            if node_id not in self.nodes:
                 raise ValueError("every selected node requires an SSH deployment entry")
-            node = self.nodes[stage["node_id"]]
+            node = self.nodes[node_id]
             for name in ("workspace", "model", "node_key"):
                 if not isinstance(node.get(name), str) or not node[name]:
                     raise ValueError(f"node requires local {name}")
             ssh_argv(node)
+        # These are configured software ceilings, not measured GPU capacity.
+        caps = [self._node_context(self.nodes[node_id]) for node_id in selected_ids]
+        caps += [stage["context_limit"] for stage in self.plan["stages"] if stage.get("context_limit") is not None]
+        if self.plan.get("execution"):
+            caps.append(self.plan["execution"]["max_context"])
+        self.max_context = min(caps)
         self.local = ManagedLauncher(state_dir)
         self.started, self.tunnels = [], []
 
@@ -74,14 +84,26 @@ class RingDeployment:
     def _name(self, stage):
         return f"{self.plan['ring_id']}.stage{stage['index']}"
 
+    @staticmethod
+    def _node_context(node):
+        value = node.get("max_context", 8192)
+        if type(value) is not int or value < 1:
+            raise ValueError("node max_context must be a positive integer")
+        return value
+
     def stage_command(self, stage, node):
         plan_file = str(PurePosixPath(node["workspace"]) / ".shard-deployments" / self.plan["ring_id"] / "plan.json")
-        port = urlsplit("//" + stage["endpoint"]).port
+        # The advertised/dial port may be a NAT mapping or a caller-local SSH
+        # forward. The engine binds the container's actual listener port.
+        port = node.get("listen_port", urlsplit("//" + stage["endpoint"]).port)
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("listen_port must be an integer in 1..65535")
         argv = [node.get("python", "python3"), "phase0/specpipe.py", "--deployment-plan", plan_file,
                 "--stage", str(stage["index"]), "--nstages", str(self.plan["nstages"]),
                 "--model", node["model"], "--device", node.get("device", "cuda:0"),
                 "--listen-port", str(port), "--fast", "--direct-return",
-                "--max-ctx", str(node.get("max_context", 8192)), "--timeout", str(node.get("io_timeout_s", 600))]
+                "--max-ctx", str(min(self._node_context(node), self.max_context)),
+                "--timeout", str(node.get("io_timeout_s", 600))]
         if stage["head"]: argv.append("--served-head")
         if stage["next_endpoint"]: argv += ["--next", stage["next_endpoint"]]
         return argv, plan_file
@@ -122,20 +144,30 @@ class RingDeployment:
                     if state["listening"]: break
                     if time.monotonic() >= until: raise TimeoutError("stage readiness timed out")
                     time.sleep(.5)
+            # Deploy the entry manifest even when warmup is explicitly skipped:
+            # an independent coordinator needs it for the later strict run.
+            head = self.plan["stages"][0]
+            node = self.nodes[self.coordinator_id]
+            _, path = self.stage_command(head, node)
+            install_plan = ("import json,sys; from pathlib import Path; data=json.load(sys.stdin); "
+                            f"p=Path({path!r}); p.parent.mkdir(parents=True,exist_ok=True); "
+                            "assert not p.is_symlink(), 'plan cannot be a symlink'; "
+                            "assert not p.exists() or json.loads(p.read_text())==data['plan'], 'existing plan differs; use a fresh ring ID'; "
+                            "p.write_text(json.dumps(data['plan']),encoding='utf-8')")
+            self._remote(node, install_plan, payload={"plan": self.plan})
             if warmup:
-                head = self.plan["stages"][0]
-                node = self.nodes[head["node_id"]]
-                _, path = self.stage_command(head, node)
                 argv = [node.get("python", "python3"), "phase0/specpipe.py", "--coordinator",
                     "--deployment-plan", path, "--nstages", str(self.plan["nstages"]), "--model", node["model"],
                     "--coordinator-key", node.get("coordinator_key", node["node_key"]),
                     "--next", self.plan["coordinator"]["head"], "--tail", self.plan["coordinator"]["tail"],
                     "--direct-return", "--ngram-draft", "--pipe", "--K", "1", "--depth", "1",
-                    "--max-new", "2", "--max-ctx", str(node.get("max_context", 8192)), "--prompt", "Reply with a greeting.", "--json-result"]
+                    "--max-new", "2", "--max-ctx", str(self.max_context),
+                    "--timeout", str(node.get("io_timeout_s", 600)),
+                    "--prompt", "Reply with a greeting.", "--json-result"]
                 env = {**node.get("environment", {}), "SHARD_TRANSPORT": node.get("transport", "libp2p"), "SHARD_RECEIPTS": "1"}
                 code = ("import subprocess,os,sys,json; data=json.load(sys.stdin); "
                         f"r=subprocess.run({argv!r},env={{**os.environ,**data['environment']}}); sys.exit(r.returncode)")
-                raw = self._remote(node, code, timeout=readiness_timeout, payload={"environment":env})
+                raw = self._remote(node, code, timeout=readiness_timeout, payload={"plan":self.plan, "environment":env})
                 results = [json.loads(line[len("RESULT "):]) for line in raw.splitlines() if line.startswith("RESULT ")]
                 if not results or not results[-1].get("proof_verified") or not results[-1].get("output_ids"):
                     raise RuntimeError("end-to-end warmup did not produce verified stage receipts")
@@ -161,7 +193,8 @@ class RingDeployment:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", required=True)
-    parser.add_argument("--nodes", required=True, help="JSON nodes map and optional tunnels list")
+    parser.add_argument("--nodes", "--config", dest="nodes", required=True,
+                        help="JSON nodes map and optional tunnels list (also used by make_plan.py)")
     parser.add_argument("--state-dir", default=".shard-processes")
     parser.add_argument("--no-warmup", action="store_true")
     args = parser.parse_args(argv)

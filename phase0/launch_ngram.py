@@ -25,7 +25,7 @@ def launch_stage_uneven(inst, stage, nstages, nxt_ep, served_head, lo, hi, max_c
     the multi-minute long-context prefill. window=True sets FV_WINDOW=1 so sliding-attention
     layers read only their 128-key window at decode (O(window) not O(ctx)) — the long-context
     speed lever. sync_send=True sets SHARD_SYNC_SEND=1 (force the old synchronous forward send, the
-    TTFT A/B baseline). NEVER pkill -f specpipe (self-match); kill by GPU pid + port."""
+    TTFT A/B baseline). ManagedLauncher owns each stage process and its cleanup."""
     argv = ["python3", "phase0/specpipe.py", "--legacy-protocol", "--stage", str(stage), "--nstages", str(nstages),
             "--model", M120, "--listen-port", str(PORT), "--fast", "--direct-return", "--lo", str(lo), "--hi", str(hi),
             "--max-ctx", str(max_ctx), "--timeout", str(timeout)]
@@ -85,13 +85,11 @@ def main():
             label, ok = warm_stage(stages[k], f"stage{k} {stages[k]['id']}")
             print(f"  {'OK ' if ok else 'FAIL '}{label}", flush=True)
             if not ok:
-                print("[abort] stage failed to warm", flush=True)
-                return
+                raise SystemExit(f"stage failed to warm: {label}")
 
     head_ep = f"127.0.0.1:{PORT}"                       # coordinator runs ON the head box -> localhost to stage 0
     tail_ep = f"{eps[nstages - 1][0]}:{eps[nstages - 1][1]}"
     print(f"\n[coord] n-gram coordinator on head {head['id']}: --next {head_ep} --tail {tail_ep}", flush=True)
-    renv = " SHARD_RECEIPTS=1" if a.receipts else ""
     argv = ["python3", "phase0/specpipe.py", "--legacy-protocol", "--coordinator", "--nstages", str(nstages),
             "--model", M120, "--ngram-draft", "--ngram-n", str(a.ngram_n), "--pipe", "--depth", str(a.depth), "--K", str(a.K),
             "--next", head_ep, "--direct-return",

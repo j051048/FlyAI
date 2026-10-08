@@ -27,6 +27,7 @@ piggybacked, so a round costs exactly one round-trip end to end.
 """
 
 import argparse, socket, time, threading, queue, os, json, hashlib, sys
+from collections import deque
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if os.path.isdir(os.path.join(_ROOT, "shard")) and _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
@@ -55,6 +56,57 @@ def send_msg(sock, payload):
 
 def recv_msg(sock):
     return recv_message(_raw_recv_msg, sock)
+
+
+class _CoordinatorEdges:
+    """Keep safe endpoint/op context, including FIFO reply ownership in a pipe.
+
+    Tokens, activation tensors, swarm keys and arbitrary exception text never
+    enter this diagnostic. A return read is bound to the oldest request still
+    awaiting a reply, not to an intervening fire-and-forget abort frame.
+    """
+    def __init__(self, head, returned=None, draft=None):
+        self.head, self.returned, self.draft = head, returned, draft
+        self.peers = {id(channel): self._peer(channel) for channel in (head, returned, draft) if channel is not None}
+        self.pending = deque()
+        self.context = {"edge": "head(s0)", "peer": self.peers.get(id(head), "unknown"), "op": "connect", "phase": "send"}
+
+    @staticmethod
+    def _peer(channel):
+        try:
+            value = channel.getpeername()
+            if isinstance(value, tuple):
+                host, port = value[:2]
+                return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+            return str(value) or "local-draft"
+        except (AttributeError, OSError):
+            return "unknown"
+
+    def _set(self, channel, op, phase):
+        edge = "draft" if channel is self.draft and channel is not None else (
+            "tail-return" if self.returned is not None and channel is self.returned else "head(s0)")
+        self.context = {"edge": edge, "peer": self.peers.get(id(channel), "unknown"), "op": op, "phase": phase}
+
+    def send(self, channel, payload):
+        op = payload.get("op", "draft") if isinstance(payload, dict) else "unknown"
+        self._set(channel, op, "send")
+        result = send_msg(channel, payload)
+        if channel is self.head and op in ("reset", "verify", "receipt"):
+            self.pending.append(op)
+        return result
+
+    def receive(self, channel):
+        target_reply = channel is self.head or (self.returned is not None and channel is self.returned)
+        op = self.pending[0] if target_reply and self.pending else "draft" if channel is self.draft else "unknown"
+        self._set(channel, op, "recv")
+        result = recv_msg(channel)
+        if target_reply and self.pending:
+            self.pending.popleft()
+        return result
+
+    def failure(self, error, count):
+        context = " ".join(f"{key}={self.context[key]}" for key in ("edge", "peer", "op", "phase"))
+        return f"pipeline edge failed at token {count} ({context} error={type(error).__name__})"
 
 
 def _address(endpoint):
@@ -386,40 +438,48 @@ def serve_tail_direct(parts, listen_port, timeout, dev):
     """tail with DIRECT return: the result goes straight to the coordinator, not
     relayed up the chain. two connections arrive on the listen port -- the
     predecessor (activations) and the coordinator's return channel (which sends a
-    {op:hello_return} on connect). select tells them apart (only the return channel
-    has a message waiting; the predecessor is idle until driven). each verify's
-    result is sent on the return channel."""
-    import select
+    {op:hello_return} on connect). Classify by message content: the predecessor
+    may already have a reset queued when the return connection arrives. Preserve
+    that real first frame rather than confusing readiness with channel role.
+    Each verify's result is sent on the return channel."""
     srv, acceptor = _server(parts, listen_port, timeout)
     print(f"[tail] listening on :{listen_port} (predecessor + coordinator return, edge timeout {timeout:.0f}s)", flush=True)
     while True:
+        pending = None
         if acceptor is not None:
             pred_conn = acceptor.get("drive" if parts["_session_config"].index == 0 else "forward")
             ret_conn = acceptor.get("return")
             c1, c2 = pred_conn, ret_conn
         else:
-            c1, _ = srv.accept(); c2, _ = srv.accept()
-            c1.settimeout(min(timeout, 5)); c2.settimeout(min(timeout, 5))
-            ready, _, _ = select.select([c1, c2], [], [], timeout)
-            if not ready:
-                print("[tail] no return-channel handshake; resetting", flush=True)
-                c1.close(); c2.close(); continue
-            ret_conn = ready[0]
+            pred_conn = ret_conn = None
+            channel = None
             try:
-                hello = recv_msg(ret_conn)
+                while pred_conn is None or ret_conn is None:
+                    channel, _ = srv.accept()
+                    channel.settimeout(timeout)
+                    first_frame = recv_msg(channel)
+                    if isinstance(first_frame, dict) and first_frame.get("op") == "hello_return":
+                        if ret_conn is not None:
+                            ret_conn.close()
+                        ret_conn = channel
+                    else:
+                        if pred_conn is not None:
+                            pred_conn.close()
+                        pred_conn, pending = channel, first_frame
+                    channel = None
             except EDGE_ERRORS:
-                c1.close(); c2.close(); continue
-            if not (isinstance(hello, dict) and hello.get("op") == "hello_return"):
-                print("[tail] unexpected handshake; resetting", flush=True)
-                c1.close(); c2.close(); continue
-            pred_conn = c2 if ret_conn is c1 else c1
+                for incomplete in (channel, pred_conn, ret_conn):
+                    if incomplete is not None:
+                        incomplete.close()
+                continue
         pred_conn.settimeout(timeout)
         print("[tail] predecessor + coordinator-return connected", flush=True)
         cache = DynamicCache(); verifies = 0
         with torch.no_grad():
             while True:
                 try:
-                    msg = recv_msg(pred_conn)
+                    msg = pending if pending is not None else recv_msg(pred_conn)
+                    pending = None
                     if msg["op"] == "reset":
                         cache = DynamicCache(); send_msg(ret_conn, "ok"); continue
                     if msg.get("gather") is not None:
@@ -648,7 +708,12 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                     ret = acceptor.get("return")
                 continue
             c, _ = srv.accept()
-            c.settimeout(min(timeout, 5.0))
+            # This may be a static predecessor dialed before its own/head model
+            # finishes loading. Unlike strict HELLO it sends no role frame until
+            # the coordinator resets the ring. Preserve the configured legacy
+            # edge deadline; a five-second classifier timeout poisoned a healthy
+            # startup by closing that forward channel before the first reset.
+            c.settimeout(timeout)
             try:
                 m = recv_msg(c)
             except EDGE_ERRORS:
@@ -859,7 +924,7 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
 
 
 def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
-               adaptive=False, k_min=1, k_max=12, ret_sock=None, prefill_chunk=0):
+               adaptive=False, k_min=1, k_max=12, ret_sock=None, prefill_chunk=0, local_draft=None):
     """the in-house coordinator (c0mpute entry node): holds NO 120B layers. it
     tokenizes, queries the in-house draft for K tokens, sends token ids into the
     swarm's stage 0 (which embeds + runs), reads back the verify, greedy-accepts.
@@ -867,26 +932,31 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
     point plus the managed draft. lazy crop propagates to every swarm node.
     ret_sock set => DIRECT return: send forward to stage 0, receive the verify
     result straight from the tail (1 hop) instead of relayed back up the chain."""
+    if type(max_new) is not int or max_new < 0:
+        raise ValueError("max_new must be a nonnegative integer")
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock     # where results come back (direct => tail)
+    if hasattr(rx, "settimeout"):
+        rx.settimeout(timeout)
+    edges = _CoordinatorEdges(pipe_sock, ret_sock, draft_sock)
     eos = tok.eos_token_id
     enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
                                   add_generation_prompt=True, return_tensors="pt", return_dict=True)
     prompt_ids = enc["input_ids"][0].tolist()
     out = []
     try:
-        send_msg(pipe_sock, {"op": "reset"}); recv_msg(rx)
+        edges.send(pipe_sock, {"op": "reset"}); edges.receive(rx)
         # prefill: one shot, or CHUNKED (long prompts) so each stage's per-chunk activation
         # stays bounded (the KV cache accumulates). flex_attention keeps each chunk O(n) on Ada.
         if prefill_chunk and len(prompt_ids) > prefill_chunk:
             r = None
             for i in range(0, len(prompt_ids), prefill_chunk):
-                send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids[i:i + prefill_chunk], "start": i})
-                r = recv_msg(rx)
+                edges.send(pipe_sock, {"op": "verify", "token_ids": prompt_ids[i:i + prefill_chunk], "start": i})
+                r = edges.receive(rx)
             cur = r[-1]
         else:
-            send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # prefill
-            cur = recv_msg(rx)[-1]
+            edges.send(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # prefill
+            cur = edges.receive(rx)[-1]
         pos = len(prompt_ids)
         out = [cur]
         rounds, accepted_total = 0, 0
@@ -896,11 +966,14 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
         t0 = time.time()
         while len(out) < max_new and cur != eos:
             td = time.time()
-            send_msg(draft_sock, {"ids": prompt_ids + out, "k": kc}); drafts = recv_msg(draft_sock)
+            if local_draft is not None:
+                drafts = local_draft.propose(prompt_ids + out, kc)
+            else:
+                edges.send(draft_sock, {"ids": prompt_ids + out, "k": kc}); drafts = edges.receive(draft_sock)
             t_draft += time.time() - td
             tv = time.time()
-            send_msg(pipe_sock, {"op": "verify", "token_ids": [cur] + drafts, "start": pos, "crop": tail_crop})
-            r = recv_msg(rx)
+            edges.send(pipe_sock, {"op": "verify", "token_ids": [cur] + drafts, "start": pos, "crop": tail_crop})
+            r = edges.receive(rx)
             t_verify += time.time() - tv
             n = 0
             for j in range(kc):
@@ -909,14 +982,19 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
             committed = drafts[:n] + [r[n]]
             out.extend(committed); cur = r[n]; pos += n + 1
             rounds += 1; accepted_total += n; k_hist.append(kc); tail_crop = pos
+            if hasattr(local_draft, "note_accepted"):
+                local_draft.note_accepted(n)
             ema_n = 0.7 * ema_n + 0.3 * n
             if adaptive:
                 kc = max(k_min, min(k_max, round(ema_n) + 2))
             if eos in committed:
                 break
     except EDGE_ERRORS as e:
-        raise TransportError(f"pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
+        raise TransportError(edges.failure(e, len(out))) from e
     dt = time.time() - t0
+    # One final synchronous speculative chunk can run past the public budget.
+    # Keep that verified scratch work out of the returned completion.
+    out = out[:max_new]
     if eos in out:
         out = out[:out.index(eos)]
     return {
@@ -956,6 +1034,7 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
     rx = ret_sock if ret_sock is not None else pipe_sock
     if hasattr(rx, "settimeout"):
         rx.settimeout(timeout)
+    edges = _CoordinatorEdges(pipe_sock, ret_sock, draft_sock)
     def check():
         if cancel_check:
             cancel_check()
@@ -963,12 +1042,12 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
     def receive():
         nonlocal recv_wait
         check(); started = clock()
-        result = recv_msg(rx)
+        result = edges.receive(rx)
         recv_wait += clock() - started
         check()
         return result
     def transmit(payload):
-        check(); send_msg(pipe_sock, payload); check()
+        check(); edges.send(pipe_sock, payload); check()
     if prompt_ids is None:
         options = {"reasoning_effort": reasoning} if reasoning else {}
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
@@ -1033,14 +1112,14 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
         if use_local:
             local_draft.request(ids, current_k)
         else:
-            send_msg(draft_sock, {"ids": ids, "k": current_k})
+            edges.send(draft_sock, {"ids": ids, "k": current_k})
         pending_draft = True
     def draft_fetch():
         nonlocal pending_draft, draft_wait
         if not pending_draft:
             return []
         check(); started = clock()
-        result = local_draft.fetch() if use_local else recv_msg(draft_sock)
+        result = local_draft.fetch() if use_local else edges.receive(draft_sock)
         draft_wait += clock() - started
         pending_draft = False
         check()
@@ -1207,9 +1286,9 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
     except EDGE_ERRORS as error:
         check()
         if resumable:
-            return {"ok": False, "error": f"{type(error).__name__}: {str(error)[:160]}",
+            return {"ok": False, "error": edges.failure(error, len(out)),
                     "output_ids": list(out), "n_tokens": len(out), "text": tok.decode(out, skip_special_tokens=True)}
-        raise TransportError(f"pipeline edge failed at token {len(out)} ({type(error).__name__}: {error})") from error
+        raise TransportError(edges.failure(error, len(out))) from error
     request_s = clock() - request_started
     decode_s = max(0.0, last_commit - first_commit) if first_commit is not None else 0.0
     new_decode = max(0, new_count - 1)
@@ -1432,6 +1511,8 @@ def coordinate_tree_fast(draft_sock, pipe_sock, tok, prompt, tree_cfg, max_new, 
 
 def _run_coordinator(args, session_config, plan):
     import json, hashlib
+    if args.ngram_draft and (args.tree or args.tree_fast):
+        raise ValueError("--ngram-draft supports linear sync/pipe/compare, not --tree or --tree-fast")
     draft_sock = pipe_sock = ret_sock = None
     try:
         tok = AutoTokenizer.from_pretrained(args.model)     # 20b tokenizer == 120b tokenizer
@@ -1473,7 +1554,8 @@ def _run_coordinator(args, session_config, plan):
             sync_warm = pipe_warm = None
             for K in [int(x) for x in args.ks.split(",")]:
                 for i in range(2):                         # sync: cold (captures K+1 graph), then warm
-                    r = coordinate(draft_sock, pipe_sock, tok, args.prompt, K, args.max_new, args.timeout, ret_sock=ret_sock)
+                    r = coordinate(draft_sock, pipe_sock, tok, args.prompt, K, args.max_new, args.timeout, ret_sock=ret_sock,
+                                   local_draft=local_draft)
                     if i: sync_warm = r
                     print(f"[SYNC K={K} {'warm' if i else 'cold'}] {r['tok_s']:.2f} tok/s | "
                           f"{r['toks_per_traversal']:.2f} tok/trav | accept {r['mean_accept']:.2f} | "
@@ -1481,7 +1563,7 @@ def _run_coordinator(args, session_config, plan):
                 for d in depths:
                     for i in range(2):                     # pipe: cold, then warm, at each depth
                         r = coordinate_pipe(draft_sock, pipe_sock, tok, args.prompt, K, args.max_new,
-                                            args.timeout, d, ret_sock=ret_sock)
+                                            args.timeout, d, ret_sock=ret_sock, local_draft=local_draft)
                         if i: pipe_warm = r
                         print(f"[PIPE K={K} depth={d} {'warm' if i else 'cold'}] {r['tok_s']:.2f} tok/s | "
                               f"{r['toks_per_traversal']:.2f} tok/trav | accept {r['mean_accept']:.2f} | "
@@ -1615,7 +1697,7 @@ def _run_coordinator(args, session_config, plan):
             adaptive = (kv == 0) or (not args.sweep and args.adaptive)
             r = coordinate(draft_sock, pipe_sock, tok, args.prompt, (6 if kv == 0 else kv),
                            args.max_new, args.timeout, adaptive=adaptive, ret_sock=ret_sock,
-                           prefill_chunk=args.prefill_chunk)
+                           prefill_chunk=args.prefill_chunk, local_draft=local_draft)
             if args.sweep:
                 print(f"[SWEEP K={kv}] {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
                       f"accept {r['mean_accept']:.2f} | draft {r['draft_ms']:.0f}ms + verify {r['verify_ms']:.0f}ms/round", flush=True)
@@ -1694,6 +1776,17 @@ def _cli_contract(args, parser):
             args.direct_return = True
             if not args.coordinator and args.stage == 0:
                 args.served_head = True
+            # Metadata is an admission bound only when it is actually known.
+            # Stage construction consumes args.max_ctx; enforce the plan before
+            # allocating its cache, not merely while generating the manifest.
+            ceilings = []
+            execution_limit = (plan.get("execution") or {}).get("max_context")
+            if execution_limit is not None:
+                ceilings.append(execution_limit)
+            assigned = plan["stages"] if args.coordinator else [plan["stages"][args.stage]]
+            ceilings.extend(row["context_limit"] for row in assigned if row.get("context_limit") is not None)
+            if ceilings and args.max_ctx > min(ceilings):
+                parser.error(f"--max-ctx {args.max_ctx} exceeds known deployment context ceiling {min(ceilings)}")
         cohort = plan.get("model_cohort")
         if not args.legacy_protocol and cohort is None:
             parser.error("strict production plan requires the complete model_cohort and verified download inventory")

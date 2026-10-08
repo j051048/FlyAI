@@ -4,8 +4,10 @@
 `phase0/specpipe.py` 路径。V4 与 GPT-OSS 共用注册、资源租约、HTTP/SSE、
 会话协议和部署清单；模型算子仍由各自引擎实现。
 
-文档对齐于 2026-10-08 的 `c2ab623`。本轮 985 通过、3 跳过属于选定的
-本地非 GPU 回归集合，不是全仓 CI 或新的集群性能收据。
+文档以 2026-10-08 的 `c2ab623` 为基线；985 通过、3 跳过是上一轮选定
+本地非 GPU 集合。本次下午报告后的修正和生成器已合并到统一的 58 文件
+本地回归检查：**1113 通过、3 跳过**。这些都不是全仓 CI、真实 MXFP4 GPU
+执行验收或新的集群性能收据。
 
 ## 下载与模型身份
 
@@ -14,13 +16,20 @@ GPU 节点使用完整仓库。手工部署工具需要 `deploy` 依赖；GPT-OS
 运行时会在转换权重前拒绝反量化回退，并检查实际 packed 权重布局。
 
 ```sh
-pip install -e '.[gpt-oss,deploy]'
-python phase0/get_model.py openai/gpt-oss-120b /root/models/gpt-oss-120b --anonymous
+bash phase0/setup_box.sh
+python3 -m pip install -e '.[gpt-oss,deploy]'
+python3 phase0/get_model.py openai/gpt-oss-120b /root/models/gpt-oss-120b --anonymous
 # 已下载的平铺权重：只取固定版本元数据并核对文件，不重新下载。
 
-python phase0/get_model.py openai/gpt-oss-120b /root/models/gpt-oss-120b --anonymous --verify-existing
-python phase0/gpt_oss_manifest.py --model /root/models/gpt-oss-120b --out cohort.json
+python3 phase0/get_model.py openai/gpt-oss-120b /root/models/gpt-oss-120b --anonymous --verify-existing
+python3 phase0/gpt_oss_manifest.py --model /root/models/gpt-oss-120b --out cohort.json
 ```
+
+若要隔离系统包，先 `bash phase0/setup_box.sh --venv /root/flyai-venv`，
+后续所有 `python`/`python3` 都用它打印的 `/root/flyai-venv/bin/python`，部署 JSON 的
+`python` 也使用同一路径。setup 先处理系统 rich 缺 RECORD 的兼容问题，
+再安装依赖；不用先手工卸载系统 rich。模型下载和 GPU 初始化不是本地计划
+生成器的工作。
 
 认证下载使用 `--token-file` 或 `--token-env`。非法凭据脱敏报错，不能悄悄
 变成匿名。匿名模式明确禁用 HF 缓存凭据。下载一次解析不可变 commit；
@@ -73,20 +82,124 @@ MXFP4 配置、禁止反量化、实际层数与四个支持字段。调用者�
 验证器要求各 stage 的 receipt signer 不同；同机多 GPU 的资源合法性并不会
 自动满足这个签名分配条件。
 
-```sh
-python -m shard.pipeline_plan --plan ring.json --config /root/models/gpt-oss-120b/config.json
-python phase0/deploy_oss.py --plan ring.json --nodes deployment-nodes.json
-```
+生成入口是 [make_plan.py](../phase0/make_plan.py)。它从实际模型目录、上一步
+的 `cohort.json` 和节点 JSON 生成计划；校验真实 config/download 身份、
+层覆盖、完整 GPU UUID、公钥与重复 stage signer。它不生成私钥、不自动探测
+网络、不加载 GPU，也不会伪造 `runtime_config_sha256` 或资源校准。
+
+### 从零生成三段严格环
+
+以下按报告的拓扑举例：**N1=head，N0=middle+coordinator，N2=tail**，
+顺序切分 12/12/12。同出口不能代替可达性测试；N3 可以留作未入环的备选。
+先完成[对应 caller-local 路线表](LAUNCH.md#2026-10-08-legacy-ring-reproduction)
+中的连接。生成器填写的是实际已有路线，不会因为写了 JSON 就创建隧道。
+
+1. 每台运行节点均需完整 checkout、相同固定 revision 的完整模型快照与
+   `.shard-download.json`。在协调器/计划生成机的实际模型目录运行上面的
+   `gpt_oss_manifest.py`，得到完整 `cohort.json`。不能手填虚构 SHA、层数或 ABI。
+2. 在每台 GPU 节点读取实际 UUID 和已有签名公钥：
+
+   ```sh
+   nvidia-smi --query-gpu=uuid --format=csv,noheader
+   python3 -c "from shard.manifest import load_key,pub_b64; print(pub_b64(load_key('/root/receipt.key')))"
+   ```
+
+   若沿用 Go sidecar 身份，先导出同一 key 的 Python 格式：
+
+   ```sh
+   python3 -m shard.offers export-receipt-key --sidecar-key /path/to/node.key --out /root/receipt.key
+   ```
+
+   新的独立手工节点若还没有身份，可以在该节点本机显式创建并保存：
+
+   ```sh
+   python3 -c "from shard.receipt import load_or_make_node_key,pub_b64; print(pub_b64(load_or_make_node_key('/root/receipt.key')))"
+   ```
+
+   输出只是公钥。每个 stage 的 signer 必须不同；协调器可复用 N0 的 signer，
+   也可用独立 `coordinator_key`，但清单公钥必须与那个真实文件一致。私钥留在
+   所属机器上，不粘贴进计划。多 GPU 节点应分别保存对应身份。
+3. 在控制机保存 `deployment-nodes.json`。下面的尖括号占位值必须替换成
+   刚读到的真实值；它们本身不能通过生成器验证。SSH alias 须事先配置可用。
+
+   ```json
+   {
+     "nodes": {
+       "N1": {"ssh_target":"node-n1","workspace":"/root/FlyAI","model":"/root/models/gpt-oss-120b","node_key":"/root/receipt.key","listen_port":29501,"max_context":2048,"transport":"tcp","environment":{"SHARD_PSK":"<SAME_EXISTING_SWARM_SECRET>"}},
+       "N0": {"ssh_target":"node-n0","workspace":"/root/FlyAI","model":"/root/models/gpt-oss-120b","node_key":"/root/receipt.key","listen_port":29502,"max_context":2048,"transport":"tcp","environment":{"SHARD_PSK":"<SAME_EXISTING_SWARM_SECRET>"}},
+       "N2": {"ssh_target":"node-n2","workspace":"/root/FlyAI","model":"/root/models/gpt-oss-120b","node_key":"/root/receipt.key","listen_port":29503,"max_context":2048,"transport":"tcp","environment":{"SHARD_PSK":"<SAME_EXISTING_SWARM_SECRET>"}}
+     },
+     "stages": [
+       {"node_id":"N1","gpu_uuid":"<GPU_UUID_FROM_N1>","signer_pubkey":"<BASE64_PUB_FROM_N1>","endpoint":"127.0.0.1:29501","next_endpoint":"127.0.0.1:29502"},
+       {"node_id":"N0","gpu_uuid":"<GPU_UUID_FROM_N0>","signer_pubkey":"<BASE64_PUB_FROM_N0>","endpoint":"127.0.0.1:29502","next_endpoint":"127.0.0.1:29503"},
+       {"node_id":"N2","gpu_uuid":"<GPU_UUID_FROM_N2>","signer_pubkey":"<BASE64_PUB_FROM_N2>","endpoint":"127.0.0.1:29503","next_endpoint":null}
+     ],
+     "coordinator": {"node_id":"N0","head":"127.0.0.1:39601","tail":"127.0.0.1:29503","signer_pubkey":"<BASE64_PUB_FROM_N0>"},
+     "tunnels": []
+   }
+   ```
+
+   `nodes` 也支持 `ssh_port/ssh_key/python/device/io_timeout_s/environment`。
+   这些本地部署字段不会复制到公开 `ring.json`。协调器在 `coordinator.node_id`
+   指定的节点上运行，省略则兼容地使用 head。独立的 CPU 协调器需要自己的
+   `nodes` 条目和公钥，不需要 stage GPU UUID。
+
+   `listen_port` 是该容器/进程实际绑定的端口，不能填成公网映射口。
+   `next_endpoint` 从当前 stage 的主机拨号；`coordinator.head/tail` 从 N0
+   拨号。例子中的每个 `127.0.0.1` 都属于自己的 caller，
+   不表示三台机器共享 loopback。非 tail 的 next 必须显式填写，
+   生成器不会从另一台机器的 localhost 推导连接。
+
+   此例使用报告里已有的 SSH 路线与 TCP wire。将三个 PSK 占位值替换成同一个
+   真实 swarm secret，保存配置时按私钥文件保护，避免提交版本库。仅在控制机
+   `export SHARD_PSK` 不会自动把它传入远端 stage；部署器按节点 `environment`
+   经 SSH stdin 传入，不写进公开计划或命令参数。已有 libp2p sidecar 的部署可
+   将 `transport` 改为 `libp2p`，并先配置其实际 caller-local sidecar 路线。
+4. 生成并校验公开计划：
+
+   ```sh
+   python3 phase0/make_plan.py --model /root/models/gpt-oss-120b --cohort cohort.json \
+     --config deployment-nodes.json --ring-id gptoss-n1-n0-n2-run1 --split 12,12,12 --out ring.json
+   python3 -m shard.pipeline_plan --plan ring.json --config /root/models/gpt-oss-120b/config.json
+   ```
+
+   `--config` 与 `--nodes` 等价。`--split` 也可放进 JSON 的 `split`；都提供时
+   必须一致。不提供时按实际层数均分。生成器核对本地不可变 inventory/config
+   身份，默认不重新哈希几十 GB 权重；可加 `--verify-files` 做完整本地哈希。
+   节点首次启动仍会自行完整校验。输出包含 `execution.max_context`，取所有
+   stage 声明、节点软件配置及协调器配置的最小值；缺省沿用 deploy 的 8192。
+   这是软件上限而非 GPU 容量实测，不能证明给定切分/上下文不会 OOM。
+   相同文件可幂等重用；不同计划不能覆盖旧输出，改配置应使用新的 ring ID。
+5. 在控制机启动计划和检查真实暖机：
+
+   ```sh
+   python3 phase0/deploy_oss.py --plan ring.json --nodes deployment-nodes.json
+   # --config deployment-nodes.json 是同一个输入参数的别名。
+   ```
+
+   部署器按 tail→middle→head 启动，复制计划到指定 N0 协调器，再执行实际
+   严格推理和完整签名收据暖机。看到 LISTEN 不是完成验收；需要
+   `signed_warmup: true`。没有配置正确 sidecar/端口路径，生成成功也不能推理。
+   `--no-warmup` 只用于明确的诊断，不证明可以对外服务。
+
+这条入口生成的是**手工严格会话计划**，不自动构造 `PlacementRequirements`
+或 lease/calibration 模板，也不替代开放组环的生产资源标定。生成器提供的
+GPU UUID/公钥是输入声明；真实身份所有权由握手检查，资源/硬件能力还需另外
+测量。实际切分可能是 20/8/8 或其它非均分值，只要覆盖真实模型且资源允许。
 
 `deployment-nodes.json` 的 `nodes` 按清单 node_id 索引，分别提供：
 `ssh_target`（SSH alias 或 user@host）、可选 `ssh_port/ssh_key`、远端
-`workspace/model/node_key`，可选 `coordinator_key/device/max_context/transport`。
-`transport` 默认使用现有 libp2p sidecar。协调器在 head 的主机运行；其
+`workspace/model/node_key`，可选 `coordinator_key/device/max_context/transport`
+和实际 `listen_port`。`transport` 默认使用现有 libp2p sidecar。协调器在
+`coordinator.node_id` 指定的主机运行（省略时为 head）；其
 `coordinator_key` 必须匹配清单中的控制器公钥。
 
 可选 `tunnels` 各含 `ssh_target` 和 `forward`，例如
 `127.0.0.1:30001:127.0.0.1:29501`。启动器以独立 argv 建立 `ssh -L`，开启
-`ExitOnForwardFailure` 与 keepalive。环境数据经 SSH stdin 发送，不出现在命令参数。
+`ExitOnForwardFailure` 与 keepalive。这些 `tunnels` 的 `-L` 绑定在**运行
+deploy_oss 的控制机**；它们不能替代 N1 本机需要的 29502 forward。跨主机
+node-local sidecar/SSH 路径应按上面的 caller-local 表预配置。环境数据经
+SSH stdin 发送，不出现在命令参数。
 节点按尾到头启动，最后通过真实推理和完整收据确认暖机。
 
 手工进程管理使用 `.shard-processes` 的持久记录，只停止本次拥有的进程；
@@ -145,7 +258,8 @@ checkpoint/config/node/GPU/runtime-config 身份、时间和 TTL、测量方法�
 测量。tail→coordinator 的逻辑返回边由 coordinator 拨入 tail 的返回 listener。
 缺路线绑定会失败，不使用另一个端口的延迟。旧 v1 保留其保守 RTT 语义。
 
-同公网 IP 可作为发现线索，合法有向链不要求 head 与所有节点组成双向星形。
+同公网 IP 只是地址信息，不能判定物理主机或数据边可达性。合法有向链
+不要求 head 与所有节点组成双向星形。
 任意贡献者可注册；区域优先、容量、可用模板和实测链路决定执行资格。
 现有 sidecar/部署层配置实际连接，代码没有新增 DHT/NAT 栈。
 
