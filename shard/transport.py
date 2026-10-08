@@ -33,7 +33,11 @@ def _read_exact(sock: socket.socket, n: int) -> bytearray:
     while got < n:
         r = sock.recv_into(view[got:], n - got)
         if not r:
-            raise ConnectionError("sidecar closed the connection")
+            try:
+                peer = sock.getpeername()
+            except (OSError, AttributeError):
+                peer = "unknown"
+            raise ConnectionError(f"peer {peer} closed the connection while reading a frame ({got}/{n} bytes)")
         got += r
     return buf
 

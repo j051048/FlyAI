@@ -509,6 +509,13 @@ class DSparkTail:
         receipt."""
         V4 = _v4()
         d = d or V4.V4_DIR
+        proof = V4.verify_checkpoint_artifacts(d, lo=self.stage.lo, hi=self.stage.hi,
+            head=self.stage.head, tail=True, dspark=True)
+        stage_proof = getattr(self.stage, "_artifact_verification", None)
+        if stage_proof is not None and (proof is None or
+                proof["checkpoint_id"] != stage_proof["checkpoint_id"] or
+                proof["manifest_sha256"] != stage_proof["manifest_sha256"]):
+            raise RuntimeError("v4 dspark: MTP checkpoint differs from the loaded main stage")
         wm = V4.weight_map(d)
         self.alias_missing = []
         for k, blk in enumerate(self.mtp):
@@ -528,6 +535,10 @@ class DSparkTail:
                     f"missing {extra}, unexpected {sorted(unexpected)}. (Only {list(ALIAS_KEYS)} may "
                     f"be missing: they alias the tail's embed/head and convert.py skips them.)")
             self.alias_missing.append(tuple(sorted(missing)))
+        V4.weight_map(d)
+        if proof is not None:
+            V4.verify_checkpoint_artifacts(d, lo=self.stage.lo, hi=self.stage.hi,
+                head=self.stage.head, tail=True, dspark=True)
         return self
 
     def __repr__(self):

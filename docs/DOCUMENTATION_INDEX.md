@@ -1,6 +1,6 @@
 # 当前文档导航与历史证据
 
-核对日期：2026-10-08；实现基线：`c2ab623`。本页区分当前操作合同、接口规范、
+核对日期：2026-10-08；实现基线：`a6e96e3` 加本地权重准备/换环及 P0–P2 运行改造。本页区分操作合同、接口规范、
 有日期的实验记录和参考实现来源。历史性能数字按原实验条件保留；新版计时、
 会话或资源合同需要新的原始运行证据。
 
@@ -11,9 +11,12 @@
 | 了解项目与已实现边界 | [README](../README.md)、[中文说明](../README_CN.md)、[实现状态](../STATE.md) |
 | 部署 GPT-OSS、下载校验、严格会话与重测 | [GPT_OSS_PRODUCTION](GPT_OSS_PRODUCTION.md) |
 | 部署 V4 严格服务 | [V4_CLUSTER_DEPLOY_GUIDE](V4_CLUSTER_DEPLOY_GUIDE.md)、[V4_GATEWAY](V4_GATEWAY.md) |
+| V4 运行自检、strict SSH 部署、健康诊断和单变量复测 | [V4_OPERATIONS](V4_OPERATIONS.md) |
+| 小磁盘节点、流式转换、权重准备与请求边界换环 | [WEIGHT_PREPARATION](WEIGHT_PREPARATION.md) |
 | 任意节点注册、区域组环、租约与多环 | [OPEN_INFERENCE_NETWORK](OPEN_INFERENCE_NETWORK.md) |
 | 资源准入与部署检查 | [RESOURCE_CONTRACT](RESOURCE_CONTRACT.md)、[DEPLOY_READINESS](DEPLOY_READINESS.md) |
 | 区分预测、真实测量与速度验收 | [V4_BENCHMARK](V4_BENCHMARK.md)、[RUNTIME_METRICS](RUNTIME_METRICS.md) |
+| 复核 2026-10-08 六卡实测与历史口径 | [V4_FIELD_REVIEW_20261008](V4_FIELD_REVIEW_20261008.md) |
 | 理解收据、身份与隐私边界 | [PROOF](PROOF.md)、[V4_TRUST_BOUNDARIES](V4_TRUST_BOUNDARIES.md) |
 
 当前严格生产适配器为 `engines/gpt_oss/network_service.py` 和
@@ -22,7 +25,7 @@
 仍在 `phase0/specpipe.py`。V4 旧 `v4_gateway.py` 单环／静态环池入口和旧实验
 CLI 有各自兼容合同，不能仅更换命令名称就认为已经启用严格会话。
 
-本轮选定 CPU/socket/HTTP 回归为 985 通过、3 项环境条件跳过。
+本轮选定 CPU/socket/HTTP 回归为 1620 通过、3 项环境条件跳过，41 项 GPU 标记未选入。
 新增代码的 GPU 吞吐与长时间稳定性仍需实测。V4 四卡 >=40、六卡 >=30 valid
 output tok/s 仍是固定验收目标；`v4_acceptance.py` 的模拟结果不通过该硬件门槛。
 
@@ -33,6 +36,7 @@ output tok/s 仍是固定验收目标；`v4_acceptance.py` 的模拟结果不通
 | [ARCHITECTURE](ARCHITECTURE.md) | 协议骨架、模型后端、控制面及信任边界 |
 | [MODEL_RUNTIME](MODEL_RUNTIME.md) | ModelRuntime 接口、实际后端和继续统一的部分 |
 | [RESOURCE_CONTRACT](RESOURCE_CONTRACT.md) | measured byte budgets、共享 RAM/pinned、硬件未知值 |
+| [WEIGHT_PREPARATION](WEIGHT_PREPARATION.md) | 局部分片身份、共享磁盘/准备 RAM 预算、自动准备与请求边界切换 |
 | [OPEN_INFERENCE_NETWORK](OPEN_INFERENCE_NETWORK.md) | offers、cohort、执行模板、租约、区域与生命周期 |
 | [NETWORK](NETWORK.md) | 现有 sidecar、传输连接和网络假设 |
 | [COLOCATION_POLICY](COLOCATION_POLICY.md) | 同机、同 IP 参与与实际资源/路由检查 |
@@ -46,6 +50,7 @@ output tok/s 仍是固定验收目标；`v4_acceptance.py` 的模拟结果不通
 | [ROADMAP](ROADMAP.md) | 当前代码、硬件验证与未来工作分别维护 |
 | [GPT_OSS_PRODUCTION](GPT_OSS_PRODUCTION.md) | GPT-OSS 严格部署、下载、测量和投机调优 |
 | [V4_CLUSTER_DEPLOY_GUIDE](V4_CLUSTER_DEPLOY_GUIDE.md) | V4 当前操作步骤 |
+| [V4_OPERATIONS](V4_OPERATIONS.md) | 共享运行初始化、caller-local 隧道、签名运行观察及独立链路探测 |
 | [V4_GATEWAY](V4_GATEWAY.md) | HTTP/SSE、租户/模型路由、不同入口合同 |
 | [V4_BENCHMARK](V4_BENCHMARK.md) | 固定协议、原始证据和 GPU 速度线 |
 | [V4_NEXT_PHASE](V4_NEXT_PHASE.md) | 当前 V4 集成与下一阶段验证 |

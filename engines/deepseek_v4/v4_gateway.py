@@ -73,7 +73,11 @@ class V4RingBackend:
                     sys.path.insert(0, str(path))
             vp = importlib.import_module("v4_pipe")
         self.vp = vp
-        self.model_id = vp.V4_MODEL_ID
+        self.artifact_verification = None
+        if pipeline_plan is not None and pipeline_plan.get("model_cohort"):
+            self.artifact_verification = vp.verify_cohort_directory(directory, pipeline_plan["model_cohort"])
+        self.model_id = (pipeline_plan["model_cohort"]["model_id"] if pipeline_plan is not None and pipeline_plan.get("model_cohort")
+                         else vp.V4_MODEL_ID)
         self.layers = int(json.loads((Path(directory) / "config.json").read_text(encoding="utf-8-sig"))['n_layers']) if tokenizer is None else vp.N_LAYERS
         self.assignments = {str(key): tuple(span) for key, span in assignments.items()}
         self._check_assignments()
@@ -82,8 +86,8 @@ class V4RingBackend:
         if any(not required <= set(inspect.signature(method).parameters) for method in methods):
             raise ValueError("V4 coordinator lacks required cancellation/receipt/job-binding capability")
         if tokenizer is None:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(directory, local_files_only=True, trust_remote_code=False)
+            from v4_tokenizer import load_v4_tokenizer
+            tokenizer = load_v4_tokenizer(directory)
         self.tokenizer = tokenizer
         eos = tokenizer.eos_token_id
         self.eos_ids = tuple(eos) if isinstance(eos, (tuple, list)) else (() if eos is None else (eos,))

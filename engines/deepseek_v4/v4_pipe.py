@@ -78,6 +78,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -92,6 +93,11 @@ import torch  # noqa: E402
 # imports it that way: a process that cannot audit its own levers produces numbers nobody can trust,
 # so a deploy that forgot the file must die in the launch log, not serve.
 import v4_levers  # noqa: E402
+
+
+def _stage_event(event, stage, **fields):
+    from v4_observability import emit_stage_event
+    return emit_stage_event(event, stage, **fields)
 
 try:                                                    # flat box layout (files pushed to /root/) else package
     from transport import send_msg as _raw_send_msg, recv_msg as _raw_recv_msg
@@ -772,6 +778,66 @@ def _fwd_open(kw, nxt, timeout, msg, tag="[s]"):
     return sock
 
 
+def verify_cohort_directory(directory, cohort, *, weights=False, lo=None, hi=None,
+                            head=None, tail=None, dspark=None, production=True):
+    """Bind exact global identity while distinguishing coordinator assets.
+
+    A coordinator needs its local encoder/config and pinned global catalogue,
+    not 167GB of local weights. Stages additionally verify every assigned local
+    tensor/file before construction/READY through the immutable native loader.
+    """
+    from pathlib import Path
+    from shard import weight_artifacts as artifacts
+    if type(production) is not bool:
+        raise ValueError("production verification must be an explicit boolean")
+    directory = Path(directory).resolve()
+    # Refuse an unsupported or foreign model before reading gigabytes of local
+    # payloads. Full file/tensor checks below still precede model READY.
+    initial = artifacts.validate_catalog(artifacts.read_json(directory / artifacts.GLOBAL_FILE))
+    if (initial["checkpoint_id"], initial["manifest_sha256"], initial["model_id"], initial["config_sha256"],
+            initial["config"]["n_layers"], initial["runtime_abi"]) != (
+            cohort["checkpoint_id"], cohort["manifest_sha256"], cohort["model_id"], cohort["config_sha256"],
+            cohort["n_layers"], cohort["runtime_abi"]):
+        raise artifacts.ArtifactError("native model/config/runtime differs from deployment cohort")
+    if production:
+        from v4_artifact_contract import validate_native_cohort
+        validate_native_cohort(cohort, initial["config"])
+    if weights:
+        proof = _v4().verify_checkpoint_artifacts(directory,
+            expected_checkpoint_id=cohort["checkpoint_id"],
+            expected_manifest_sha256=cohort["manifest_sha256"],
+            lo=lo, hi=hi, head=head, tail=tail, dspark=dspark, required=True)
+        catalog = proof["catalog"]
+    else:
+        catalog = initial
+        if (catalog["checkpoint_id"], catalog["manifest_sha256"]) != (
+                cohort["checkpoint_id"], cohort["manifest_sha256"]):
+            raise artifacts.ArtifactError("coordinator catalogue differs from pinned model")
+        for name, row in catalog["assets"].items():
+            if artifacts.hash_file(artifacts.safe_path(directory, name)) != (row["sha256"], row["size"]):
+                raise artifacts.ArtifactError("coordinator model asset hash mismatch")
+        if not any(name.startswith(("tokenizer", "vocab", "merges")) for name in catalog["assets"]):
+            raise artifacts.ArtifactError("coordinator requires pinned encoder assets")
+        # The tokenizer may consult these extra files. Do not let an unpinned
+        # local override change encoding while the declared tokenizer stays valid.
+        encoder_files = {p.name for pattern in ("tokenizer*", "vocab*", "merges*", "special_tokens_map.json", "generation_config.json")
+                         for p in directory.glob(pattern) if p.is_file()}
+        if not encoder_files <= set(catalog["assets"]):
+            raise artifacts.ArtifactError("unverified local encoder asset")
+        proof = {"checkpoint_id": catalog["checkpoint_id"], "manifest_sha256": catalog["manifest_sha256"],
+                 "config": catalog["config"], "config_sha256": catalog["config_sha256"],
+                 "verification_scope": "pinned catalogue and local model assets only",
+                 "payload_integrity_verified": False, "config_bytes_verified": True,
+                 "tokenizer_bytes_verified": True}
+    if (catalog["model_id"], catalog["config_sha256"], catalog["config"]["n_layers"], catalog["runtime_abi"]) != (
+            cohort["model_id"], cohort["config_sha256"], cohort["n_layers"], cohort["runtime_abi"]):
+        raise artifacts.ArtifactError("native model/config/runtime differs from deployment cohort")
+    if production:
+        from v4_artifact_contract import validate_native_cohort
+        validate_native_cohort(cohort, catalog["config"])
+    return proof
+
+
 def ring_args(ckpt_dir):
     """The ModelArgs a V4 process is built from, with the fields the shipped config omits filled in.
 
@@ -892,7 +958,8 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
     args = args if args is not None else ring_args(ckpt_dir)
     dev = device or getattr(V4, "dev", "cuda")
     if lease_guard is not None and str(dev).startswith("cuda"):
-        actual_uuid = str(getattr(torch.cuda.get_device_properties(dev), "uuid", ""))
+        from shard.runtime_observation import gpu_uuid_text
+        actual_uuid = gpu_uuid_text(getattr(torch.cuda.get_device_properties(dev), "uuid", None))
         if not actual_uuid or actual_uuid.strip().casefold() != lease_guard.gpu_uuid.strip().casefold():
             raise ValueError("leased GPU UUID differs from the actual stage CUDA device")
     receipts = RECEIPTS if receipts is None else receipts
@@ -912,6 +979,9 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
             raise ValueError("authenticated stage plan differs from its node-local lease")
         if ret_relay is not None:
             raise ValueError("strict sessions require the plan's direct tail endpoint; legacy return relay requires explicit compatibility")
+        if ckpt_dir is not None and session_config.plan.get("model_cohort"):
+            verify_cohort_directory(ckpt_dir, session_config.plan["model_cohort"], weights=True,
+                lo=lo, hi=hi, head=head, tail=tail, dspark=bool(dspark and tail))
     if str(dev).startswith("cuda"):
         # generate.py:92 does this and the reference NEEDS it: model.py's lru_cached index helpers
         # (get_window_topk_idxs:261, get_compress_topk_idxs:275, get_dspark_topk_idxs:744) build
@@ -965,21 +1035,34 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
     # Requested vs LIVE-observed, per lever, to the log this launch already redirects stderr into.
     # Raises under V4_LEVERS_STRICT rather than serving a ring whose measurement would be meaningless.
     v4_levers.report(side=v4_levers.STAGE, stage=st)
+    st._runtime_session_config = session_config
+    st._diagnostic_stage_index = stage
+    st._diagnostic_operation = "listen"
+    from v4_observability import runtime_observation
+    loaded_observation = runtime_observation(st, session_config=session_config)
+    _stage_event("loaded", stage, operation="load", observation=loaded_observation,
+                 lo=lo, hi=hi, strict=session_config is not None)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((bind, port))
     srv.listen(32)
+    _stage_event("listening", stage, operation="listen", listener=f"{bind}:{port}",
+                 service_ready=False)
     acceptor = (SessionAcceptor(srv, session_config, _raw_send_msg, _raw_recv_msg,
                                key=node_key, timeout=timeout) if session_config is not None else None)
     # non-tail stages dial the forward leg at startup (a dead --next at boot is a launcher bug); the
     # sidecar tunnels FWD_RING to the next stage's inbound. Kernel accepts the handshake as soon as
     # the peer is listening, so this completes before the peer calls accept().
+    st._diagnostic_operation = "successor_connect"
     nxt_sock = _dial(*nxt.rsplit(":", 1), timeout=timeout) if (not tail and nxt) else None
     if nxt_sock is not None and session_config is not None:
         nxt_sock = hello_client(nxt_sock, session_config, stage + 1, "forward", _raw_send_msg, _raw_recv_msg, key=node_key)
     elif nxt_sock is not None and SWARM_TOKEN is not None:
         send_msg(nxt_sock, {"op": "hello_pred", "token": SWARM_TOKEN})
+    if nxt_sock is not None:
+        _stage_event("successor_connected", stage, operation="successor_connect",
+                     endpoint=nxt, strict=session_config is not None, service_ready=False)
     print(f"[s{stage}] listening {bind}:{port}"
           + (f" -> {nxt}" if nxt_sock is not None else " (tail)")
           + (f" pub={pub_b64(node_key)}" if node_key is not None else ""), flush=True)
@@ -988,6 +1071,7 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
 
     try:
         if tail:
+            st._diagnostic_operation = "predecessor_accept"
             _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=(ckpt_dir if dspark
                                                                                else None), acceptor=acceptor)
         elif ret_relay is not None:
@@ -995,6 +1079,13 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
                                  timeout, ret_relay)
         else:
             _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout, acceptor=acceptor)
+    except Exception as error:
+        _stage_event("failed", stage, operation=getattr(st, "_diagnostic_operation", "serve"),
+                     job_id=getattr(st, "_diagnostic_job_id", None),
+                     error_type=type(error).__name__, error=str(error)[:4096], service_ready=False)
+        raise
+    else:
+        _stage_event("stopped", stage, operation="stop", service_ready=False)
     finally:
         # Teardown: this stage serves no more jobs, so drop the horizon it was carrying. In a real
         # ring that is one process per stage and the clear is cosmetic; in the IN-PROCESS shape (the
@@ -1094,6 +1185,7 @@ def _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receip
     finally:
         stop_warm()                            # stop BEFORE the forward loop touches nxt_sock
     print(f"[s{stage}] predecessor connected", flush=True)
+    _stage_event("predecessor_connected", stage, operation="predecessor_accept", service_ready=False)
     reaccept = (lambda: _accept_pred(srv, timeout, acceptor=acceptor)) if head else None
     _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, conn, queued, timeout,
                   reaccept=reaccept)
@@ -1118,6 +1210,7 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                    getattr(st, "_runtime_profile", None))
     with torch.no_grad():
         while True:
+            st._diagnostic_operation = "receive_predecessor"
             if queued is not None:
                 msg, queued = queued, None
             else:
@@ -1144,6 +1237,9 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
             op = msg.get("op")
             if op == "noop":                                  # keep-warm tick from the predecessor: skip
                 continue
+            st._diagnostic_operation = op
+            if op == "reset":
+                st._diagnostic_job_id = msg.get("job_id")
             if op == "reset":
                 capacity_error = _reset_capacity_error(st, msg)
                 if capacity_error is not None:
@@ -1197,9 +1293,11 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                         binding=_privacy_binding(st, msg) if codec is not None else None)
                 start_pos = int(msg["start_pos"])
                 timer.lap("pre")
+                st._diagnostic_operation = "forward"
                 h = st.forward(h, ids, start_pos)
                 timer.sync()
                 timer.lap("fwd")
+                st._diagnostic_operation = "encode_output"
                 frame, out_b = _make_step_frame(h, ids, start_pos, signer, token_envelope=envelope)
                 for k in _PASSTHRU:                           # protocol header rides every hop
                     if k == "dnxt" and envelope is not None:
@@ -1209,6 +1307,7 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 if signer is not None:
                     signer.observe(in_b, out_b)
                 timer.lap("out")
+                st._diagnostic_operation = "send_successor"
                 timer.lap("send", kw.send(frame))
                 timer.frame(h.shape[1])
                 continue
@@ -1307,6 +1406,11 @@ def _tail_drafter(st, ckpt_dir, cache):
 def _finalize_stage_receipt(signer, stage):
     """Optional observations belong in the signature preimage; off keeps the old call contract."""
     snapshot = getattr(stage, "runtime_metrics", lambda: None)()
+    if hasattr(stage, "_runtime_observed_sources"):
+        from v4_observability import runtime_observation
+        observation = runtime_observation(stage, session_config=getattr(stage, "_runtime_session_config", None),
+                                          phase="job_complete")
+        return signer.finalize(runtime_metrics=snapshot, runtime_observation=observation)
     return signer.finalize() if snapshot is None else signer.finalize(runtime_metrics=snapshot)
 
 
@@ -1414,6 +1518,8 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
     from, and passing it is what makes a drafted ring possible at all."""
     ret, pred, queued = _tail_bringup(srv, timeout, acceptor=acceptor)
     print("[tail] predecessor + coord-return connected", flush=True)
+    _stage_event("predecessor_connected", getattr(st, "_diagnostic_stage_index", "tail"),
+                 operation="predecessor_accept", service_ready=False)
     chan = _RetChannel(ret)
     threading.Thread(target=_tail_return_reaccept, args=(srv, chan, timeout, acceptor), daemon=True,
                      name="v4-tail-reaccept").start()
@@ -1427,11 +1533,15 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                    getattr(st, "device", None), getattr(st, "_runtime_profile", None))
     with torch.no_grad():
         while True:
+            st._diagnostic_operation = "receive_predecessor"
             msg = queued if queued is not None else recv_msg(pred)
             queued = None
             op = msg.get("op")
             if op == "noop":                                  # keep-warm tick from the predecessor: skip
                 continue
+            st._diagnostic_operation = op
+            if op == "reset":
+                st._diagnostic_job_id = msg.get("job_id")
             if op == "reset":
                 reply_identity = ({key: msg.get(key) for key in ("job_id", "swarm_id", "nonce")}
                                   if msg.get("reply_binding") == 1 else {})
@@ -1494,6 +1604,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                     is_tail=True, binding=_privacy_binding(st, msg) if codec is not None else None)
                 start_pos = int(msg["start_pos"])
                 timer.lap("pre")
+                st._diagnostic_operation = "forward"
                 h = st.forward(h, ids, start_pos)
                 timer.sync()
                 timer.lap("fwd")
@@ -1504,6 +1615,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                     else:
                         signer.observe(in_b, _payload_bytes(h, ids))
                 timer.lap("out")
+                st._diagnostic_operation = "logits"
                 rows = _tail_logit_rows(st, h, start_pos)     # hc_head + norm + lm_head, one row per pos
                 out = {"token": sample_token(rows[-1][0], temp, gen)}
                 if getattr(st, "_spec", False):               # spec: model's greedy token at EVERY chunk pos
@@ -1513,6 +1625,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                 timer.sync()
                 timer.lap("logits")
                 if drafter is not None:                       # dspark: draft the next block locally
+                    st._diagnostic_operation = "draft"
                     draft_msg = dict(msg, ids=ids) if envelope is not None else msg
                     if envelope is not None:
                         hint = codec.open_next_token(envelope, _privacy_binding(st, msg))
@@ -1522,6 +1635,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                 out.update(reply_identity)
                 timer.sync()
                 timer.lap("draft")
+                st._diagnostic_operation = "send_return"
                 timer.lap("send", chan.send(out))
                 timer.frame(h.shape[1])
                 continue
@@ -1647,6 +1761,14 @@ def _sweep_receipts(pipe, ret, layer_count, nonce, *, expected_by_signer=None,
         return recs, False
 
 
+def _timed_receipts(enabled, pipe, ret, layer_count, nonce, **kwargs):
+    if not enabled:
+        return [], None, 0.0
+    started = time.perf_counter()
+    receipts, verified = _sweep_receipts(pipe, ret, layer_count, nonce, **kwargs)
+    return receipts, verified, time.perf_counter() - started
+
+
 def _coord_io(cancel_check, on_token, expected_job=None):
     """Cancellation boundaries around I/O and committed callbacks.
 
@@ -1726,11 +1848,16 @@ def coordinate(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_
             break
         ids = [tid]
 
-    recs, receipts_ok = [], None
-    if receipts:
-        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce, expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
+    recs, receipts_ok, sweep_s = _timed_receipts(receipts, pipe, ret, layer_count, nonce,
+        expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
-            "receipts": recs, "receipts_ok": receipts_ok}
+            "receipts": recs, "receipts_ok": receipts_ok, "receipt_sweep_s": sweep_s,
+            "mode": "greedy", "legacy_g_definition": None,
+            "coordinator_counters": {"accepted_predictions": 0, "proposed_predictions": 0,
+                "cancel_events": 0, "speculation_cycles": None,
+                "frames_enqueued": max(0, len(toks) - 1), "frames_sent": max(0, len(toks) - 1),
+                "replies_received": max(0, len(toks) - 1), "frames_judged": max(0, len(toks) - 1),
+                "stale_replies": 0, "drained_replies": 0, "unsent_frames": 0}}
 
 
 class _RepeatDrafter:
@@ -1789,6 +1916,7 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
     ids = list(prompt_ids)                                    # full committed sequence (prompt + gen)
     toks = []                                                 # generated tokens only
     rounds, accepted_total = 0, 0
+    proposed_predictions = committed_predictions = 0
     hist = {}
 
     # prefill: forward the whole prompt as one chunk, take the first generated token
@@ -1803,6 +1931,7 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
 
     while len(toks) < max_new and cur not in eos:
         drafts = propose(ids, K)                              # K proposed continuations of `cur`
+        proposed_predictions += len(drafts)
         rounds += 1
         _send(pipe, {"op": "step", "ids": [[cur] + drafts], "start_pos": pos})
         r = _recv(ret)["tokens"]                           # model greedy token AFTER each chunk pos (K+1)
@@ -1810,7 +1939,8 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
         accepted_total += n
         hist[n] = hist.get(n, 0) + 1
         stop = False
-        for t in committed:
+        for committed_index, t in enumerate(committed):
+            committed_predictions += int(committed_index < n)
             toks.append(int(t))
             ids.append(int(t))
             if on_token is not None:
@@ -1823,14 +1953,20 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
         if stop:
             break
 
-    recs, receipts_ok = [], None
-    if receipts:
-        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce, expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
+    recs, receipts_ok, sweep_s = _timed_receipts(receipts, pipe, ret, layer_count, nonce,
+        expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
     gen = len(toks)
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
             "receipts": recs, "receipts_ok": receipts_ok,
             "rounds": rounds, "generated": gen, "accepted": accepted_total,
-            "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist}
+            "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist,
+            "mode": "spec", "legacy_g_definition": "total_generated_tokens_per_verified_chunk",
+            "receipt_sweep_s": sweep_s,
+            "coordinator_counters": {"accepted_predictions": committed_predictions,
+                "proposed_predictions": proposed_predictions, "cancel_events": None,
+                "speculation_cycles": rounds, "frames_enqueued": rounds, "frames_sent": rounds,
+                "replies_received": rounds, "frames_judged": rounds,
+                "stale_replies": 0, "drained_replies": 0, "unsent_frames": 0}}
 
 
 # CONFIDENCE-GATED ADAPTIVE SEND-LENGTH (coordinate_dspark). The DSpark drafter emits a per-position
@@ -1956,6 +2092,7 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
         on_token(cur)
 
     block, confs = [], []                                     # round 1 is the bare [cur] chunk (no block)
+    committed_predictions = 0
     d2s = []                                                  # the block's runner-up column (V4_DRAFT_TOP2)
     rescue_by_depth = {}                                      # cancel depth -> [runner-up hits, cancels]
     drafted, sent = 0, 0                                       # rounds that carried a block; drafts offered
@@ -1989,7 +2126,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
         if conf_probe is not None and block:                  # the FULL block's conf vs what accepted
             conf_probe(list(confs), n)
         stop = False
-        for t in committed:
+        for committed_index, t in enumerate(committed):
+            committed_predictions += int(committed_index < n)
             toks.append(int(t))
             ids.append(int(t))
             if on_token is not None:
@@ -2005,16 +2143,22 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
         if stop:
             break
 
-    recs, receipts_ok = [], None
-    if receipts:
-        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce, expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
+    recs, receipts_ok, sweep_s = _timed_receipts(receipts, pipe, ret, layer_count, nonce,
+        expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
     gen = len(toks)
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
             "receipts": recs, "receipts_ok": receipts_ok,
             "rounds": rounds, "drafted": drafted, "generated": gen, "accepted": accepted_total,
             "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist,
             "rescue_by_depth": {d: tuple(v) for d, v in sorted(rescue_by_depth.items())},
-            "sent": sent, "send_hist": send_hist}
+            "sent": sent, "send_hist": send_hist,
+            "mode": "dspark", "legacy_g_definition": "total_generated_tokens_per_verified_chunk",
+            "receipt_sweep_s": sweep_s,
+            "coordinator_counters": {"accepted_predictions": committed_predictions,
+                "proposed_predictions": sent, "cancel_events": None,
+                "speculation_cycles": rounds, "frames_enqueued": rounds, "frames_sent": rounds,
+                "replies_received": rounds, "frames_judged": rounds,
+                "stale_replies": 0, "drained_replies": 0, "unsent_frames": 0}}
 
 
 # ── PIPELINED speculation: stream the block as s=1 frames instead of verifying it as one chunk ──────
@@ -2280,6 +2424,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     dalt = {}                                                 # pos -> the drafter's runner-up there
     horizon = c - 1                                           # highest position a frame has been sent for
     frames = drafted = accepted = cancels = run = stale = issued = 0
+    proposed_predictions = committed_predictions = replies_received = frames_judged = drained_replies = 0
     topups = topup_frames = topup_agree = topup_disagree = 0
     hist, depths = {}, []
     by_depth, tu_by_depth = {}, {}                            # draft depth -> [hits, trials], per source
@@ -2291,7 +2436,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     # bias measured ~6.5% high on the live ring. `tick` instead integrates level x wall time across
     # every change of `c` or `horizon`: the clock starts at the first streamed frame and freezes on
     # the commit that sets `stop`, so the post-EOS drain dilutes nothing.
-    tick = {"t": None, "area": 0.0, "span": 0.0}
+    tick = {"t": None, "area": 0.0, "span": 0.0, "durations": {}}
 
     def _mark():
         """Advance the fill integral to NOW at the CURRENT level — called BEFORE c/horizon moves."""
@@ -2301,8 +2446,10 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         now = time.perf_counter()
         if tick["t"] is not None:
             dt = now - tick["t"]
-            tick["area"] += (horizon - c + 1) * dt
+            level = horizon - c + 1
+            tick["area"] += level * dt
             tick["span"] += dt
+            tick["durations"][level] = tick["durations"].get(level, 0.0) + dt
         tick["t"] = now
 
     def _feed(pos, tok, nxt=None, prev=False, dep=0, src="block", alt=None):
@@ -2332,7 +2479,8 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         `alt` is the drafter's RUNNER-UP for this position (the reply's `d2` column, sliced exactly
         as the draft was) — carried purely so a cancel can score it (`rescue_by_depth`). Nothing is
         ever fed from it."""
-        nonlocal horizon, frames, topup_frames
+        nonlocal horizon, frames, topup_frames, proposed_predictions
+        proposed_predictions += int(dep > 0)
         sent[pos] = int(tok)
         ddepth[pos] = int(dep)
         dsrc[pos] = src
@@ -2398,6 +2546,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 raise RuntimeError(f"v4 pipelined dspark: the frame sender died: "
                                    f"{type(sender.err).__name__}: {sender.err}") from sender.err
             raise
+        replies_received += 1
         with st8.lock:
             pos, ep = st8.outstanding.popleft()
             st8.pending -= 1
@@ -2410,7 +2559,9 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             stale += 1
             continue
         if stop:                                              # draining after EOS/max_new: judge nothing
+            drained_replies += 1
             continue
+        frames_judged += 1
         if pos != c:
             raise RuntimeError(f"v4 pipelined dspark: reply for position {pos} with the committed "
                                f"frontier at {c} — replies must land in committed order")
@@ -2446,6 +2597,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             slot[1] += 1
             if fed == m:
                 slot[0] += 1
+                committed_predictions += 1
             elif dalt.get(pos + 1) is not None:               # THE TREE GATE: a cancel with a d2 to
                 slot2 = rescue_by_depth.setdefault(fdep, [0, 0])   # judge — would the runner-up have
                 slot2[1] += 1                                 # rescued this very cancel? beta is
@@ -2579,9 +2731,8 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     if sender.err is not None:
         raise RuntimeError(f"v4 pipelined dspark: the frame sender died: "
                            f"{type(sender.err).__name__}: {sender.err}") from sender.err
-    recs, receipts_ok = [], None
-    if receipts:
-        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce, expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
+    recs, receipts_ok, sweep_s = _timed_receipts(receipts, pipe, ret, layer_count, nonce,
+        expected_by_signer=expected_by_signer, swarm_id=swarm_id, job_id=job_id, cancel_check=cancel_check)
     gen = len(toks)
     cycles = cancels + 1
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
@@ -2601,7 +2752,17 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             "decode_wall_s": round(tick["span"], 3),
             "frames_per_token": round(frames / gen, 3) if gen else 0.0,
             "block_len": blen,
-            "stale_replies": stale, "unsent_frames": st8.unsent}
+            "stale_replies": stale, "unsent_frames": st8.unsent,
+            "mode": "pipelined", "legacy_g_definition": "total_generated_tokens_per_cancel_cycle",
+            "receipt_sweep_s": sweep_s,
+            "inflight_intervals": [{"level": level, "duration_s": duration}
+                for level, duration in sorted(tick["durations"].items())],
+            "coordinator_counters": {"accepted_predictions": committed_predictions,
+                "proposed_predictions": proposed_predictions, "cancel_events": cancels,
+                "speculation_cycles": cycles, "frames_enqueued": frames,
+                "frames_sent": frames - st8.unsent, "replies_received": replies_received,
+                "frames_judged": frames_judged, "stale_replies": stale,
+                "drained_replies": drained_replies, "unsent_frames": st8.unsent}}
 
 
 # ── layer tiling: consume a V4 profile via plan_ring ───────────────────────────────────────────────
@@ -2724,6 +2885,7 @@ ENG_ENV = [
     "V4_REF_SLIM", "V4_REF_SLIM_NOQAT",                                         # reference-compute slim
     "V4_FAST_VERIFY", "V4_FAST_VERIFY_MAX",                                     # chunked verify
     "V4_KERNELS", "V4_DTYPE", "V4_MAX_SEQ", "V4_MAX_BATCH",                     # stage build-out
+    "V4_HADAMARD",                                                              # shared service/bench backend
     "V4_KEEPWARM", "V4_KEEPWARM_MS",                                            # transport keep-warm
     "V4_DIAL_CONNECT_TIMEOUT", "V4_DIAL_RETRY_S",                               # inter-stage dial
     "V4_TIMING", "V4_TIMING_EVERY",                                             # instrumentation
@@ -3078,6 +3240,8 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
     terminates at that box's ingress and is bridged over loopback to the box tail (the --ret-relay
     path a real G>1 tail box runs), proving the return relay against the same parity bar."""
     import tempfile
+    from v4_runtime_init import prepare_cpu_selftest
+    prepare_cpu_selftest()
     import v4_ref_cpu as R
     os.environ["SHARD_RECEIPTS"] = "1"
     global RECEIPTS
@@ -3305,10 +3469,17 @@ def _coord_cli(a):
     the V4 path. To stream jobs by hand rather than tear down between them, keep stdin open (e.g. feed
     a FIFO) rather than piping a here-doc that EOFs after the last line."""
     os.environ.setdefault("V4_DIR", a.dir)
+    session_config = getattr(a, "session_config", None)
+    strict = session_config is not None
+    assignments = ({row["signer_pubkey"]: (row["lo"], row["hi"])
+                    for row in session_config.plan["stages"]} if strict else None)
+    if strict:
+        a.receipts = True
+    job_options = {"expected_by_signer": assignments, "strict_job_binding": strict}
     layer_count = ring_args(a.dir).n_layers                   # same view of the config the stages built
     try:
-        from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(a.dir, trust_remote_code=True)
+        from v4_tokenizer import load_v4_tokenizer
+        tok = load_v4_tokenizer(a.dir)
     except Exception as e:  # noqa: BLE001
         _emit("SHARD_JOB_FATAL", error=f"tokenizer load failed: {e}")
         return 1
@@ -3321,7 +3492,10 @@ def _coord_cli(a):
     # and V4_PIPELINED_SPEC are read HERE and nowhere else, and an operator who set them on the
     # stages instead has, until now, had no signal at all.
     v4_levers.report(side=v4_levers.COORDINATOR)
-    _emit("SHARD_COORD_READY", head=a.head, tail=a.tail, receipts=a.receipts)
+    from v4_observability import effective_flags, public_environment
+    _emit("SHARD_COORD_READY", head=a.head, tail=a.tail, receipts=a.receipts,
+          strict=strict, serviceReady=False, state="connected; signed warmup still required",
+          environment=public_environment(), runtimeAudit=effective_flags(v4_levers.COORDINATOR))
     audited = False
 
     for line in sys.stdin:
@@ -3330,22 +3504,36 @@ def _coord_cli(a):
             continue
         try:
             job = json.loads(line)
+            if not isinstance(job, dict):
+                raise ValueError("job must be a JSON object")
             job_id = job["jobId"]
-        except (ValueError, KeyError) as e:
+            requested_max = job.get("maxNew", 512)
+            if type(requested_max) is not int:
+                raise ValueError("maxNew must be an integer")
+            max_new = max(1, min(requested_max, 4096))
+        except (ValueError, KeyError, TypeError) as e:
             _emit("SHARD_JOB_FATAL", error=f"unparseable job line: {e}")
             continue
-        max_new = max(1, min(int(job.get("maxNew") or 512), 4096))
         _emit("SHARD_JOB_START", jobId=job_id, maxNew=job.get("maxNew"))
-        state = {"n": 0, "t0": None, "tft": None}
+        state = {"n": 0, "t0": None, "tft": None, "last": None}
 
         def _on_token(_tid, _job=job_id, _st=state):
             _st["n"] += 1
+            now = time.perf_counter() - _st["t0"]
             if _st["tft"] is None:                            # first-token latency (prefill + one traversal)
-                _st["tft"] = time.time() - _st["t0"]
+                _st["tft"] = now
+            _st["last"] = now
             _emit("SHARD_JOB_TOKEN", jobId=_job, delta=_st["n"])
         try:
             prompt_ids = _encode_prompt(tok, job)
-            state["t0"] = time.time()
+            if strict:
+                import secrets
+                job["nonce"] = job.get("nonce") or secrets.token_hex(32)
+                nonce = job["nonce"]
+                if not isinstance(nonce, str) or len(nonce) != 64 or any(c not in "0123456789abcdef" for c in nonce):
+                    raise ValueError("strict jobs require a fresh 32-byte lowercase hex nonce")
+            job_eos = () if job.get("ignoreEOS") is True else eos_ids
+            state["t0"] = time.perf_counter()
             if job.get("dspark"):                             # V4's own trained speculator, on the tail
                 # PIPELINED is opt-in per job or per process, and the serial path stays the default:
                 # the two emit the same stream, but only one of them has been measured on a real ring.
@@ -3364,40 +3552,58 @@ def _coord_cli(a):
                         "Run one or the other, not both.")
                 if pipelined:
                     r = coordinate_dspark_pipelined(
-                        pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
+                        pipe, ret, prompt_ids, max_new, eos_ids=job_eos,
                         nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
                         job_id=job_id, layer_count=layer_count, receipts=a.receipts,
-                        timeout=a.timeout, on_token=_on_token)
+                        timeout=a.timeout, on_token=_on_token, **job_options)
                 else:
-                    r = coordinate_dspark(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
+                    r = coordinate_dspark(pipe, ret, prompt_ids, max_new, eos_ids=job_eos,
                                           nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
                                           job_id=job_id, layer_count=layer_count, receipts=a.receipts,
                                           timeout=a.timeout, on_token=_on_token,
                                           conf_gate=job.get("confGate"),  # None -> V4_DSPARK_CONF_* env
                                           conf_thresh=job.get("confThresh"),
-                                          conf_min=job.get("confMin"))
+                                          conf_min=job.get("confMin"), **job_options)
             elif job.get("spec"):                             # coordinator-side drafter (n-gram)
-                r = coordinate_spec(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
+                r = coordinate_spec(pipe, ret, prompt_ids, max_new, eos_ids=job_eos,
                                     nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
                                     job_id=job_id, layer_count=layer_count, receipts=a.receipts,
                                     timeout=a.timeout, on_token=_on_token,
-                                    K=int(job.get("specK", 4)), ng=int(job.get("specNg", 3)))
+                                    K=int(job.get("specK", 4)), ng=int(job.get("specNg", 3)), **job_options)
             else:
-                r = coordinate(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
+                r = coordinate(pipe, ret, prompt_ids, max_new, eos_ids=job_eos,
                                nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
                                job_id=job_id, layer_count=layer_count, receipts=a.receipts,
                                temp=float(job.get("temperature", 0.0)), timeout=a.timeout,
-                               on_token=_on_token)
-            elapsed = time.time() - state["t0"]
+                               on_token=_on_token, **job_options)
+            elapsed = time.perf_counter() - state["t0"]
             ngen = len(r["tokens"])
+            if strict and r["receipts_ok"] is not True:
+                raise RuntimeError("strict job failed assigned-signer receipt coverage/chain validation")
+            if state["n"] != ngen:
+                raise RuntimeError("committed callbacks differ from the returned output tokens")
+            from shard.benchmark_metrics import make_coordinator_diagnostics
+            request_elapsed = elapsed - r.get("receipt_sweep_s", 0.0)
+            diagnostics = make_coordinator_diagnostics(r.get("mode", "greedy"), committed_tokens=ngen,
+                prefill_tokens=min(1, ngen), counters=r.get("coordinator_counters"),
+                timing={"request_elapsed_s": request_elapsed, "first_token_s": state["tft"],
+                    "last_token_s": state["last"], "receipt_sweep_s": r.get("receipt_sweep_s", 0.0)},
+                inflight_intervals=r.get("inflight_intervals"))
+            decode_s = diagnostics["timing"]["decode_s"]
             _emit("SHARD_JOB_DONE", jobId=job_id, ok=True,
                   response=tok.decode(r["tokens"], skip_special_tokens=True),
                   tokensGenerated=ngen,
+                  tokenIds=r["tokens"],
                   tokPerSec=round(ngen / elapsed, 3) if elapsed > 0 else None,
+                  tokPerSecDefinition="compatibility: committed tokens / full return including receipt sweep",
+                  decodeTokPerSec=(ngen - 1) / decode_s if ngen > 1 and decode_s else None,
+                  endToEndTokPerSec=ngen / request_elapsed if request_elapsed > 0 else None,
                   firstTokenMs=round((state["tft"] or 0) * 1000, 1),
                   elapsedS=round(elapsed, 2),
                   spec=bool(job.get("spec") or job.get("dspark")), dspark=bool(job.get("dspark")),
                   g=r.get("g"), rounds=r.get("rounds"), acceptHist=r.get("accept_hist"),
+                  gDefinition=r.get("legacy_g_definition"), coordinatorDiagnostics=diagnostics,
+                  runtimeAudit=effective_flags(v4_levers.COORDINATOR),
                   receipts=[wire_receipt(rr) for rr in (r["receipts"] or [])],
                   receiptsOk=r["receipts_ok"], nonce=job.get("nonce"))
         except Exception as e:  # noqa: BLE001
@@ -3405,7 +3611,9 @@ def _coord_cli(a):
             # the pipe to the head, which disconnects it and cascades the ring down. A fresh reset on
             # the next job re-inits every still-connected stage, so a transient hiccup costs one job,
             # not the warm ring.
-            _emit("SHARD_JOB_FATAL", jobId=job_id, error=f"{type(e).__name__}: {e}")
+            traceback.print_exc(file=sys.stderr)
+            _emit("SHARD_JOB_FATAL", jobId=job_id, error=f"{type(e).__name__}: {e}",
+                  errorType=type(e).__name__, operation="coordinate", strict=strict)
             continue
         if not audited:
             # ONCE, after the first job COMPLETES and OUTSIDE its try. The coordinator levers are
@@ -3433,6 +3641,7 @@ def main():
     s.add_argument("--lo", type=int, required=True)
     s.add_argument("--hi", type=int, required=True)
     s.add_argument("--port", type=int, default=ENG_IN)
+    s.add_argument("--timeout", type=int, default=600)
     s.add_argument("--next", default=None, dest="next")
     s.add_argument("--ret-relay", default=None, dest="ret_relay",
                    help="multi-GPU tail box ingress only: loopback addr of the box tail's return "
@@ -3463,6 +3672,9 @@ def main():
     sub.add_parser("selftest-relay",
                    help="offline CPU parity proof with a MULTI-GPU tail box (return relay path)")
     a = ap.parse_args()
+    if a.cmd in ("selftest", "selftest-relay"):
+        from v4_runtime_init import prepare_cpu_selftest
+        prepare_cpu_selftest()
 
     if a.cmd == "stage":
         lease_guard = None
@@ -3482,15 +3694,21 @@ def main():
         if not a.legacy_protocol:
             if plan is None or not plan.get("model_cohort"):
                 ap.error("strict V4 stage requires a full model-cohort deployment plan; legacy is explicit")
-            raw = open(os.path.join(a.dir, "config.json"), "rb").read()
-            import hashlib
-            if hashlib.sha256(raw).hexdigest() != plan["model_cohort"]["config_sha256"]:
-                ap.error("V4 checkpoint config differs from the deployment cohort")
-            session_config = SessionConfig.from_plan(plan, a.stage, caller_key=load_or_make_node_key(NODE_KEY_PATH))
-        serve_stage(a.stage, a.nstages, a.lo, a.hi, a.port, nxt=a.next, ckpt_dir=a.dir,
-                    device=a.device, receipts=(a.receipts or RECEIPTS), bind=a.bind,
-                    ret_relay=a.ret_relay, dspark=a.dspark, runtime_metrics=a.runtime_metrics,
-                    lease_guard=lease_guard, session_config=session_config)
+            verify_cohort_directory(a.dir, plan["model_cohort"], weights=True,
+                lo=a.lo, hi=a.hi, head=a.stage == 0, tail=a.stage == a.nstages - 1,
+                dspark=bool(a.dspark and a.stage == a.nstages - 1))
+            session_config = SessionConfig.from_plan(plan, a.stage, ttl_s=min(3600, max(30, a.timeout * 2)),
+                                                    caller_key=load_or_make_node_key(NODE_KEY_PATH))
+        try:
+            _stage_event("starting", a.stage, operation="initialize", strict=session_config is not None)
+            serve_stage(a.stage, a.nstages, a.lo, a.hi, a.port, nxt=a.next, ckpt_dir=a.dir,
+                        device=a.device, receipts=(a.receipts or RECEIPTS or session_config is not None), bind=a.bind,
+                        ret_relay=a.ret_relay, dspark=a.dspark, runtime_metrics=a.runtime_metrics,
+                        lease_guard=lease_guard, session_config=session_config, timeout=a.timeout)
+        except Exception as error:
+            _stage_event("process_failed", a.stage, operation="stage", error_type=type(error).__name__,
+                         error=str(error)[:4096], service_ready=False)
+            raise
         if lease_stop is not None:
             lease_stop.set()
     elif a.cmd == "coord":
@@ -3502,6 +3720,7 @@ def main():
             plan = load_plan(a.deployment_plan)
             if not plan.get("model_cohort"):
                 ap.error("strict V4 coordinator requires the full model cohort")
+            verify_cohort_directory(a.dir, plan["model_cohort"])
             a.head, a.tail = plan["coordinator"]["head"], plan["coordinator"]["tail"]
             a.session_config = SessionConfig.from_plan(plan, -1, caller_key=load_or_make_node_key(a.coordinator_key))
         sys.exit(_coord_cli(a))

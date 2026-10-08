@@ -77,11 +77,13 @@ def process_lease_watchdog(guard, *, interval_s=0.25, exit_process=os._exit):
 
 class LeasedProcessRunner:
     def __init__(self, guard, *, ledger_path, command_factory, environment=None, stop_timeout_s=5,
-                 runtime_config=None):
+                 runtime_config=None, weight_preparer=None):
         self.guard, self.ledger_path = guard, str(ledger_path)
         self.command_factory, self.environment = command_factory, dict(environment or {})
         self.stop_timeout_s = stop_timeout_s
         self.runtime_config = runtime_config
+        self.weight_preparer = weight_preparer
+        self._prepared = None
         self._lock = threading.RLock()
         self._process = self._work = self._monitor = self._config = None
         self._stop = threading.Event()
@@ -96,7 +98,17 @@ class LeasedProcessRunner:
             if (assignment.get("ring_id") != lease.ring_id or assignment.get("cohort_id") != lease.model_cohort_sha256
                     or assignment.get("node_id") != lease.node_id or assignment.get("gpu_uuid") != lease.gpu_uuid):
                 raise ValueError("stage assignment differs from node lease")
-            command = self.command_factory(dict(assignment))
+            local_assignment = dict(assignment)
+            if assignment.get("weight_artifacts") is not None:
+                if self.weight_preparer is None:
+                    raise ValueError("stage artifact assignment requires a locally configured preparation hook")
+                prepared = self.weight_preparer(assignment, self.guard)
+                if prepared.get("ready") is not True or prepared.get("payload_integrity_verified") is not True:
+                    raise ValueError("stage weights are not fully verified and READY")
+                self.guard.assert_live()
+                self._prepared = prepared
+                local_assignment["model_dir"] = prepared["directory"]
+            command = self.command_factory(local_assignment)
             if not isinstance(command, (list, tuple)) or not command or any(not isinstance(v, str) for v in command):
                 raise ValueError("local command factory must return argv strings")
             work = self.guard.begin_work("resident-stage-" + lease.lease_id + "-" + secrets.token_hex(8))
@@ -177,10 +189,11 @@ class LeasedProcessRunner:
                     except (OSError, ValueError): pass
             return {"pid": None if self._process is None else self._process.pid,
                     "running": self._process is not None and self._process.poll() is None,
-                    "resident_work_held": self._work is not None, "error": self._error, "telemetry": telemetry}
+                    "resident_work_held": self._work is not None, "error": self._error, "telemetry": telemetry,
+                    **({"weight_preparation": self._prepared} if self._prepared is not None else {})}
 
 
-def configured_stage_factory(ledger_path, stages):
+def configured_stage_factory(ledger_path, stages, *, weight_preparer=None):
     """Build runners ONLY from locally measured and configured stage templates.
 
     Each template has cohort_id, lo/hi, head/tail, requirements, runtime_config,
@@ -208,6 +221,15 @@ def configured_stage_factory(ledger_path, stages):
         if len(matching) != 1:
             raise ValueError("no unique locally calibrated stage template")
         row = matching[0]
+        if assignment.get("preparation_mode") is not None:
+            from .resources import StorageRequirements
+            if row.get("storage") is None:
+                raise ValueError("planned preparation requires a locally approved storage template")
+            storage = StorageRequirements.from_dict(row["storage"])
+            if (assignment["preparation_mode"] not in {option.mode for option in storage.preparation_options}
+                    or assignment.get("weight_artifacts") != {key: getattr(storage, key)
+                        for key in ("artifact_id", "checkpoint_id", "manifest_sha256")}):
+                raise ValueError("planned artifact strategy differs from the locally approved storage template")
         req = PlacementRequirements.from_dict(row["requirements"])
         cfg = row["runtime_config"]
         if (req.provenance.node_id != guard.node_id or (req.layer_start, req.layer_end) != (assignment["lo"], assignment["hi"])
@@ -225,10 +247,16 @@ def configured_stage_factory(ledger_path, stages):
             if oss_flags(env) != oss_flags(cfg.get("environment", {})):
                 raise ValueError("effective GPT-OSS stage environment differs from calibration")
         allowed_placeholders = {"lo", "hi", "stage", "nstages", "next"}
+        if weight_preparer is not None:
+            allowed_placeholders.add("model_dir")
+        model_path_used = False
         for arg in row["argv"]:
             for _, field, fmt, conversion in string.Formatter().parse(arg):
+                model_path_used |= field == "model_dir"
                 if field is not None and (field not in allowed_placeholders or fmt or conversion):
                     raise ValueError("stage argv may interpolate only validated execution coordinates")
+        if assignment.get("weight_artifacts") is not None and not model_path_used:
+            raise ValueError("prepared weights must be loaded from the verified {model_dir} template")
         measured = datetime.fromisoformat(req.provenance.measured_at.replace("Z", "+00:00"))
         if not -30 <= (datetime.now(timezone.utc) - measured).total_seconds() <= 300:
             raise ValueError("local stage calibration is stale")
@@ -239,5 +267,7 @@ def configured_stage_factory(ledger_path, stages):
             # Values remain argv elements; no shell interprets these strings.
             return [arg.format_map(local_assignment) for arg in row["argv"]]
         return LeasedProcessRunner(guard, ledger_path=ledger_path, command_factory=command,
-                                   environment=row.get("environment"), runtime_config=cfg)
+                                   environment=row.get("environment"), runtime_config=cfg,
+                                   weight_preparer=weight_preparer)
+    factory.weight_preparer = weight_preparer
     return factory

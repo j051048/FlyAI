@@ -309,6 +309,8 @@ def install():
     resolves off sys.path (v4_ref_cpu's job) with no shim in the way."""
     be = backend()
     if be == "tilelang":
+        from v4_runtime_init import ensure_hadamard
+        ensure_hadamard()
         return be
     clash = [n for n in _MODULES if _foreign(n)]
     if clash and V4_KERNELS != "cpu":
@@ -322,6 +324,8 @@ def install():
             sys.modules[name] = mod
         for attr, value in attrs.items():
             setattr(mod, attr, value)
+    from v4_runtime_init import ensure_hadamard
+    ensure_hadamard()
     return be
 
 

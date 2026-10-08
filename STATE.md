@@ -1,6 +1,6 @@
 # FlyAI / Shard — implementation status
 
-Reviewed 2026-10-08 against code `c2ab623`. Current commands and documentation are indexed in
+Reviewed 2026-10-08 against `a6e96e3` plus local artifact-preparation/replacement and P0–P2 operations changes. Commands and documentation are indexed in
 [DOCUMENTATION_INDEX](docs/DOCUMENTATION_INDEX.md). The dated journal below records earlier experiments;
 its `DONE`, `NOW` and speed labels describe those sessions, not current cluster readiness.
 
@@ -9,12 +9,14 @@ its `DONE`, `NOW` and speed labels describe those sessions, not current cluster 
 | Area | Current code and limits |
 |---|---|
 | JOIN | Open signed GPU offers, cohort compatibility, TTL/sequence replay protection and verified model files. Sidecars retain identity/transport/NAT handling. |
+| WEIGHTS | Native V4 logical tensor catalogues, bounded streaming conversion, hash-verified stage artifacts, shared preparation disk/RAM leases and atomic publication. Configured same-cohort candidates support request-boundary replacement; source/calibration configuration and real GPU acceptance remain required. See [weight preparation](docs/WEIGHT_PREPARATION.md). |
 | FORM | Regional/directed-route search, heterogeneous exact calibrated spans, shared host budgets, prepare/commit/renew/release leases and resident-process fencing. Inference routes are supplied by the existing deployment/sidecar layer. |
 | SERVE | GPT-OSS and V4 open-network service adapters, signed warmup, authenticated HTTP/SSE, one serial worker per ring and parallel separate rings. No continuous batching or durable coordinator HA claim. |
 | PROVE | Fresh signed receipts, actual activation commitments, full layer coverage and chain checks; local challenge primitives. These do not prove every participant computed honestly. |
 | PAY | Consuming-network integration, outside this engine's implementation/verification scope. |
+| V4 OPERATIONS | Shared Hadamard/alias initialization, isolated CPU selftest, strict caller-local SSH deployment, signed runtime declarations and raw measurement/controlled A/B tooling. See [V4 operations](docs/V4_OPERATIONS.md); actual GPU and WAN acceptance remain separate. |
 
-Latest selected local CPU/socket/HTTP regression: **985 passed, 3 environment-dependent skips**.
+Latest selected local CPU/socket/HTTP regression: **1620 passed, 3 environment-dependent skips, 41 GPU-marked cases deselected**.
 Actual native MXFP4 GPU execution and new V4 four/six-card acceptance remain pending live verification.
 The targets remain **4x5090 >=40 / 6x5090 >=30 valid output tok/s**, using the frozen benchmark and raw evidence.
 

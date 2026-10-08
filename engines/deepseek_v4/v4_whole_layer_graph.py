@@ -641,6 +641,26 @@ class WholeBlockGraphs:
         self._graphs = {}     # (bucket, compress) -> graph + static io
         self._pool = None     # one shared graph memory pool across every variant
         self.ho = self.ffn_out_buf = self.g_post = None
+        from v4_runtime_init import bind_attention_aliases, tensor_storage_signature
+        self._alias_signature = (bind_attention_aliases(L.attn, rebind=True)["signature"],
+                                 tuple(tensor_storage_signature(t) for t in _layer_state(L)))
+        self.alias_invalidations = 0
+
+    def _check_aliases(self):
+        """Refresh views and retire any graphs capturing replaced buffers."""
+        global _GRAPH_COUNT
+        from v4_runtime_init import bind_attention_aliases, tensor_storage_signature
+        binding = bind_attention_aliases(self.L.attn, rebind=True)
+        signature = (binding["signature"], tuple(tensor_storage_signature(t) for t in _layer_state(self.L)))
+        if signature != self._alias_signature:
+            removed = len(self._graphs) + int(self.g_post is not None)
+            _GRAPH_COUNT = max(0, _GRAPH_COUNT - removed)
+            self._graphs.clear(); self._bufs.clear()
+            self.g_post = self.ho = self.ffn_out_buf = self._pool = None
+            self._alias_signature = signature
+            self.alias_invalidations += 1
+            if self.has_indexer:
+                self.maxw = self.L.attn.indexer.kv_cache.size(1)
 
     # -- per-step shape decisions, all HOST-side before a replay --
 
@@ -772,6 +792,7 @@ class WholeBlockGraphs:
 
     def _capture(self, key, ids=None):
         """Capture the graph(s) for one (bucket, compress) key. moe_eager captures g_pre (+ g_post once)."""
+        self._check_aliases()
         bucket, compress = key
         # ALWAYS point the static buffers at a valid position for this variant FIRST: the warm-up runs
         # for real, and a compress variant captured at the zero-filled pos_buf would read
@@ -828,6 +849,7 @@ class WholeBlockGraphs:
         wrong model. The other modes run the MoE outside the graph and pass `ids` to it directly, so
         None there is merely the score-routed case and stays legal."""
         global _GRAPH_SKIPPED
+        self._check_aliases()
         if self.eager:
             return self._eager(h, ids, start_pos)
         if self.moe_requested and self.moe_in_graph is None:

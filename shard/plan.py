@@ -683,6 +683,12 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
             row = spec["calibrations"][i]
             st.update(runtime_config_sha256=row["runtime_config_sha256"],
                       calibrated_resources={key: row[key] for key in ("gpu_bytes", "host_bytes", "pinned_bytes")})
+            if row.get("storage") is not None:
+                storage = row["storage"]
+                st.update(storage=storage, preparation_mode=row["preparation_mode"],
+                          filesystem_id=row["filesystem_id"], disk_peak_bytes=row["disk_bytes"],
+                          weight_artifacts={key: storage[key] for key in ("artifact_id", "checkpoint_id", "manifest_sha256")},
+                          prepare_ram_bytes=row["prepare_ram_bytes"], prepare_pinned_bytes=row["prepare_pinned_bytes"])
         if m.get("placement") == "ram":
             st["layer_ms"] = layer_ms[i]
             st["latency_source"] = ("measured_layer" if nodes[i].get("layer_ms") is not None else

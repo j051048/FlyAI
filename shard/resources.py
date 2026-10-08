@@ -155,6 +155,47 @@ class PlacementRequirements:
 
 
 STORAGE_SCHEMA = "shard-storage-requirements/1"
+STORAGE_PREPARE_SCHEMA = "shard-storage-requirements/2"
+
+
+def _relative_file(value):
+    _text(value, "file path")
+    if ("\\" in value or ":" in value or PurePosixPath(value).is_absolute()
+            or any(part in ("", ".", "..") for part in value.split("/"))
+            or any(ord(c) < 32 for c in value)):
+        raise ResourceError("storage file path must be a safe relative path")
+    return value
+
+
+@dataclass(frozen=True)
+class StorageFile:
+    path: str
+    size: int
+    sha256: str
+
+    def __post_init__(self):
+        _relative_file(self.path)
+        byte_count(self.size, "file size")
+        if not isinstance(self.sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
+            raise ResourceError("storage file sha256 must be a lowercase SHA256")
+
+
+@dataclass(frozen=True)
+class PreparationOption:
+    mode: str
+    filesystem_id: str
+    disk_peak_bytes: int
+    ram_bytes: int
+    pinned_bytes: int = 0
+
+    def __post_init__(self):
+        if self.mode not in ("fetch", "range_repack"):
+            raise ResourceError("unknown bounded artifact preparation mode")
+        _text(self.filesystem_id, "filesystem_id")
+        for name in ("disk_peak_bytes", "ram_bytes", "pinned_bytes"):
+            byte_count(getattr(self, name), name)
+        if self.disk_peak_bytes == 0 or self.ram_bytes == 0 or self.pinned_bytes > self.ram_bytes:
+            raise ResourceError("preparation needs explicit positive disk/RAM bounds and a valid pinned subset")
 
 
 @dataclass(frozen=True)
@@ -166,9 +207,21 @@ class StorageRequirements:
     files: tuple[str, ...] = ()
     manifest_sha256: str = ""
     schema: str = STORAGE_SCHEMA
+    file_records: tuple[StorageFile, ...] = ()
+    checkpoint_id: str = ""
+    artifact_id: str = ""
+    filesystem_id: str = ""
+    head: bool = False
+    tail: bool = False
+    dspark: bool = False
+    download_staging_bytes: int = 0
+    conversion_staging_bytes: int = 0
+    prepare_ram_bytes: int = 0
+    prepare_pinned_bytes: int = 0
+    preparation_options: tuple[PreparationOption, ...] = ()
 
     def __post_init__(self):
-        if self.schema != STORAGE_SCHEMA:
+        if self.schema not in (STORAGE_SCHEMA, STORAGE_PREPARE_SCHEMA):
             raise ResourceError(f"unsupported storage schema {self.schema!r}")
         _text(self.model_id, "model_id")
         byte_count(self.layer_start, "layer_start")
@@ -176,11 +229,35 @@ class StorageRequirements:
         byte_count(self.storage_bytes, "storage_bytes")
         if self.layer_end <= self.layer_start:
             raise ResourceError("layer span must be nonempty")
+        if (not isinstance(self.files, tuple) or any(not isinstance(name, str) for name in self.files)
+                or len(set(self.files)) != len(self.files)):
+            raise ResourceError("storage files must be a unique tuple")
         for f in self.files:
-            _text(f, "file name")
+            _relative_file(f)
         if self.manifest_sha256:
             if not isinstance(self.manifest_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.manifest_sha256):
                 raise ResourceError("manifest_sha256 must be a lowercase SHA-256")
+        for name in ("download_staging_bytes", "conversion_staging_bytes", "prepare_ram_bytes", "prepare_pinned_bytes"):
+            byte_count(getattr(self, name), name)
+        if self.prepare_pinned_bytes > self.prepare_ram_bytes:
+            raise ResourceError("prepare pinned allocation must be a subset of prepare RAM")
+        if any(type(getattr(self, name)) is not bool for name in ("head", "tail", "dspark")):
+            raise ResourceError("storage roles must be booleans")
+        if self.schema == STORAGE_PREPARE_SCHEMA:
+            for name in ("checkpoint_id", "artifact_id", "filesystem_id", "manifest_sha256"):
+                _text(getattr(self, name), name)
+            if (not self.file_records or any(not isinstance(row, StorageFile) for row in self.file_records)
+                    or tuple(row.path for row in self.file_records) != self.files):
+                raise ResourceError("preparation requires exact size/hash records for every storage file")
+            if self.storage_bytes < sum(row.size for row in self.file_records):
+                raise ResourceError("storage budget is below complete selected file bytes")
+            seen = set()
+            for option in self.preparation_options:
+                if not isinstance(option, PreparationOption) or option.filesystem_id != self.filesystem_id or option.mode in seen:
+                    raise ResourceError("preparation alternatives must be unique validated bounds for the same filesystem")
+                seen.add(option.mode)
+                if option.mode == "fetch" and option.disk_peak_bytes < self.storage_bytes:
+                    raise ResourceError("fetch budget cannot replace full file bytes with selected tensor bytes")
 
     def to_dict(self):
         return asdict(self)
@@ -190,11 +267,64 @@ class StorageRequirements:
         if not isinstance(value, dict):
             raise ResourceError("requirements must be an object")
         body = dict(value)
-        if body.get("schema") != STORAGE_SCHEMA:
+        if body.get("schema") not in (STORAGE_SCHEMA, STORAGE_PREPARE_SCHEMA):
             raise ResourceError("serialized requirements must declare the supported schema")
         files = tuple(body.get("files", ()))
         body["files"] = files
-        return cls(**body)
+        if body.get("schema") == STORAGE_PREPARE_SCHEMA and set(body) != {f.name for f in fields(cls)}:
+            raise ResourceError("preparation storage evidence must declare every field")
+        try:
+            body["file_records"] = tuple(StorageFile(**row) if isinstance(row, dict) else row
+                                          for row in body.get("file_records", ()))
+            body["preparation_options"] = tuple(PreparationOption(**row) if isinstance(row, dict) else row
+                                                  for row in body.get("preparation_options", ()))
+            return cls(**body)
+        except (TypeError, KeyError) as exc:
+            raise ResourceError("invalid storage requirement fields") from exc
+
+    def preparation_budget(self, verified_existing=None, *, mode=None):
+        """Additional peak; only a genuine local full-hash witness may offset files.
+
+        The filesystem's free capacity already excludes existing files. Never
+        accept a JSON boolean claiming they are present/verified as a discount.
+        Remote offers carry forecasts; node-local preparation repeats validation.
+        """
+        if self.schema != STORAGE_PREPARE_SCHEMA:
+            raise ResourceError("legacy storage estimates cannot authorize artifact preparation")
+        existing = {}
+        if verified_existing is not None:
+            from .weight_artifacts import (verified_stage_artifact_descriptor, VerifiedWeightPack,
+                                           select_stage_artifacts)
+            descriptor = verified_stage_artifact_descriptor(verified_existing)
+            if isinstance(verified_existing, VerifiedWeightPack):
+                descriptor = select_stage_artifacts(verified_existing["catalog"], verified_existing["pack"],
+                    self.layer_start, self.layer_end, head=self.head, tail=self.tail, dspark=self.dspark)
+            if (descriptor.get("checkpoint_id") != self.checkpoint_id or
+                    descriptor.get("manifest_sha256") != self.manifest_sha256 or
+                    descriptor.get("model_id") != self.model_id or
+                    any(descriptor.get(key) != getattr(self, name) for key, name in (
+                        ("lo", "layer_start"), ("hi", "layer_end"), ("head", "head"), ("tail", "tail"), ("dspark", "dspark")))):
+                raise ResourceError("verified artifact differs from storage assignment")
+            existing = {row["path"]: (row["size"], row["sha256"]) for row in descriptor["files"]}
+            # Repacking changes files/artifact_id, never the validated logical
+            # catalogue and exact assigned roles. Report its ACTUAL bytes, not
+            # the much larger equivalent source-container byte count.
+            return {"filesystem_id": self.filesystem_id, "verified_existing_bytes": sum(size for size, _ in existing.values()),
+                    "missing_file_bytes": 0, "disk_peak_bytes": 0, "ram_bytes": 0, "pinned_bytes": 0}
+        held = sum(row.size for row in self.file_records if existing.get(row.path) == (row.size, row.sha256))
+        missing = self.storage_bytes - held
+        if self.preparation_options:
+            choices = [option for option in self.preparation_options if mode is None or option.mode == mode]
+            if not choices:
+                raise ResourceError("requested preparation mode is absent from its bounds")
+            choice = min(choices, key=lambda row: (row.disk_peak_bytes, row.ram_bytes))
+            return {"filesystem_id": self.filesystem_id, "verified_existing_bytes": held,
+                    "missing_file_bytes": missing, "disk_peak_bytes": choice.disk_peak_bytes,
+                    "ram_bytes": choice.ram_bytes, "pinned_bytes": choice.pinned_bytes, "mode": choice.mode}
+        return {"filesystem_id": self.filesystem_id, "verified_existing_bytes": held,
+                "missing_file_bytes": missing,
+                "disk_peak_bytes": missing + self.download_staging_bytes + self.conversion_staging_bytes,
+                "ram_bytes": self.prepare_ram_bytes, "pinned_bytes": self.prepare_pinned_bytes}
 
 
 @dataclass(frozen=True)
@@ -211,7 +341,7 @@ class NodeResources:
                 byte_count(value, field.name)
 
 
-def evaluate_fit(requirements, capacity, storage=None):
+def evaluate_fit(requirements, capacity, storage=None, *, verified_existing=None, preparation_mode=None):
     """Fail closed on missing evidence; return the independent binding resources."""
     if not isinstance(requirements, PlacementRequirements) or not isinstance(capacity, NodeResources):
         raise ResourceError("validated requirements and node resources are required")
@@ -221,7 +351,20 @@ def evaluate_fit(requirements, capacity, storage=None):
     if storage is not None:
         if not isinstance(storage, StorageRequirements):
             raise ResourceError("storage requirement must be a validated StorageRequirements")
-        checks.append(("disk", storage.storage_bytes, capacity.available_disk_bytes))
+        if storage.schema == STORAGE_PREPARE_SCHEMA and storage.preparation_options and preparation_mode is None and verified_existing is None:
+            choices = [evaluate_fit(requirements, capacity, storage, preparation_mode=row.mode)
+                       for row in storage.preparation_options]
+            fits = [choice for choice in choices if choice["fits"]]
+            return min(fits or choices, key=lambda choice: (len(choice["insufficient"]) + len(choice["unknown"]),
+                                                          choice["required_disk_bytes"], choice["required_ram_bytes"]))
+        budget = storage.preparation_budget(verified_existing, mode=preparation_mode) if storage.schema == STORAGE_PREPARE_SCHEMA else None
+        disk_bytes = budget["disk_peak_bytes"] if budget else storage.storage_bytes
+        checks.append(("disk", disk_bytes, capacity.available_disk_bytes))
+        if storage.schema == STORAGE_PREPARE_SCHEMA:
+            # Preparation may overlap idle resident weights; use a conservative
+            # joint host reservation, never independently admit both maxima.
+            checks[1] = ("ram", requirements.host.peak_bytes + budget["ram_bytes"], capacity.available_ram_bytes)
+            checks[2] = ("pinned", requirements.host.pinned_bytes + budget["pinned_bytes"], capacity.pinnable_ram_bytes)
     insufficient, unknown = [], []
     for name, need, have in checks:
         if need == 0:
@@ -243,11 +386,13 @@ def evaluate_fit(requirements, capacity, storage=None):
            "status": "insufficient" if insufficient else "unknown" if unknown else "fits",
            "insufficient": insufficient, "unknown": unknown,
            "required_vram_bytes": requirements.gpu.peak_bytes,
-           "required_ram_bytes": requirements.host.peak_bytes,
-           "required_pinned_bytes": requirements.host.pinned_bytes,
+           "required_ram_bytes": checks[1][1],
+           "required_pinned_bytes": checks[2][1],
            "action": action}
     if storage is not None:
-        out["required_disk_bytes"] = storage.storage_bytes
+        out["required_disk_bytes"] = disk_bytes
+        if budget is not None:
+            out["preparation_mode"] = budget.get("mode", "fetch")
     return out
 
 

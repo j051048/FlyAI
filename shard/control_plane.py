@@ -40,6 +40,19 @@ class ControlError(ValueError):
     pass
 
 
+from .leases import LeaseConflict
+
+
+class ResourceControlError(ControlError, LeaseConflict):
+    """A signed capacity refusal, also compatible with existing RPC callers."""
+    pass
+
+
+class CapacityUnavailable(ResourceControlError):
+    """A valid measured geometry can form only after lifting insufficient quotas."""
+    pass
+
+
 def _identity(key):
     raw = key.public_key().public_bytes_raw()
     return peer_id_from_public_key(raw), base64.b64encode(raw).decode()
@@ -118,6 +131,46 @@ class NodeLeaseAgent:
         if not ledger.node_id.startswith(self.peer_id + "/"):
             raise ControlError("lease node identity differs from sidecar identity")
 
+    def _assignment_guard(self, assignment, lease, peer):
+        allowed = {"ring_id", "cohort_id", "node_id", "gpu_uuid", "lo", "hi", "head", "tail", "dspark",
+                   "stage", "nstages", "next", "runtime_config_sha256", "deployment_plan", "weight_artifacts", "preparation_mode"}
+        if not isinstance(assignment, dict) or set(assignment) - allowed:
+            raise ControlError("remote assignment cannot contain commands, paths or environment")
+        if any(assignment.get(key) != expected for key, expected in (
+                ("ring_id", lease.ring_id), ("cohort_id", lease.model_cohort_sha256),
+                ("node_id", lease.node_id), ("gpu_uuid", lease.gpu_uuid))):
+            raise ControlError("stage/preparation assignment differs from the authenticated lease")
+        artifact = assignment.get("weight_artifacts")
+        if "preparation_mode" in assignment and (assignment["preparation_mode"] not in {"fetch", "range_repack"}
+                or artifact is None):
+            raise ControlError("preparation mode must bind a pinned artifact and be fetch or range_repack")
+        geometry = {"lo", "hi", "stage", "nstages", "head", "tail"}
+        if artifact is not None or geometry.intersection(assignment) or assignment.get("deployment_plan") is not None:
+            for name in ("lo", "hi", "stage", "nstages"):
+                if type(assignment.get(name)) is not int:
+                    raise ControlError("stage coordinates must be integers")
+            if not (0 <= assignment["lo"] < assignment["hi"] and 0 <= assignment["stage"] < assignment["nstages"]):
+                raise ControlError("invalid stage coordinates")
+            if (type(assignment.get("head")) is not bool or type(assignment.get("tail")) is not bool
+                    or assignment["head"] != (assignment["stage"] == 0)
+                    or assignment["tail"] != (assignment["stage"] == assignment["nstages"] - 1)):
+                raise ControlError("stage roles differ from execution coordinates")
+        if artifact is not None and (not isinstance(artifact, dict) or
+                set(artifact) != {"artifact_id", "checkpoint_id", "manifest_sha256"} or
+                any(not isinstance(value, str) or not value for value in artifact.values())):
+            raise ControlError("only a pinned artifact identity may appear in a remote assignment")
+        if assignment.get("deployment_plan") is not None:
+            from .pipeline_plan import validate_plan
+            plan = validate_plan(assignment["deployment_plan"])
+            slot = plan["stages"][assignment["stage"]]
+            if (plan["ring_id"] != lease.ring_id or plan["cohort_id"] != lease.model_cohort_sha256
+                    or any(slot[key] != assignment[key] for key in ("node_id", "gpu_uuid", "lo", "hi", "head", "tail"))):
+                raise ControlError("deployment plan differs from the node assignment")
+        guard = self.ledger.guard(lease.lease_id, lease.fencing_token, principal=peer,
+                                 ring_id=lease.ring_id, model_cohort_sha256=lease.model_cohort_sha256)
+        guard.assert_live()
+        return guard
+
     def dispatch(self, envelope):
         peer = _verify(envelope, "request", clock=self.clock)
         self.replay.consume(peer, envelope)
@@ -154,6 +207,32 @@ class NodeLeaseAgent:
                     # resident engine handle, even when it owns the lease.
                     kwargs["work_id"] = "rpc:" + peer + ":" + work_id
                 value = getattr(self.ledger, action)(body["lease_id"], body["fencing_token"], **kwargs)
+            elif action in {"prepare_stage", "prepare_status"}:
+                expected = {"lease_id", "fencing_token", "assignment"} | ({"job_id"} if action == "prepare_status" else set())
+                if set(body) != expected:
+                    raise ControlError("invalid preparation lifecycle arguments")
+                lease = self.ledger.get(body["lease_id"], principal=peer)
+                if lease.fencing_token != body["fencing_token"]:
+                    raise ControlError("preparation stage fencing token differs")
+                guard = self._assignment_guard(body["assignment"], lease, peer)
+                preparer = getattr(self.stage_factory, "weight_preparer", None)
+                if preparer is None:
+                    if body["assignment"].get("weight_artifacts") is not None:
+                        raise ControlError("node has no locally configured artifact preparation source")
+                    value = {"ready": True, "state": "not_required"}
+                elif action == "prepare_stage":
+                    # Construction validates an exact locally calibrated template;
+                    # it does not start a process or load model weights.
+                    self.stage_factory(body["assignment"], guard)
+                    if body["assignment"].get("preparation_mode") is not None:
+                        choices = preparer.options(body["assignment"], guard)
+                        if body["assignment"]["preparation_mode"] not in choices["options"]:
+                            raise ControlError("requested preparation mode is not locally approved")
+                    value = preparer.submit(body["assignment"], guard)
+                else:
+                    if not isinstance(body["job_id"], str) or not body["job_id"]:
+                        raise ControlError("bounded preparation job identity required")
+                    value = preparer.status(body["assignment"], guard, body["job_id"])
             elif action in {"start_stage", "stop_stage", "stage_status"}:
                 expected = {"lease_id", "fencing_token"} | ({"assignment"} if action == "start_stage" else set())
                 if set(body) != expected:
@@ -167,13 +246,7 @@ class NodeLeaseAgent:
                         if self.stage_factory is None:
                             raise ControlError("node has no locally configured engine runner")
                         assignment = body["assignment"]
-                        allowed = {"ring_id", "cohort_id", "node_id", "gpu_uuid", "lo", "hi", "head", "tail",
-                                   "stage", "nstages", "next"}
-                        if not isinstance(assignment, dict) or set(assignment) - allowed:
-                            raise ControlError("remote assignment cannot contain commands or environment")
-                        guard = self.ledger.guard(lease.lease_id, lease.fencing_token, principal=peer,
-                                                  ring_id=lease.ring_id, model_cohort_sha256=lease.model_cohort_sha256)
-                        guard.assert_live()
+                        guard = self._assignment_guard(assignment, lease, peer)
                         if runner is None or not runner.status()["resident_work_held"]:
                             if self.ledger.resident_work(lease.lease_id, principal=peer):
                                 raise ControlError("resident stage cleanup is unconfirmed after restart")
@@ -204,6 +277,9 @@ class NodeLeaseAgent:
             answer = {"request_nonce": envelope["nonce"], "ok": True, "result": result}
         except (ValueError, KeyError, TypeError, RuntimeError) as exc:
             answer = {"request_nonce": envelope["nonce"], "ok": False, "error": str(exc)}
+            from .leases import LeaseConflict
+            if isinstance(exc, LeaseConflict):
+                answer["error_code"] = "resource_conflict"
         return _signed("response", answer, self.key, clock=self.clock)
 
 
@@ -318,6 +394,8 @@ class LeaseRPCClient:
         if not isinstance(payload, dict) or payload.get("request_nonce") != envelope["nonce"]:
             raise ControlError("lease reply belongs to another request")
         if payload.get("ok") is not True:
+            if payload.get("error_code") == "resource_conflict":
+                raise ResourceControlError(payload.get("error", "node resource reservation failed"))
             raise ControlError(payload.get("error", "lease request failed"))
         return payload["result"]
 
@@ -520,6 +598,41 @@ class FormationController:
                              diagnostics=diagnostics, **({"coordinator_id": coordinator_id} if coordinator_id is not None else {}),
                              **({"route_ids": route_ids} if route_ids is not None else {}))
             if plan is None:
+                # Prove this is a capacity refusal, not an invalid cohort,
+                # missing calibration, unsupported shape or unreachable route.
+                relaxed = copy.deepcopy(nodes)
+                evidence = False
+                total_ram = total_pin = total_disk = 0
+                for node in relaxed:
+                    rejected = node.get("capacity_rejected_spans", [])
+                    if rejected:
+                        evidence = True
+                        node["allowed_spans"] = [*node.get("allowed_spans", []), *(item["span"] for item in rejected)]
+                    for span in node.get("allowed_spans", []):
+                        total_ram += span["host_bytes"] + span.get("prepare_ram_bytes", 0)
+                        total_pin += span["pinned_bytes"] + span.get("prepare_pinned_bytes", 0)
+                        total_disk += span.get("disk_bytes", 0)
+                if evidence:
+                    for node in relaxed:
+                        rows = node.get("allowed_spans", [])
+                        if not rows:
+                            continue
+                        caps = node["resource_capacity"]
+                        caps["available_vram_bytes"] = max(caps["available_vram_bytes"], max(row["gpu_bytes"] for row in rows))
+                        node["free_vram_mb"] = caps["available_vram_bytes"] / 1024**2
+                        if caps["available_ram_bytes"] is not None:
+                            caps["available_ram_bytes"] = max(caps["available_ram_bytes"], total_ram)
+                        if caps["pinnable_ram_bytes"] is not None:
+                            caps["pinnable_ram_bytes"] = max(caps["pinnable_ram_bytes"], total_pin)
+                        for filesystem in caps.get("filesystems", {}).values():
+                            if filesystem["available_disk_bytes"] is not None:
+                                filesystem["available_disk_bytes"] = max(filesystem["available_disk_bytes"], total_disk)
+                    possible = plan_ring(relaxed, rtt, profile, locality=locality or {"mode": "prefer_local"},
+                        objective=objective, workload=workload, measurements=measurements, now=self.clock(),
+                        **({"coordinator_id": coordinator_id} if coordinator_id is not None else {}),
+                        **({"route_ids": route_ids} if route_ids is not None else {}))
+                    if possible is not None:
+                        raise CapacityUnavailable("fresh calibrated stages/routes exist but measured GPU/host/filesystem capacity is insufficient")
                 raise ControlError(diagnostics.get("reason", "no compatible ring found in the examined candidates"))
             plan["ring_id"] = ring_id
             info["plan"] = plan
@@ -541,6 +654,27 @@ class FormationController:
                 measured = datetime.fromisoformat(req.provenance.measured_at.replace("Z", "+00:00")).timestamp()
                 if not -30 <= self.clock() - measured <= self.registry.max_ttl_s:
                     raise ControlError("block calibration is stale")
+                if stage.get("storage") is not None:
+                    from .resources import StorageRequirements, NodeResources, evaluate_fit
+                    storage = StorageRequirements.from_dict(stage["storage"])
+                    offered = [row for capability in offer["models"] if model_cohort_id(capability["cohort"]) == cid
+                               for row in capability.get("calibrations", []) if row.get("storage") is not None
+                               and row["requirements"]["provenance"]["runtime_config_sha256"] == req.provenance.runtime_config_sha256
+                               and canonical(row["storage"]) == canonical(storage.to_dict())]
+                    if len(offered) != 1:
+                        raise ControlError("selected storage/preparation contract differs from signed calibration")
+                    if (storage.checkpoint_id != cohort.checkpoint_id or storage.manifest_sha256 != cohort.manifest_sha256
+                            or storage.model_id != cohort.model_id or (storage.layer_start, storage.layer_end) != (stage["lo"], stage["hi"])):
+                        raise ControlError("storage artifact identity differs from the formation cohort")
+                    values = offer["resources"]
+                    filesystem = values.get("filesystems", {}).get(storage.filesystem_id, {})
+                    if self.clock() - filesystem.get("measured_at", 0) > self.registry.max_ttl_s:
+                        raise LeaseConflict("target filesystem measurement is absent or stale")
+                    available = NodeResources(values["available_vram_bytes"], values["available_ram_bytes"],
+                        values["pinnable_ram_bytes"], filesystem.get("available_disk_bytes"))
+                    fit = evaluate_fit(req, available, storage, preparation_mode=stage.get("preparation_mode"))
+                    if not fit["fits"]:
+                        raise LeaseConflict("selected preparation/GPU/host capacity became insufficient or unknown")
                 contracts.append((stage, offer, req))
             for stage, offer, req in contracts:
                 request = LeaseRequest(ring_id, cid, offer["node_id"], offer["gpu_uuid"], offer["memory_domain_id"],
@@ -730,8 +864,16 @@ def main(argv=None):
         ledger.register_capacity(capacity["memory_domain_id"], available_ram_bytes=capacity["available_ram_bytes"],
                                  pinnable_ram_bytes=capacity["pinnable_ram_bytes"],
                                  gpu_capacity_bytes=capacity["gpu_capacity_bytes"])
+        for row in capacity.get("filesystems", []):
+            if not isinstance(row, dict) or not {"filesystem_id", "path"} <= set(row) or set(row) - {"filesystem_id", "path", "available_disk_bytes"}:
+                raise ControlError("filesystem capacity needs a local identity/path and optional measured free bytes")
+            ledger.register_filesystem(row["filesystem_id"], row["path"], available_disk_bytes=row.get("available_disk_bytes"))
         from .leased_runtime import configured_stage_factory
-        factory = configured_stage_factory(args.db, capacity["stages"]) if capacity.get("stages") else None
+        preparer = None
+        if capacity.get("weight_sources"):
+            from .weight_prepare import configured_prepare_factory
+            preparer = configured_prepare_factory(args.db, capacity["weight_sources"])
+        factory = configured_stage_factory(args.db, capacity["stages"], weight_preparer=preparer) if capacity.get("stages") else None
         agent = NodeLeaseAgent(ledger, key, cohorts=capacity["cohort_ids"], replay=ReplayCache(str(args.db) + ".rpc"),
                                stage_factory=factory)
         def dispatch(path, body):

@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import math
 from pathlib import Path
+import secrets
+import threading
+import time
 from urllib.parse import urlparse
 
 from .control_plane import (ControlError, FormationController, LeaseRPCClient,
@@ -12,6 +16,66 @@ from .offers import OfferRegistry, model_cohort_id
 from .pipeline_plan import build_plan, validate_plan
 from .resources import PlacementRequirements
 from .ring_pool import RingPool
+
+
+class PreparedManagedRingBackend(ManagedRingBackend):
+    """Finish authenticated node preparation before starting any stage process."""
+    def __init__(self, backend, nodes, *, prepare_timeout_s=3600, poll_s=.1):
+        super().__init__(backend, nodes)
+        if (type(prepare_timeout_s) not in (int, float) or not math.isfinite(prepare_timeout_s)
+                or prepare_timeout_s <= 0):
+            raise ControlError("finite positive weight preparation timeout required")
+        self.prepare_timeout_s, self.poll_s = float(prepare_timeout_s), poll_s
+        self.preparations = {}
+
+    def load(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        deadline = time.monotonic() + self.prepare_timeout_s
+        cancelled = threading.Event()
+        def prepare(record):
+            client, lease, assignment = record
+            if assignment.get("weight_artifacts") is None:
+                return
+            state = client.operation("prepare_stage", lease, assignment=assignment)
+            job = state["job_id"]
+            while state.get("state") != "ready":
+                if cancelled.is_set():
+                    raise ControlError("another selected node failed preparation")
+                if state.get("state") == "failed":
+                    if state.get("error_code") == "resource_conflict":
+                        from .leases import LeaseConflict
+                        raise LeaseConflict("node stage preparation lacks resources: " + str(state.get("error")))
+                    raise ControlError("node stage preparation failed: " + str(state.get("error")))
+                if time.monotonic() >= deadline:
+                    raise ControlError("node stage preparation deadline exceeded")
+                time.sleep(min(self.poll_s, max(0, deadline - time.monotonic())))
+                state = client.operation("prepare_status", lease, assignment=assignment, job_id=job)
+            expected = assignment["weight_artifacts"]
+            if (state.get("payload_integrity_verified") is not True
+                    or state.get("source_artifact_id") != expected["artifact_id"]
+                    or state.get("checkpoint_id") != expected["checkpoint_id"]
+                    or state.get("manifest_sha256") != expected["manifest_sha256"]):
+                raise ControlError("node prepared weights differ from the pinned assignment")
+            if (assignment.get("preparation_mode") is not None
+                    and state.get("preparation_mode") != assignment["preparation_mode"]):
+                raise ControlError("node used a different strategy from the planned preparation contract")
+            self.preparations[client.node_id] = state
+        try:
+            with ThreadPoolExecutor(max_workers=min(16, len(self.nodes))) as workers:
+                futures = [workers.submit(prepare, record) for record in self.nodes]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except BaseException:
+                        cancelled.set()
+                        raise
+            super().load()
+        except BaseException:
+            self.close()
+            raise
+
+    def stats(self):
+        return {**super().stats(), "weight_preparations": dict(self.preparations)}
 
 
 def pipeline_assignment(plan, cohort, offers, formation):
@@ -86,6 +150,27 @@ class OpenNetworkService:
         if len(self.records) != len(self.config["formations"]):
             raise ControlError("duplicate formation ID")
         self.backend_factory, self.profile_factory = backend_factory, profile_factory
+        self._formation_lock = threading.RLock()
+        self._replacement_policies = {}
+        self._configured_record_ids = set(self.records)
+        self._generation_sequence = 0
+        self._reconcile_stop = threading.Event()
+        self._reconcile_thread = None
+        self._reconcile_interval = self.config.get("reconcile_interval_s", 1)
+        self._reconcile_cooldown = self.config.get("reconcile_cooldown_s", 10)
+        for value in (self._reconcile_interval, self._reconcile_cooldown):
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ControlError("positive finite reconciliation intervals required")
+        for row in self.records.values():
+            enabled = row.get("auto_replace", bool(row.get("calibrated_alternatives")))
+            if type(enabled) is not bool:
+                raise ControlError("auto_replace must be an explicit boolean")
+            if type(row.get("auto_generations", True)) is not bool:
+                raise ControlError("auto_generations must be an explicit boolean")
+            if enabled:
+                self._replacement_policies[row["ring_id"]] = {
+                    "definition": row, "active_ring_id": None, "attempted": set(),
+                    "running": False, "next_attempt": 0.0}
         self.controller = FormationController(self.registry, self.pool, {},
             requirements=self.requirements, backend_factory=self.backend,
             agent_factory=agent_factory or self.agent)
@@ -136,6 +221,7 @@ class OpenNetworkService:
         from .manifest import pub_b64
         manifest["coordinator"]["signer_pubkey"] = pub_b64(self.key)
         context_limits = []
+        runtime_configs = {}
         for stage, offer, slot in zip(plan["stages"], offers, manifest["stages"]):
             configs = [item["runtime_config"] for capability in offer["models"]
                        if model_cohort_id(capability["cohort"]) == cohort.cohort_id
@@ -144,6 +230,7 @@ class OpenNetworkService:
             if len(configs) != 1:
                 raise ControlError("selected measured stage configuration is ambiguous")
             cfg = configs[0]
+            runtime_configs[stage["id"]] = cfg
             context = cfg.get("max_ctx", cfg.get("args", {}).get("max_seq_len"))
             if type(context) is not int or context < 1:
                 raise ControlError("selected stage calibration needs its actual context capacity")
@@ -157,6 +244,15 @@ class OpenNetworkService:
         leases = {client.node_id: (client, lease) for client, lease in
                   self.controller._formations[plan["ring_id"]]["leases"]}
         selected = []
+        artifact_source = row.get("weight_artifacts")
+        if artifact_source is not None:
+            from .weight_artifacts import validate_catalog, validate_pack
+            if not isinstance(artifact_source, dict) or set(artifact_source) != {"catalog", "pack"}:
+                raise ControlError("local catalog and pack metadata paths required")
+            catalog = validate_catalog(_json_loads(self.local(artifact_source["catalog"]).read_bytes()))
+            pack = validate_pack(catalog, _json_loads(self.local(artifact_source["pack"]).read_bytes()))
+            if (catalog["checkpoint_id"] != cohort.checkpoint_id or catalog["manifest_sha256"] != cohort.manifest_sha256):
+                raise ControlError("weight catalog differs from formation cohort")
         for stage, offer, slot in zip(plan["stages"], offers, manifest["stages"]):
             client, lease = leases[stage["id"]]
             assignment = {"ring_id": plan["ring_id"], "cohort_id": cohort.cohort_id,
@@ -166,38 +262,234 @@ class OpenNetworkService:
                 "next": slot["next_endpoint"], "deployment_plan": manifest}
             if stage.get("runtime_config_sha256") is not None:
                 assignment["runtime_config_sha256"] = stage["runtime_config_sha256"]
+            stage_config = runtime_configs[stage["id"]]
+            if type(stage_config.get("dspark", False)) is not bool:
+                raise ControlError("calibrated draft role must be boolean")
+            measured_artifact = stage.get("weight_artifacts")
+            if measured_artifact is not None:
+                if (not isinstance(measured_artifact, dict)
+                        or set(measured_artifact) != {"artifact_id", "checkpoint_id", "manifest_sha256"}
+                        or measured_artifact["checkpoint_id"] != cohort.checkpoint_id
+                        or measured_artifact["manifest_sha256"] != cohort.manifest_sha256):
+                    raise ControlError("planned preparation artifact differs from formation cohort")
+                assignment["weight_artifacts"] = dict(measured_artifact)
+            if artifact_source is not None:
+                from .weight_artifacts import select_stage_artifacts
+                item = select_stage_artifacts(catalog, pack, stage["lo"], stage["hi"],
+                    head=stage["head"], tail=stage["tail"], dspark=stage_config.get("dspark", False))
+                derived = {key: item[key] for key in ("artifact_id", "checkpoint_id", "manifest_sha256")}
+                if measured_artifact is not None and derived != measured_artifact:
+                    raise ControlError("planned source artifact differs from the controller packing")
+                assignment["weight_artifacts"] = derived
+            if assignment.get("weight_artifacts") is not None and stage_config.get("dspark", False):
+                assignment["dspark"] = True
+            if stage.get("preparation_mode") is not None:
+                if assignment.get("weight_artifacts") is None or stage["preparation_mode"] not in ("fetch", "range_repack"):
+                    raise ControlError("planned preparation needs pinned artifacts and a supported mode")
+                assignment["preparation_mode"] = stage["preparation_mode"]
             selected.append((client, lease, assignment))
         backend = self.backend_factory(directory, manifest, cohort, row, contracts)
         if backend.model_id != cohort.model_id or backend.layers != cohort.n_layers:
             backend.close()
             raise ControlError("engine does not implement the selected model cohort")
         backend.model_cohort = cohort.to_dict()
-        return ManagedRingBackend(backend, selected)
+        return PreparedManagedRingBackend(backend, selected,
+            prepare_timeout_s=row.get("weight_prepare_timeout_s", 3600))
+
+    def form_one(self, row):
+        """Form one locally configured candidate; all execution budgets are measured."""
+        with self._formation_lock:
+            prior = self.records.get(row["ring_id"])
+            if prior is not None and prior != row:
+                raise ControlError("formation ID cannot be reused for another configuration")
+            self.records[row["ring_id"]] = row
+            self._prune_records(preserve=row["ring_id"])
+        observation = row["measurements"]
+        if isinstance(observation, str):
+            observation = _json_loads(self.local(observation).read_bytes())
+        if observation.get("schema") == "shard-link-measurements/2" and not row.get("coordinator_id"):
+            raise ControlError("measured production routes require an explicit coordinator identity")
+        profile = row.get("profile")
+        if self.profile_factory is not None:
+            profile = self.profile_factory(self.local(row["dir"]), row)
+        profile = {**profile, "require_exact_calibrations": True}
+        extra = {"coordinator_id": row["coordinator_id"]} if row.get("coordinator_id") else {}
+        if row.get("route_ids") is not None:
+            extra["route_ids"] = row["route_ids"]
+        return self.controller.form(row["ring_id"], row["cohort"], profile,
+            measurements=observation, locality=row.get("locality"),
+            objective=row.get("objective", "pipeline"), workload=row.get("workload"),
+            ttl_s=row.get("lease_ttl_s", 120), warmup_timeout_s=row.get("warmup_timeout_s", 300), **extra)
+
+    def form_with_alternatives(self, row):
+        """Capacity failures can use explicitly configured, same-cohort alternatives.
+
+        No layer speed/capacity is synthesized. Each alternative goes through the
+        ordinary planner, exact template matching, reservations and signed warmup.
+        """
+        from .leases import LeaseConflict
+        from .offers import ModelCohort
+        target = ModelCohort.from_dict(row["cohort"]).cohort_id
+        alternatives = row.get("calibrated_alternatives", [])
+        if not isinstance(alternatives, list) or len(alternatives) > 16:
+            raise ControlError("at most 16 explicit calibrated alternatives required")
+        candidates = [row, *alternatives]
+        if len({candidate["ring_id"] for candidate in candidates}) != len(candidates):
+            raise ControlError("alternative formation IDs must be distinct")
+        for candidate in candidates:
+            if ModelCohort.from_dict(candidate["cohort"]).cohort_id != target:
+                raise ControlError("capacity fallback must retain the exact model cohort")
+        failures = []
+        for candidate in candidates:
+            try:
+                result = self.form_one(candidate)
+                result["capacity_fallback"] = failures
+                return result
+            except LeaseConflict as error:
+                failures.append({"ring_id": candidate["ring_id"], "reason": str(error)[:300]})
+        raise LeaseConflict("all explicitly calibrated formation alternatives lack reservable resources")
+
+    def replace(self, row, retired_ring_ids, *, aliases=()):
+        """Prepare/load/warm a new ring, then switch admission without moving jobs."""
+        result = self.form_with_alternatives(row)
+        try:
+            publication = self.pool.publish_replacement(result["ring_id"], retired_ring_ids, aliases=aliases)
+        except BaseException:
+            self.controller.stop(result["ring_id"])
+            raise
+        return {**result, "replacement": publication}
 
     def form_all(self):
         results = []
-        for row in self.records.values():
-            observation = row["measurements"]
-            if isinstance(observation, str):
-                observation = _json_loads(self.local(observation).read_bytes())
-            if observation.get("schema") == "shard-link-measurements/2" and not row.get("coordinator_id"):
-                raise ControlError("measured production routes require an explicit coordinator identity")
-            profile = row.get("profile")
-            if self.profile_factory is not None:
-                profile = self.profile_factory(self.local(row["dir"]), row)
-            profile = {**profile, "require_exact_calibrations": True}
-            extra = {"coordinator_id": row["coordinator_id"]} if row.get("coordinator_id") else {}
-            if row.get("route_ids") is not None:
-                extra["route_ids"] = row["route_ids"]
-            results.append(self.controller.form(row["ring_id"], row["cohort"], profile,
-                measurements=observation, locality=row.get("locality"),
-                objective=row.get("objective", "pipeline"), workload=row.get("workload"),
-                ttl_s=row.get("lease_ttl_s", 120), warmup_timeout_s=row.get("warmup_timeout_s", 300), **extra))
+        for row in tuple(self.records.values()):
+            if row.get("replaces") is not None:
+                results.append(self.replace(row, row["replaces"], aliases=row.get("publish_aliases", [])))
+            else:
+                results.append(self.form_with_alternatives(row))
+            policy = self._replacement_policies.get(row["ring_id"])
+            if policy is not None:
+                result = results[-1]
+                policy["active_ring_id"] = result["ring_id"]
+                policy["attempted"].update(item["ring_id"] for item in result.get("capacity_fallback", []))
+                policy["attempted"].add(result["ring_id"])
+                self.pool.record_reconciliation(row["ring_id"], {
+                    "state": "armed", "active_ring_id": result["ring_id"]})
         for alias, target in self.config.get("aliases", {}).items():
             self.pool.set_alias(alias, target["model_id"], target["cohort_id"])
+        self.start_reconciliation()
         return results
 
+    def start_reconciliation(self):
+        """Automatically replace failed routes using bounded configured candidates."""
+        with self._formation_lock:
+            if not self._replacement_policies or self._reconcile_thread is not None:
+                return
+            def maintain():
+                while not self._reconcile_stop.wait(self._reconcile_interval):
+                    self.reconcile_once()
+            self._reconcile_thread = threading.Thread(target=maintain, daemon=True,
+                                                       name="network-ring-reconciliation")
+            self._reconcile_thread.start()
+
+    def reconcile_once(self):
+        """Launch independent workers; monitoring never waits for fetch/warmup RPC."""
+        from .ring_pool import RingState
+        snapshot = {ring.ring_id: ring for ring in self.pool.rings()}
+        with self._formation_lock:
+            if self._reconcile_stop.is_set():
+                return
+            for policy_id, policy in self._replacement_policies.items():
+                old = snapshot.get(policy["active_ring_id"])
+                if (old is None or old.state not in (RingState.FAILED, RingState.DRAINING, RingState.STOPPED)
+                        or policy["running"] or time.monotonic() < policy["next_attempt"]):
+                    continue
+                candidates = [row for row in policy["definition"].get("calibrated_alternatives", [])
+                              if row["ring_id"] not in policy["attempted"]]
+                if not candidates:
+                    templates = policy["definition"].get("calibrated_alternatives", [])
+                    if not templates or not policy["definition"].get("auto_generations", True):
+                        self.pool.record_reconciliation(policy_id, {"state": "unavailable",
+                            "reason": "configured_calibrated_candidates_exhausted", "active_ring_id": old.ring_id})
+                        continue
+                    previous = snapshot.get(policy.get("last_attempt_id"))
+                    if previous is not None and previous is not old and previous.state != RingState.STOPPED:
+                        self.pool.record_reconciliation(policy_id, {"state": "unavailable",
+                            "reason": "failed_attempt_cleanup_unconfirmed", "active_ring_id": old.ring_id})
+                        policy["next_attempt"] = time.monotonic() + self._reconcile_cooldown
+                        continue
+                    cursor = policy.get("template_cursor", 0)
+                    template = templates[cursor % len(templates)]
+                    policy["template_cursor"] = cursor + 1
+                    self._generation_sequence += 1
+                    suffix = f".r{self._generation_sequence:x}.{secrets.token_hex(4)}"
+                    # Only the lifecycle epoch changes. Signed calibration,
+                    # source artifacts, model, workload and routes remain exact.
+                    candidate = {**template, "ring_id": template["ring_id"][:128 - len(suffix)] + suffix,
+                                 "calibrated_alternatives": []}
+                else:
+                    candidate = {**candidates[0], "calibrated_alternatives": []}
+                    policy["attempted"].add(candidate["ring_id"])
+                policy["last_attempt_id"] = candidate["ring_id"]
+                policy["running"] = True
+                self.pool.record_reconciliation(policy_id, {"state": "preparing",
+                    "active_ring_id": old.ring_id, "candidate_ring_id": candidate["ring_id"]})
+                threading.Thread(target=self._reconcile_candidate, args=(policy_id, policy, old, candidate),
+                    daemon=True, name="replace-ring-" + candidate["ring_id"]).start()
+
+    def _reconcile_candidate(self, policy_id, policy, old, candidate):
+        from .leases import LeaseConflict
+        result, published = None, False
+        try:
+            result = self.form_with_alternatives(candidate)
+            if self._reconcile_stop.is_set():
+                self.controller.stop(result["ring_id"])
+                return
+            aliases = [name for name, target in self.pool.snapshot()["aliases"].items()
+                       if (target["model_id"], target["cohort_id"]) == (old.model_id, old.cohort_id)]
+            self.pool.publish_replacement(result["ring_id"], [old.ring_id], aliases=aliases)
+            published = True
+            with self._formation_lock:
+                policy["active_ring_id"] = result["ring_id"]
+            self.pool.record_reconciliation(policy_id, {"state": "published",
+                "active_ring_id": result["ring_id"], "retired_ring_id": old.ring_id})
+        except Exception as error:
+            if result is not None and not published:
+                try:
+                    self.controller.stop(result["ring_id"])
+                except Exception:
+                    pass  # retained pool/ledger ownership blocks unconfirmed reuse
+            # Categorical public status contains no provider credentials/paths.
+            self.pool.record_reconciliation(policy_id, {"state": "unavailable",
+                "reason": "capacity_unavailable" if isinstance(error, LeaseConflict) else "replacement_failed",
+                "error_class": type(error).__name__, "active_ring_id": old.ring_id,
+                "candidate_ring_id": candidate["ring_id"]})
+        finally:
+            with self._formation_lock:
+                policy["running"] = False
+                policy["next_attempt"] = time.monotonic() + self._reconcile_cooldown
+
+    def _prune_records(self, *, preserve=None):
+        """Keep approved definitions and live generations, bound old runtime rows."""
+        limit = len(self._configured_record_ids) + self.pool.max_rings + self.pool.max_history
+        if len(self.records) <= limit:
+            return
+        from .ring_pool import RingState
+        live = {ring.ring_id for ring in self.pool.rings() if ring.state != RingState.STOPPED}
+        lock = getattr(self.controller, "_lock", None)
+        if lock is not None:
+            with lock:
+                live.update(self.controller._formations)
+        live.update(policy.get("active_ring_id") for policy in self._replacement_policies.values())
+        for key in tuple(self.records):
+            if len(self.records) <= limit:
+                break
+            if key != preserve and key not in live and key not in self._configured_record_ids:
+                self.records.pop(key, None)
+
     def close(self):
+        self._reconcile_stop.set()
+        if self._reconcile_thread is not None:
+            self._reconcile_thread.join(1)
         self.controller.close()
         self.pool.shutdown()
         self.registry.close()

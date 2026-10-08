@@ -203,7 +203,7 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
         _text(endpoint, "endpoint", 2048)
     resources = body["resources"]
     names = {"available_vram_bytes", "available_ram_bytes", "pinnable_ram_bytes", "available_disk_bytes", "measured_at"}
-    if not isinstance(resources, dict) or set(resources) != names:
+    if not isinstance(resources, dict) or not names <= set(resources) or set(resources) - names - {"filesystems"}:
         raise OfferError("exact resource measurement fields required")
     for name in names - {"measured_at"}:
         _count(resources[name], name, nullable=True)
@@ -213,6 +213,17 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
     ram, pin = resources["available_ram_bytes"], resources["pinnable_ram_bytes"]
     if ram is not None and pin is not None and pin > ram:
         raise OfferError("pinned capacity is a subset of host RAM")
+    filesystems = resources.get("filesystems", {})
+    if not isinstance(filesystems, dict) or len(filesystems) > 32:
+        raise OfferError("bounded target filesystem measurements required")
+    for identity, filesystem in filesystems.items():
+        _text(identity, "filesystem_id")
+        if not isinstance(filesystem, dict) or set(filesystem) != {"available_disk_bytes", "measured_at"}:
+            raise OfferError("filesystem measurements expose capacity/time, never private paths")
+        _count(filesystem["available_disk_bytes"], "filesystem free bytes", nullable=True)
+        stamp = _number(filesystem["measured_at"], "filesystem measured_at")
+        if stamp > now + max_skew_s or stamp + max_ttl_s <= now:
+            raise OfferError("filesystem measurement is stale")
     models = body["models"]
     if not isinstance(models, list) or len(models) > 64:
         raise OfferError("models must be a bounded list")
@@ -267,8 +278,9 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
         seen_ranges = set()
         for record in calibrations:
             try:
-                from .resources import PlacementRequirements
-                if not isinstance(record, dict) or set(record) != {"requirements", "runtime_config"}:
+                from .resources import PlacementRequirements, StorageRequirements, STORAGE_PREPARE_SCHEMA
+                if (not isinstance(record, dict) or not {"requirements", "runtime_config"} <= set(record)
+                        or set(record) - {"requirements", "runtime_config", "storage"}):
                     raise ValueError("invalid calibration record")
                 req = PlacementRequirements.from_dict(record["requirements"])
                 cfg = record["runtime_config"]
@@ -300,6 +312,15 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
                 if identity in seen_ranges:
                     raise ValueError("duplicate stage calibration")
                 seen_ranges.add(identity)
+                if record.get("storage") is not None:
+                    storage = StorageRequirements.from_dict(record["storage"])
+                    if (storage.schema != STORAGE_PREPARE_SCHEMA or
+                            (storage.model_id, storage.layer_start, storage.layer_end, storage.checkpoint_id,
+                             storage.manifest_sha256, storage.head, storage.tail) !=
+                            (cohort.model_id, req.layer_start, req.layer_end, cohort.checkpoint_id,
+                             cohort.manifest_sha256, cfg["head"], cfg["tail"]) or
+                            storage.dspark != bool(cfg.get("dspark", False))):
+                        raise ValueError("storage/source artifact differs from calibrated model/range/roles")
             except (ValueError, TypeError, KeyError) as exc:
                 raise OfferError("invalid stage calibration") from exc
     try:
@@ -392,30 +413,55 @@ class OfferRegistry:
                     value = resources[name]
                     return None if value is None else value / (1024 * 1024)
                 templates = {}
-                if "calibrations" in model:
-                    from .resources import PlacementRequirements, NodeResources, evaluate_fit
+                if "calibrations" in model or model["cohort"]["checkpoint_id"].startswith("tensor-sha256:"):
+                    from .resources import PlacementRequirements, StorageRequirements, NodeResources, evaluate_fit
                     from .locality import timestamp
                     allowed = []
+                    rejected_capacity = []
+                    filesystems = resources.get("filesystems", {})
                     capacity = NodeResources(**{key: resources[key] for key in (
                         "available_vram_bytes", "available_ram_bytes", "pinnable_ram_bytes", "available_disk_bytes")})
-                    for record in model["calibrations"]:
+                    for record in model.get("calibrations", []):
                         req = PlacementRequirements.from_dict(record["requirements"])
                         age = now - timestamp(req.provenance.measured_at)
-                        if not -30 <= age <= self.max_ttl_s or not evaluate_fit(req, capacity)["fits"]:
+                        if not -30 <= age <= self.max_ttl_s:
                             continue
+                        storage = StorageRequirements.from_dict(record["storage"]) if record.get("storage") is not None else None
+                        if storage is None and model["cohort"]["checkpoint_id"].startswith("tensor-sha256:"):
+                            continue  # New artifact cohorts need a real preparation/disk contract.
                         config = record["runtime_config"]
-                        span = {"lo": req.layer_start, "hi": req.layer_end,
-                            "head": config["head"], "tail": config["tail"],
-                            "runtime_config_sha256": req.provenance.runtime_config_sha256,
-                            "gpu_bytes": req.gpu.peak_bytes, "host_bytes": req.host.peak_bytes,
-                            "pinned_bytes": req.host.pinned_bytes}
-                        if "stage" in config or "index" in config:
-                            span["stage_index"] = config.get("stage", config.get("index"))
-                        if "nstages" in config:
-                            span["nstages"] = config["nstages"]
-                        allowed.append(span)
-                    templates = {"allowed_spans": allowed, "resource_capacity": {
-                        key: resources[key] for key in ("available_vram_bytes", "available_ram_bytes", "pinnable_ram_bytes")}}
+                        options = [row.mode for row in storage.preparation_options] if storage and storage.preparation_options else [None]
+                        for mode in options:
+                            if storage:
+                                filesystem = filesystems.get(storage.filesystem_id, {})
+                                if now - filesystem.get("measured_at", 0) > self.max_ttl_s:
+                                    continue
+                                target_capacity = NodeResources(capacity.available_vram_bytes, capacity.available_ram_bytes,
+                                    capacity.pinnable_ram_bytes, filesystem.get("available_disk_bytes"))
+                                fit = evaluate_fit(req, target_capacity, storage, preparation_mode=mode)
+                            else:
+                                fit = evaluate_fit(req, capacity)
+                            span = {"lo": req.layer_start, "hi": req.layer_end,
+                                "head": config["head"], "tail": config["tail"],
+                                "runtime_config_sha256": req.provenance.runtime_config_sha256,
+                                "gpu_bytes": req.gpu.peak_bytes, "host_bytes": req.host.peak_bytes,
+                                "pinned_bytes": req.host.pinned_bytes}
+                            if storage:
+                                budget = storage.preparation_budget(mode=mode)
+                                span.update(filesystem_id=storage.filesystem_id, disk_bytes=budget["disk_peak_bytes"],
+                                    prepare_ram_bytes=budget["ram_bytes"], prepare_pinned_bytes=budget["pinned_bytes"],
+                                    preparation_mode=budget.get("mode", "fetch"), storage=storage.to_dict())
+                            if "stage" in config or "index" in config:
+                                span["stage_index"] = config.get("stage", config.get("index"))
+                            if "nstages" in config:
+                                span["nstages"] = config["nstages"]
+                            if fit["fits"]:
+                                allowed.append(span)
+                            elif fit["insufficient"] and not fit["unknown"]:
+                                rejected_capacity.append({"span": span, "insufficient": fit["insufficient"]})
+                    templates = {"allowed_spans": allowed, "capacity_rejected_spans": rejected_capacity, "resource_capacity": {
+                        **{key: resources[key] for key in ("available_vram_bytes", "available_ram_bytes", "pinnable_ram_bytes")},
+                        "filesystems": copy.deepcopy(filesystems)}}
                 nodes.append({**profile, "id": offer["node_id"], "cohort_id": cohort_id, "peer_id": offer["peer_id"],
                               "gpu_uuid": offer["gpu_uuid"], "memory_domain_id": offer["memory_domain_id"],
                               "host_id": offer.get("host_id"), "public_ip": offer.get("public_ip"),

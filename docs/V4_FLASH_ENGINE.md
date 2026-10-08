@@ -314,7 +314,7 @@ universal failure. A lever that silently does nothing looks like one that does n
 | `engines/deepseek_v4/v4_stage.py` | contiguous layer range, placement adapters and speculative rollback |
 | `engines/deepseek_v4/v4_pipe.py` | strict/legacy ring entry points, greedy/DSpark/pipelined coordination and receipts |
 | `engines/deepseek_v4/v4_dspark_draft.py` | tail-local DSpark drafter and verify planning |
-| `engines/deepseek_v4/v4_plan.py` | exact tiling planner using measured profiles |
+| `shard/plan.py` | exact tiling planner using measured profiles and resource contracts |
 | `engines/deepseek_v4/v4_network_service.py` | managed open-node formation and HTTP service |
 | `shard/pipeline_session.py` | signed role/session handshake and remote coordinator ownership |
 | `shard/leases.py` | node-local lease ledger and work fencing |

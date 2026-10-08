@@ -26,7 +26,9 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parents[1]
 PROTOCOL_SCHEMA = "flyai-v4-benchmark-protocol/1"
 REPORT_SCHEMA = "flyai-v4-benchmark-report/1"
+NETWORK_SCHEMA = "flyai-v4-network-comparison/1"
 MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash-0731"
+MODEL_IDS = frozenset((MODEL_ID, "deepseek-ai/DeepSeek-V4-Flash"))
 WORKLOADS = ("code", "math", "prose", "agentic")
 TARGETS = {4: 40.0, 6: 30.0}
 PROMPTS = {
@@ -46,6 +48,7 @@ CONTEXT = "Reference note: measure the actual result, preserve the inputs, and r
 # their stages with these same values; --env-file can freeze a DIFFERENT experiment recipe.
 DEFAULT_ENV = {
     "V4_KERNELS": "tilelang", "V4_DTYPE": "bfloat16", "V4_MAX_SEQ": "8192",
+    "V4_HADAMARD": "auto",
     "V4_MAX_BATCH": "1", "V4_CUDA_GRAPH": "whole", "V4_GRAPH_MAX": "192",
     "V4_MOE_GROUPED": "1", "V4_MOE_DECODE": "1", "V4_MOE_MULTI": "1",
     "V4_MOE_MULTI_MAX": "32", "V4_MOE_IN_GRAPH": "1", "V4_FP8_GEMV": "1",
@@ -69,6 +72,15 @@ HISTORICAL = {
     "verification": "historical_repository_claim_not_independently_verified",
     "limitations": "No raw signatures, frozen prompt IDs or checkpoint hashes in the historical file; "
                    "new suite uses different fixed prompts and cannot reproduce that claim exactly.",
+}
+MEASUREMENT_DEFINITIONS = {
+    "first_token_s": "first committed callback minus request start, including reset and prefill",
+    "decode_s": "last committed callback minus first committed callback; N-1 committed tokens",
+    "elapsed_s": "generation return minus request start, including prefill, decode and speculative return drain",
+    "drain_s": "generation return minus last committed callback; includes residual compute/queue/wire, not network RTT",
+    "receipt_sweep_s": "one independent receipt sweep after generation has returned",
+    "full_service_s": "final observer return minus request start, including generation, drain, sweep and observer overhead",
+    "percentiles": "linear interpolation of retained raw warm samples; all four fixed workloads are required",
 }
 
 
@@ -105,6 +117,10 @@ def _positive(value) -> bool:
     return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
+def _duration_valid(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
 def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -119,9 +135,58 @@ def _safe_path(directory: Path, name: str) -> Path:
     return result
 
 
+def _artifacts():
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from shard import weight_artifacts
+    return weight_artifacts
+
+
+def _checkpoint_identity(value):
+    return {key: item for key, item in value.items() if key != "local_verification"}
+
+
+def _catalogue_inventory(directory: Path) -> dict:
+    artifacts = _artifacts()
+    catalog = artifacts.validate_catalog(artifacts.read_json(directory / artifacts.GLOBAL_FILE))
+    config = catalog["config"]
+    from engines.deepseek_v4.v4_artifact_contract import validate_native_config
+    validate_native_config(config, model_id=catalog["model_id"], runtime_abi=catalog["runtime_abi"])
+    if catalog["model_id"] not in MODEL_IDS or config.get("n_layers") != 43 or config.get("expert_dtype") != "fp4":
+        raise BenchmarkError("this protocol requires the shipped 43-layer V4 FP4 checkpoint")
+    files = []
+    for name, row in sorted(catalog["assets"].items()):
+        if artifacts.hash_file(artifacts.safe_path(directory, name)) != (row["sha256"], row["size"]):
+            raise BenchmarkError("checkpoint config/tokenizer asset bytes differ from catalogue")
+        files.append({"name": name, "bytes": row["size"], "sha256": row["sha256"]})
+    tokenizer_files = [row for row in files if row["name"].startswith(("tokenizer", "vocab", "merges"))]
+    if not tokenizer_files:
+        raise BenchmarkError("checkpoint has no pinned tokenizer files")
+    local_encoder = {p.name for pattern in ("tokenizer*", "vocab*", "merges*", "special_tokens_map.json", "generation_config.json")
+                     for p in directory.glob(pattern) if p.is_file()}
+    if not local_encoder <= set(catalog["assets"]):
+        raise BenchmarkError("unverified local tokenizer override")
+    local = {"payload_integrity_verified": False,
+             "verification_scope": "pinned catalogue and local model assets only"}
+    if (directory / artifacts.PACK_FILE).exists():
+        proof = (artifacts.verify_stage_artifacts(directory) if (directory / artifacts.STAGE_FILE).exists()
+                 else artifacts.verify_weight_pack(directory))
+        artifacts.verified_stage_artifact_descriptor(proof)
+        local = {"payload_integrity_verified": True, "verification_scope": proof["verification_scope"]}
+    elif any(directory.glob("*.safetensors")):
+        raise BenchmarkError("local weights lack a verified packing manifest")
+    return {"identity_kind": "logical-tensor-catalogue", "checkpoint_id": catalog["checkpoint_id"],
+            "manifest_sha256": catalog["manifest_sha256"], "sha256": catalog["checkpoint_id"].removeprefix("tensor-sha256:"),
+            "global_catalog": catalog, "files": files, "config_sha256": catalog["config_sha256"],
+            "tokenizer_sha256": digest(tokenizer_files), "local_verification": local,
+            "quantization": {k: config.get(k) for k in ("dtype", "expert_dtype", "scale_dtype", "scale_fmt")}}
+
+
 def checkpoint_inventory(directory: str | Path) -> dict:
     """Read every weight byte once. Header/size alone is insufficient to pin a checkpoint."""
     directory = Path(directory).resolve()
+    if (directory / ".shard-model-artifacts.json").exists():
+        return _catalogue_inventory(directory)
     config_path = directory / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if config.get("n_layers") != 43 or config.get("expert_dtype") != "fp4":
@@ -153,8 +218,17 @@ def checkpoint_inventory(directory: str | Path) -> dict:
 
 def verify_checkpoint(directory: str | Path, inventory: dict) -> dict:
     actual = checkpoint_inventory(directory)
-    if actual != inventory:
+    if _checkpoint_identity(actual) != _checkpoint_identity(inventory):
         raise BenchmarkError("checkpoint/config/tokenizer bytes differ from the frozen protocol")
+    if actual.get("identity_kind") == "logical-tensor-catalogue":
+        local = actual["local_verification"]
+        return {"checkpoint_bytes_verified": local["payload_integrity_verified"] and
+                    local["verification_scope"] == "complete packed payload hashes",
+                "assigned_checkpoint_bytes_verified": local["payload_integrity_verified"] and
+                    local["verification_scope"] == "assigned stage payload hashes",
+                "global_catalog_verified": True, "checkpoint_id": actual["checkpoint_id"],
+                "local_weight_scope": local["verification_scope"],
+                "config_bytes_verified": True, "tokenizer_bytes_verified": True}
     return {"checkpoint_bytes_verified": True, "config_bytes_verified": True,
             "tokenizer_bytes_verified": True}
 
@@ -172,8 +246,15 @@ def source_identity(root: Path = ROOT) -> dict:
                                          text=True, stderr=subprocess.DEVNULL).strip()
     except (OSError, subprocess.CalledProcessError):
         commit = None
+    working_tree = {"known": False, "dirty": None, "status_sha256": None}
+    try:
+        status = subprocess.check_output(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--",
+                                          *(row["name"] for row in files)], cwd=root, stderr=subprocess.DEVNULL)
+        working_tree = {"known": True, "dirty": bool(status), "status_sha256": hashlib.sha256(status).hexdigest()}
+    except (OSError, subprocess.CalledProcessError):
+        pass
     # The content digest, rather than an optimistic clean flag, also identifies uncommitted code.
-    return {"git_commit": commit, "sha256": digest(files), "files": files}
+    return {"git_commit": commit, "sha256": digest(files), "files": files, "working_tree": working_tree}
 
 
 def freeze_prompts(encode: Callable[[str], list[int]], render: Callable[[str], str],
@@ -221,15 +302,28 @@ def protocol_errors(p: dict) -> list[str]:
     try:
         if p.get("sha256") != digest({k: v for k, v in p.items() if k != "sha256"}):
             errors.append("protocol hash does not match contents")
-        if p.get("model_id") != MODEL_ID or p.get("layer_count") != 43:
+        if p.get("model_id") not in MODEL_IDS or p.get("layer_count") != 43:
             errors.append("protocol is not the fixed V4-Flash 43-layer model")
         ck = p.get("checkpoint", {})
+        logical = ck.get("identity_kind") == "logical-tensor-catalogue"
         if (not _sha(ck.get("sha256")) or not _sha(ck.get("config_sha256"))
                 or not _sha(ck.get("tokenizer_sha256")) or not ck.get("files")
-                or digest(ck["files"]) != ck["sha256"]):
+                or not logical and digest(ck["files"]) != ck["sha256"]):
             errors.append("checkpoint/config/tokenizer hash inventory absent or invalid")
+        if logical:
+            artifacts = _artifacts()
+            catalog = artifacts.validate_catalog(ck.get("global_catalog"))
+            from engines.deepseek_v4.v4_artifact_contract import validate_native_config
+            validate_native_config(catalog["config"], model_id=catalog["model_id"], runtime_abi=catalog["runtime_abi"])
+            expected_assets = [{"name": name, "bytes": row["size"], "sha256": row["sha256"]}
+                               for name, row in sorted(catalog["assets"].items())]
+            if (ck.get("checkpoint_id"), ck.get("manifest_sha256"), ck.get("sha256"), ck.get("files"),
+                    catalog["model_id"], catalog["config"].get("n_layers"), catalog["config_sha256"]) != (
+                    catalog["checkpoint_id"], catalog["manifest_sha256"], catalog["checkpoint_id"].removeprefix("tensor-sha256:"), expected_assets,
+                    p["model_id"], p["layer_count"], ck.get("config_sha256")):
+                errors.append("logical checkpoint/catalogue/assets binding invalid")
         files = ck.get("files", [])
-        if not any(x.get("name", "").endswith(".safetensors") for x in files):
+        if not logical and not any(x.get("name", "").endswith(".safetensors") for x in files):
             errors.append("weight bytes are not pinned")
         for x in files:
             if not _sha(x.get("sha256")) or not _integer(x.get("bytes"), 1):
@@ -246,6 +340,30 @@ def protocol_errors(p: dict) -> list[str]:
         source = p.get("source", {})
         if not source.get("files") or not _sha(source.get("sha256")) or digest(source["files"]) != source["sha256"]:
             errors.append("engine source contents are not pinned")
+        source_names = set()
+        for row in source.get("files", []):
+            if not isinstance(row, dict) or not _sha(row.get("sha256")) or row.get("name") in source_names:
+                errors.append("invalid or duplicate source file digest")
+                break
+            _safe_path(Path("."), row["name"])
+            source_names.add(row["name"])
+        state = source.get("working_tree")
+        if state is not None and (not isinstance(state, dict) or set(state) != {"known", "dirty", "status_sha256"}
+                or type(state.get("known")) is not bool or
+                (state["known"] and (type(state.get("dirty")) is not bool or not _sha(state.get("status_sha256")))) or
+                (not state["known"] and (state.get("dirty") is not None or state.get("status_sha256") is not None))):
+            errors.append("source working-tree summary invalid")
+        contract = p.get("evidence_contract")
+        if contract is not None and (not isinstance(contract, dict) or set(contract) != {"coordinator_diagnostics_required", "runtime_observation_required"}
+                or any(type(value) is not bool for value in contract.values())):
+            errors.append("explicit benchmark observation contract invalid")
+        network = p.get("network_comparison")
+        if network is not None and (not isinstance(network, dict) or
+                set(network) != {"schema", "transport", "route_identity_sha256", "latency_semantics", "measurement_method"}
+                or network.get("schema") != NETWORK_SCHEMA or not _sha(network.get("route_identity_sha256"))
+                or network.get("latency_semantics") not in ("round_trip", "one_way", "no_latency_claim")
+                or any(not isinstance(network.get(name), str) or not network[name] for name in ("transport", "measurement_method"))):
+            errors.append("network route/latency comparison contract invalid")
         run = p.get("run", {})
         if (not _integer(run.get("prompt_tokens"), 1) or not _integer(run.get("max_new"), 2)
                 or run.get("warm_reps") != 3 or run.get("warmup_reps") != 1
@@ -325,6 +443,69 @@ def require_protocol(protocol: dict) -> None:
         raise BenchmarkError("; ".join(errors))
 
 
+def runtime_observation_errors(observation, node, protocol):
+    """Check a declaration already authenticated inside its stage receipt."""
+    from shard.runtime_observation import validate_runtime_observation
+    try:
+        value = validate_runtime_observation(observation)
+        errors = []
+        if any(value[name] != node[name] for name in ("node_id", "gpu_uuid", "process_run_id")):
+            errors.append("runtime node/GPU/process identity differs from frozen inventory")
+        if node.get("runtime_config_sha256") is not None and value["runtime_config_sha256"] != node["runtime_config_sha256"]:
+            errors.append("effective runtime configuration differs from frozen inventory")
+        expected = {row["name"]:row["sha256"] for row in protocol["source"]["files"]}
+        required_source = {"engines/deepseek_v4/v4_pipe.py", "engines/deepseek_v4/v4_stage.py",
+                           "vendor/deepseek_v4_ref/inference/model.py", "shard/pipeline_session.py", "shard/transport.py"}
+        required_source |= {path for path in expected if path.startswith(("engines/deepseek_v4/v4_", "vendor/deepseek_v4_ref/"))
+                            or path in {"shard/"+name+".py" for name in (
+                                "receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport")}}
+        if not required_source <= set(value["source_files"]):
+            errors.append("observed source inventory omits core executed stage/protocol modules")
+        if any(expected.get(path) != sha for path, sha in value["source_files"].items()):
+            errors.append("observed stage source differs from frozen source bytes")
+        env = value["environment"]
+        def normalized(setting):
+            return str(setting).removeprefix("torch.")
+        if any(key not in env or normalized(env[key]) != normalized(setting) for key, setting in protocol["env"].items()):
+            errors.append("observed public environment differs from frozen recipe")
+        if set(env) - set(protocol["env"]):
+            errors.append("observed public environment contains unfrozen runtime flags")
+        for name in ("torch", "cuda", "tilelang"):
+            if value["versions"][name] != node[name]:
+                errors.append("observed runtime software version differs from frozen inventory")
+        if value["phase"] != "job_complete":
+            errors.append("runtime observation must describe the measured completed job")
+        if value["kernel_backend"] != protocol["env"]["V4_KERNELS"]:
+            errors.append("actual kernel backend differs from frozen recipe")
+        expected_wire = "fp8" if protocol["env"]["V4_FP8_WIRE"] not in ("", "0") else "bf16"
+        if value["wire_mode"] != expected_wire:
+            errors.append("actual wire dtype differs from frozen recipe")
+        if protocol["env"].get("V4_HADAMARD") in ("torch", "extension") and value["hadamard_backend"] != protocol["env"]["V4_HADAMARD"]:
+            errors.append("actual Hadamard backend differs from explicitly selected recipe")
+        if any(row["verdict"] in ("MISMATCH", "UNKNOWN") for row in value["effective_flags"].values()):
+            errors.append("effective runtime audit reports a mismatched or unregistered flag")
+        identity = value.get("backend_identity")
+        if identity is None and protocol.get("evidence_contract", {}).get("runtime_observation_required", False):
+            errors.append("frozen runtime contract requires backend source/binary identity")
+        if identity is not None and identity["hadamard"]["requested"] != protocol["env"].get("V4_HADAMARD", "auto"):
+            errors.append("Hadamard selection identity differs from frozen request")
+        return errors
+    except (ValueError, TypeError, KeyError) as exc:
+        return [f"runtime observation invalid: {exc}"]
+
+
+def _runtime_identity(observation):
+    """Immutable settings, separate from per-job changing coverage observations."""
+    fields = ("node_id", "gpu_uuid", "process_run_id", "runtime_config_sha256", "source_sha256",
+              "environment", "environment_sha256", "kernel_backend", "hadamard_backend", "graph_mode",
+              "wire_mode", "transport", "versions")
+    identity = observation.get("backend_identity")
+    return {**{name: observation[name] for name in fields},
+            "backend_identity": {"hadamard": {key: value for key, value in identity["hadamard"].items() if key != "reason"}} if identity else None,
+            "effective_settings": {name: {field: row[field] for field in ("requested", "parsed")}
+                                   for name, row in observation["effective_flags"].items()}}
+
+
 def measure_job(adapter, prompt: dict, protocol: dict, *, run_id: str, phase: str,
                 rep: int, mode: str, clock: Callable[[], float] = time.perf_counter) -> dict:
     """Time committed callbacks, never drafted frames. Sweep receipts after generation stops."""
@@ -338,7 +519,10 @@ def measure_job(adapter, prompt: dict, protocol: dict, *, run_id: str, phase: st
 
     result = adapter.generate(prompt["token_ids"], protocol["run"]["max_new"], mode=mode,
                               nonce=nonce, job_id=job_id, on_token=on_token)
-    returned_at = clock() - start  # includes reset/prefill/last-token return/drain; excludes sweep
+    returned_clock = clock()
+    returned_at = returned_clock - start  # includes reset/prefill/last-token return/drain; excludes sweep
+    if result.get("receipt_sweep_s", 0) != 0:
+        raise BenchmarkError("benchmark generation must disable internal receipt sweep; external sweep is timed separately")
     tokens = list(result.get("tokens", []))
     if not result.get("ok") or tokens != [token for token, _ in events]:
         raise BenchmarkError("coordinator result is not exactly its committed callback token stream")
@@ -346,10 +530,13 @@ def measure_job(adapter, prompt: dict, protocol: dict, *, run_id: str, phase: st
         raise BenchmarkError("generation ended before the fixed committed-token length")
     sweep_start = clock()
     receipts, sweep_ok = adapter.sweep(nonce)
-    sweep_s = clock() - sweep_start
+    sweep_end = clock()
+    sweep_s = sweep_end - sweep_start
+    service_end = clock()
+    service_s = service_end - start
     offsets = [offset for _, offset in events]
     decode_s = offsets[-1] - offsets[0]
-    return {
+    sample = {
         "workload": prompt["workload"], "phase": phase, "rep": rep, "mode": mode,
         "job_id": job_id, "swarm_id": adapter.swarm_id, "nonce": nonce,
         "prompt_sha256": prompt["sha256"], "prompt_tokens": len(prompt["token_ids"]),
@@ -357,13 +544,25 @@ def measure_job(adapter, prompt: dict, protocol: dict, *, run_id: str, phase: st
         "measurement": {"clock": "perf_counter", "elapsed_s": returned_at,
                         "first_token_s": offsets[0], "last_token_s": offsets[-1],
                         "commit_offsets_s": offsets, "receipt_sweep_s": sweep_s,
+                        "drain_s": returned_at-offsets[-1], "full_service_s": service_s,
+                        "observer_overhead_s": (sweep_start-returned_clock)+(service_end-sweep_end),
                         "decode_s": decode_s,
                         "end_to_end_committed_tok_s": len(tokens) / returned_at,
+                        "full_service_committed_tok_s": len(tokens)/service_s,
                         "decode_committed_tok_s": (len(tokens) - 1) / decode_s if decode_s > 0 else None},
         "coordinator_stats": {k: v for k, v in result.items()
                               if k not in ("tokens", "receipts", "receipts_ok")},
         "receipt_sweep_ok": sweep_ok, "receipts": receipts,
     }
+    if result.get("coordinator_counters") is not None:
+        from shard.benchmark_metrics import make_coordinator_diagnostics
+        sample["coordinator_diagnostics"] = make_coordinator_diagnostics(mode,
+            committed_tokens=len(tokens), prefill_tokens=result.get("prefill_committed_tokens", 1),
+            counters=result["coordinator_counters"], inflight_intervals=result.get("inflight_intervals"),
+            timing={"request_elapsed_s": returned_at, "first_token_s": offsets[0], "last_token_s": offsets[-1],
+                    "drain_s": returned_at-offsets[-1], "receipt_sweep_s": sweep_s},
+            backend=result.get("backend_identity"))
+    return sample
 
 
 def run_suite(adapter, protocol: dict, *, fresh_ring: bool,
@@ -373,6 +572,7 @@ def run_suite(adapter, protocol: dict, *, fresh_ring: bool,
     run_id = secrets.token_hex(16)
     report = {
         "schema": REPORT_SCHEMA, "protocol": protocol, "protocol_sha256": protocol["sha256"],
+        "measurement_definitions": dict(MEASUREMENT_DEFINITIONS),
         "run_id": run_id, "created_utc": _utc(), "backend": adapter.backend,
         "artifact_verification": getattr(adapter, "artifact_verification", {}),
         "cold_start": {"fresh_ring_operator_assertion": bool(fresh_ring),
@@ -435,14 +635,25 @@ class LiveRingAdapter:
             actual = {(n["node_id"], n["gpu_uuid"], n["signer_pubkey"], n["lo"], n["hi"]) for n in plan["stages"]}
             if actual != expected or plan.get("model_cohort", {}).get("config_sha256") != protocol["checkpoint"]["config_sha256"]:
                 raise BenchmarkError("benchmark hardware/config differs from deployment plan")
+            if protocol["checkpoint"].get("identity_kind") == "logical-tensor-catalogue":
+                checkpoint = protocol["checkpoint"]
+                cohort = plan.get("model_cohort", {})
+                if (cohort.get("checkpoint_id"), cohort.get("manifest_sha256")) != (
+                        checkpoint["checkpoint_id"], checkpoint["manifest_sha256"]):
+                    raise BenchmarkError("benchmark global checkpoint differs from deployment cohort")
+                self.vp.verify_cohort_directory(directory, cohort)
             key_path = coordinator_key or os.environ.get("SHARD_COORDINATOR_KEY")
             if not key_path:
                 raise BenchmarkError("strict benchmark requires a coordinator signing key")
             session_options["session_config"] = SessionConfig.from_plan(plan, -1,
                 ttl_s=min(3600, max(30, timeout * 2)), caller_key=load_key(key_path))
             self.swarm_id = plan["ring_id"]
+        if protocol["checkpoint"].get("identity_kind") == "logical-tensor-catalogue" and not session_options:
+            raise BenchmarkError("logical catalogue benchmarks require a strict deployment plan")
         self.pipe, self.ret = self.vp.connect_ring(head, tail, timeout=timeout,
                                                   token=self.vp.SWARM_TOKEN, retry_s=retry_s, **session_options)
+        if protocol["checkpoint"].get("identity_kind") == "logical-tensor-catalogue":
+            self.artifact_verification["authenticated_cohort_verified"] = bool(session_options)
 
     def generate(self, prompt_ids, max_new, *, mode, nonce, job_id, on_token):
         self._job_id = job_id
@@ -504,6 +715,36 @@ def _sample_errors(sample: dict, protocol: dict, prompt: dict) -> list[str]:
         errors.append("decode speed must use N-1 committed tokens between first and last callbacks")
     if type(m.get("receipt_sweep_s")) not in (int, float) or not math.isfinite(m["receipt_sweep_s"]) or m["receipt_sweep_s"] < 0:
         errors.append("receipt sweep duration is absent/invalid")
+    if "drain_s" in m and (not _duration_valid(m["drain_s"]) or
+            not math.isclose(m["drain_s"], elapsed-offsets[-1], rel_tol=1e-8, abs_tol=1e-8)):
+        errors.append("drain must measure generation return minus the final commit")
+    if "full_service_s" in m and (not _positive(m["full_service_s"]) or
+            not _duration_valid(m.get("observer_overhead_s")) or
+            not math.isclose(m["full_service_s"], elapsed+m["receipt_sweep_s"]+m["observer_overhead_s"], rel_tol=1e-8, abs_tol=1e-8) or
+            not math.isclose(m.get("full_service_committed_tok_s", -1), run["max_new"]/m["full_service_s"], rel_tol=1e-8)):
+        errors.append("full service must include generation/drain and separate receipt sweep")
+    if sample.get("coordinator_diagnostics") is not None:
+        try:
+            from shard.benchmark_metrics import COUNTERS, validate_coordinator_diagnostics
+            diagnostics = validate_coordinator_diagnostics(sample["coordinator_diagnostics"])
+            if diagnostics["counts"]["committed_total_tokens"] != len(tokens) or diagnostics["mode"] != sample["mode"]:
+                errors.append("coordinator raw counts/mode differ from actual committed sample")
+            if protocol.get("evidence_contract", {}).get("coordinator_diagnostics_required", False) and diagnostics["missing_counters"]:
+                errors.append("frozen diagnostic contract requires complete raw coordinator counters")
+            for diagnostic_field, measurement_field in (("request_elapsed_s", "elapsed_s"), ("first_token_s", "first_token_s"),
+                    ("last_token_s", "last_token_s"), ("drain_s", "drain_s"), ("receipt_sweep_s", "receipt_sweep_s")):
+                if diagnostics["timing"][diagnostic_field] != m.get(measurement_field):
+                    errors.append("coordinator diagnostic timing differs from measured callback/return/sweep boundaries")
+                    break
+            raw_stats = sample.get("coordinator_stats", {})
+            if diagnostics["inflight_intervals"] != raw_stats.get("inflight_intervals"):
+                errors.append("inflight diagnostics differ from raw coordinator intervals")
+            if any(diagnostics["counts"][name] != raw_stats.get("coordinator_counters", {}).get(name) for name in COUNTERS):
+                errors.append("coordinator diagnostics differ from raw result counters")
+        except (ValueError, TypeError, KeyError) as exc:
+            errors.append(f"coordinator diagnostics invalid: {exc}")
+    elif protocol.get("evidence_contract", {}).get("coordinator_diagnostics_required", False):
+        errors.append("frozen diagnostic contract requires raw coordinator counters")
     return errors
 
 
@@ -518,18 +759,32 @@ def evaluate_report(report: dict, expected_protocol: dict | None = None) -> dict
                 "workloads": {}, "hardware_evidence": "operator_inventory", "speed_pass": False}
     if report.get("schema") != REPORT_SCHEMA or report.get("protocol_sha256") != protocol["sha256"]:
         failed.append("report schema/protocol binding invalid")
+    if report.get("measurement_definitions") is not None and report["measurement_definitions"] != MEASUREMENT_DEFINITIONS:
+        failed.append("measurement definitions differ from the supported timing/counter contract")
     if expected_protocol is not None and protocol != expected_protocol:
         failed.append("report does not use the independently supplied frozen protocol")
     if report.get("backend") != "live_ring":
         missing.append("not a live hardware benchmark; mock/CPU execution cannot pass the speed gate")
     evidence = report.get("artifact_verification", {})
-    if not all(evidence.get(k) is True for k in ("checkpoint_bytes_verified", "config_bytes_verified",
-                                               "tokenizer_bytes_verified", "engine_source_verified")):
+    logical = protocol["checkpoint"].get("identity_kind") == "logical-tensor-catalogue"
+    required_artifacts = (("global_catalog_verified", "authenticated_cohort_verified") if logical else
+                          ("checkpoint_bytes_verified",)) + ("config_bytes_verified", "tokenizer_bytes_verified", "engine_source_verified")
+    if not all(evidence.get(k) is True for k in required_artifacts):
         missing.append("live checkpoint/config/tokenizer/source verification absent")
+    if logical:
+        scope = evidence.get("local_weight_scope")
+        if evidence.get("checkpoint_id") != protocol["checkpoint"]["checkpoint_id"] or scope not in (
+                "complete packed payload hashes", "assigned stage payload hashes", "pinned catalogue and local model assets only"):
+            missing.append("local/global artifact verification scope absent or invalid")
+        if scope != "complete packed payload hashes" and evidence.get("checkpoint_bytes_verified") is True:
+            failed.append("partial/coordinator assets falsely claim complete local checkpoint verification")
     if report.get("cold_start", {}).get("fresh_ring_operator_assertion") is not True:
         missing.append("fresh process/model cold-start assertion absent")
     nodes = protocol["hardware"]
     assignments = {n["signer_pubkey"]: (n["layer_start"], n["layer_end"]) for n in nodes}
+    hardware_by_signer = {node["signer_pubkey"]:node for node in nodes}
+    runtime_observed = 0
+    runtime_identities = {}
     try:
         if str(ROOT) not in sys.path:
             sys.path.insert(0, str(ROOT))
@@ -577,6 +832,19 @@ def evaluate_report(report: dict, expected_protocol: dict | None = None) -> dict
                                         expected_nonce=nonce, check_chain=True)
                         if any(r.get("job_id") != job_id or r.get("swarm_id") != s.get("swarm_id") for r in wired):
                             raise BenchmarkError("signed job/swarm identity differs from measured job")
+                        for receipt in wired:
+                            observation = receipt.get("runtime_observation")
+                            if observation is not None:
+                                runtime_observed += 1
+                                problems = runtime_observation_errors(observation, hardware_by_signer[receipt["pubkey"]], protocol)
+                                if problems:
+                                    raise BenchmarkError("; ".join(problems))
+                                identity = _runtime_identity(observation)
+                                previous = runtime_identities.setdefault(observation["node_id"], identity)
+                                if previous != identity:
+                                    raise BenchmarkError("effective runtime settings/backends changed during the frozen suite")
+                            elif protocol.get("evidence_contract", {}).get("runtime_observation_required", False):
+                                missing.append(f"{label}: signed effective runtime observation absent")
                         if protocol["env"].get("V4_RUNTIME_METRICS") not in ("", "0"):
                             if any(not r.get("runtime_metrics") for r in wired):
                                 missing.append(f"{label}: enabled signed runtime metrics absent")
@@ -604,6 +872,25 @@ def evaluate_report(report: dict, expected_protocol: dict | None = None) -> dict
                 "median_first_token_s": statistics.median(s["measurement"]["first_token_s"] for s in warm),
                 "token_parity": all(s.get("tokens") == greedy.get("tokens") for s in group),
             }
+            from shard.benchmark_metrics import percentile
+            raw_timings = {field:[s["measurement"][field] for s in warm if s["measurement"].get(field) is not None]
+                           for field in ("first_token_s", "decode_s", "elapsed_s", "drain_s", "receipt_sweep_s", "full_service_s")}
+            workloads[name]["timing_distributions"] = {field:{"samples":values, "p50":percentile(values,50), "p95":percentile(values,95)}
+                                                       for field, values in raw_timings.items()}
+            workloads[name]["inter_token_latency_s"] = {"samples":[b-a for s in warm for a,b in zip(
+                s["measurement"]["commit_offsets_s"], s["measurement"]["commit_offsets_s"][1:])]}
+            intervals = workloads[name]["inter_token_latency_s"]["samples"]
+            workloads[name]["inter_token_latency_s"].update(p50=percentile(intervals,50), p95=percentile(intervals,95))
+            diagnostic_values = {field:[s["coordinator_diagnostics"]["derived"][field] for s in warm
+                if s.get("coordinator_diagnostics") is not None and s["coordinator_diagnostics"]["derived"][field] is not None]
+                for field in ("g_cycle", "g_frame", "acceptance_ratio", "frame_waste_ratio", "inflight_time_avg", "max_inflight")}
+            workloads[name]["coordinator_distributions"] = {field:{"samples":values, "p50":percentile(values,50), "p95":percentile(values,95)}
+                                                            for field, values in diagnostic_values.items()}
+            from shard.benchmark_metrics import COUNTERS
+            count_values = {field:[s["coordinator_diagnostics"]["counts"][field] for s in warm
+                if s.get("coordinator_diagnostics") is not None and s["coordinator_diagnostics"]["counts"][field] is not None] for field in COUNTERS}
+            workloads[name]["coordinator_count_distributions"] = {field:{"samples":values, "p50":percentile(values,50), "p95":percentile(values,95)}
+                                                                  for field, values in count_values.items()}
         if len(samples) != 20 or any(s.get("workload") not in WORKLOADS for s in samples):
             failed.append("report has extra/missing benchmark jobs")
     except (KeyError, ValueError, TypeError, AttributeError, BenchmarkError) as exc:
@@ -625,19 +912,106 @@ def evaluate_report(report: dict, expected_protocol: dict | None = None) -> dict
         "valid_evidence": has_evidence,
         "parity_scope": "committed token IDs vs same-ring greedy, not proof of hidden-state bit equality",
         "hardware_evidence": "operator_inventory_pinned_to_receipt_signers; not remote hardware attestation",
+        "runtime_evidence": {"signed_observation_count": runtime_observed,
+            "scope": "worker-signed effective runtime declarations" if runtime_observed else "operator declarations only; actual runtime not observed",
+            "stage_identities": runtime_identities,
+            "not_remote_execution_attestation": True},
     }
 
 
-def compare_reports(before: dict, after: dict) -> dict:
+def compare_reports(before: dict, after: dict, *, vary=None) -> dict:
     """Compare matching workload/model recipes; decouple target passing from valid A/B comparison."""
     old, new = evaluate_report(before), evaluate_report(after)
     p, q = before.get("protocol", {}), after.get("protocol", {})
+    if protocol_errors(p) or protocol_errors(q):
+        return {"status":"unverified", "reason":"comparison protocol invalid", "before":old, "after":new}
     # Core model, context length, and prompt recipe must match, allowing intentional runtime cache/knob evolution
-    same_recipe = (all(p.get(k) == q.get(k) for k in ("model_id", "checkpoint", "prompts", "run"))
+    same_recipe = (all(p.get(k) == q.get(k) for k in ("model_id", "prompts", "run"))
+                   and _checkpoint_identity(p.get("checkpoint", {})) == _checkpoint_identity(q.get("checkpoint", {}))
                    and p.get("env", {}).get("V4_MAX_SEQ") == q.get("env", {}).get("V4_MAX_SEQ"))
     if not same_recipe:
         return {"status": "unverified", "reason": "model/prompt/context/run recipe differs",
                 "before": old, "after": new}
+    if vary is not None and (not isinstance(vary, str) or vary != "source" and vary != "network" and not re.fullmatch(r"env:V4_[A-Z0-9_]+", vary)):
+        return {"status":"unverified", "reason":"vary must be source, network or env:V4_FLAG", "before":old, "after":new}
+    source_changed = p.get("source", {}).get("sha256") != q.get("source", {}).get("sha256")
+    ignored = {"process_run_id", "stage_env_sha256", "engine_source_sha256"}
+    if vary == "source" or isinstance(vary, str) and vary.startswith("env:"):
+        ignored |= {"runtime_config_sha256", "effective_flags_sha256"}
+    if vary == "source":
+        ignored |= {"hadamard_backend", "graph_mode", "kernel_backend"}
+    elif vary in {"env:V4_HADAMARD", "env:V4_HADAMARD_BACKEND"}:
+        ignored.add("hadamard_backend")
+    elif vary == "env:V4_CUDA_GRAPH":
+        ignored.add("graph_mode")
+    hardware_changed = [{k:v for k,v in node.items() if k not in ignored} for node in p.get("hardware", [])] != [
+        {k:v for k,v in node.items() if k not in ignored} for node in q.get("hardware", [])]
+    env_changes = sorted(key for key in set(p.get("env", {})) | set(q.get("env", {})) if p.get("env", {}).get(key) != q.get("env", {}).get(key))
+    network_changed = p.get("network_comparison") != q.get("network_comparison")
+    actual_changes = (["source"] if source_changed else []) + (["network"] if network_changed else []) + ["env:"+key for key in env_changes]
+    reason = None
+    if hardware_changed or before.get("backend") != after.get("backend"):
+        reason = "hardware/software assignment or backend differs; not a controlled single-variable comparison"
+    elif not p.get("network_comparison") or not q.get("network_comparison"):
+        reason = "network route/latency measurement contract is not frozen"
+    elif any(p["network_comparison"][key] != q["network_comparison"][key] for key in ("latency_semantics", "measurement_method")):
+        reason = "network latency semantics or measurement method differs"
+    elif actual_changes != ([] if vary is None else [vary]):
+        reason = "undeclared or multiple source/environment/network changes: " + str(actual_changes)
+    observations_old = old.get("runtime_evidence", {}).get("stage_identities", {})
+    observations_new = new.get("runtime_evidence", {}).get("stage_identities", {})
+    if reason is None and (old.get("runtime_evidence", {}).get("signed_observation_count") != len(before.get("samples", []))*len(p.get("hardware", []))
+            or new.get("runtime_evidence", {}).get("signed_observation_count") != len(after.get("samples", []))*len(q.get("hardware", []))
+            or set(observations_old) != {node["node_id"] for node in p.get("hardware", [])}
+            or set(observations_new) != set(observations_old)
+            or any(row.get("backend_identity") is None for row in (*observations_old.values(), *observations_new.values()))):
+        reason = "controlled comparison requires signed effective runtime observations for every stage/job"
+    def comparable_runtime(identity, protocol, other):
+        result = {name: value for name, value in identity.items() if name != "process_run_id"}
+        if vary == "source":
+            result = {name:value for name,value in result.items() if name not in
+                      {"runtime_config_sha256", "source_sha256", "kernel_backend", "hadamard_backend", "graph_mode", "effective_settings"}}
+            # Repo-owned Python code may change in a source experiment. Retain
+            # external .so/.pyd and dependency versions, even though config SHA changes.
+            backend = result.get("backend_identity", {}).get("hadamard")
+            if identity["hadamard_backend"] != other["hadamard_backend"]:
+                result.pop("backend_identity", None)
+            elif backend is not None:
+                source_rows = protocol["source"]["files"]
+                repo_files = {(Path(row["name"]).name, row["sha256"]) for row in source_rows}
+                hadamard = dict(backend)
+                hadamard["module_files"] = [row for row in backend["module_files"] if (row["name"], row["sha256"]) not in repo_files]
+                if len(hadamard["module_files"]) != len(backend["module_files"]) and backend["backend"] == "torch":
+                    hadamard.pop("source_sha256", None)
+                result["backend_identity"] = {"hadamard": hadamard}
+        elif isinstance(vary, str) and vary.startswith("env:"):
+            changed_flag = vary[4:]
+            result.pop("runtime_config_sha256", None)
+            result.pop("environment_sha256", None)
+            result["environment"] = {name:value for name,value in result["environment"].items() if name != changed_flag}
+            result["effective_settings"] = {name:value for name,value in result["effective_settings"].items() if name != changed_flag}
+            if changed_flag == "V4_HADAMARD":
+                result.pop("hadamard_backend", None)
+                if identity["hadamard_backend"] != other["hadamard_backend"]:
+                    result.pop("backend_identity", None)
+                else:
+                    backend = result.get("backend_identity")
+                    if backend is not None:
+                        result["backend_identity"] = {"hadamard": {key:value for key,value in backend["hadamard"].items() if key != "requested"}}
+            if changed_flag == "V4_CUDA_GRAPH":
+                result.pop("graph_mode", None)
+            if changed_flag == "V4_FP8_WIRE":
+                result.pop("wire_mode", None)
+        return result
+    if reason is None and any(comparable_runtime(observations_old[node], p, observations_new[node]) !=
+            comparable_runtime(observations_new[node], q, observations_old[node]) for node in observations_old):
+        reason = "observed backends/settings differ beyond the declared variable"
+    if reason:
+        return {"status":"unverified", "reason":reason, "changes":actual_changes, "before":old, "after":new}
+    outputs_before = {sample["workload"]:sample["tokens"] for sample in before.get("samples", []) if sample.get("phase") == "greedy_control"}
+    outputs_after = {sample["workload"]:sample["tokens"] for sample in after.get("samples", []) if sample.get("phase") == "greedy_control"}
+    if outputs_before != outputs_after:
+        return {"status":"unverified", "reason":"before/after committed output IDs differ despite matched prompts/recipe", "before":old, "after":new}
     ratios = {name: new["workloads"][name]["median_decode_committed_tok_s"] /
                     old["workloads"][name]["median_decode_committed_tok_s"]
               for name in WORKLOADS if name in old.get("workloads", {}) and name in new.get("workloads", {})}
@@ -647,6 +1021,9 @@ def compare_reports(before: dict, after: dict) -> dict:
               else "unverified")
     return {"status": status,
             "workload_speed_ratios": ratios, "before": old, "after": new,
+            "declared_variable": vary, "changes": actual_changes,
+            "frozen_controls": {"before": {"source":p.get("source"), "hardware":p.get("hardware"), "env":p.get("env"), "network":p.get("network_comparison")},
+                                "after": {"source":q.get("source"), "hardware":q.get("hardware"), "env":q.get("env"), "network":q.get("network_comparison")}},
             "source_changed": p.get("source") != q.get("source"),
             "hardware_changed": p.get("hardware") != q.get("hardware"),
             "cache_knob_changed": p.get("expert_cache") != q.get("expert_cache")}
@@ -665,13 +1042,15 @@ def _write(path, obj):
 
 
 def _prepare(args):
-    inventory = checkpoint_inventory(args.dir)
+    inventory = _checkpoint_identity(checkpoint_inventory(args.dir))
     source = source_identity()
     env = dict(DEFAULT_ENV)
     if args.env_file:
         env.update(_read(args.env_file))
-    from transformers import AutoTokenizer  # local files only, no GPU/runtime model dependency
-    tokenizer = AutoTokenizer.from_pretrained(args.dir, local_files_only=True, trust_remote_code=False)
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from engines.deepseek_v4.v4_tokenizer import load_v4_tokenizer
+    tokenizer = load_v4_tokenizer(args.dir)
     enc_dir = ROOT / "vendor" / "deepseek_v4_ref" / "encoding"
     sys.path.insert(0, str(enc_dir))
     from encoding_dsv4 import encode_messages
@@ -679,10 +1058,12 @@ def _prepare(args):
     prompts = freeze_prompts(lambda text: tokenizer.encode(text, add_special_tokens=False), render,
                              args.prompt_tokens)
     p = seal_protocol({
-        "schema": PROTOCOL_SCHEMA, "model_id": MODEL_ID, "layer_count": 43,
+        "schema": PROTOCOL_SCHEMA, "model_id": inventory.get("global_catalog", {}).get("model_id", MODEL_ID), "layer_count": 43,
         "checkpoint": inventory, "source": source, "env": env, "hardware": _read(args.hardware),
         "isolation": args.isolation,
         "prompts": prompts,
+        "evidence_contract": {"coordinator_diagnostics_required": True, "runtime_observation_required": True},
+        **({"network_comparison": _read(args.network)} if getattr(args, "network", None) else {}),
         "run": {"prompt_tokens": args.prompt_tokens, "max_new": args.max_new,
                 "warm_reps": 3, "warmup_reps": 1, "mode": args.mode,
                 "temperature": 0.0, "seed": 0, "eos_policy": "fixed_length_ignore_eos",
@@ -707,6 +1088,7 @@ def main(argv=None) -> int:
     prep.add_argument("--isolation", choices=("host", "none"), default="host",
                       help="host preserves scattered-WAN baseline; none admits distinct GPUs on shared hosts")
     prep.add_argument("--env-file", help="JSON object overriding the explicit baseline recipe")
+    prep.add_argument("--network", help="frozen public route/latency comparison contract JSON; required for controlled A/B")
     prep.add_argument("--prompt-tokens", type=int, default=512)
     prep.add_argument("--max-new", type=int, default=512)
     prep.add_argument("--mode", choices=("greedy", "dspark", "pipelined"), default="pipelined")
@@ -728,6 +1110,7 @@ def main(argv=None) -> int:
     compare = sub.add_parser("compare", help="compare before/after only with matching benchmark recipe")
     compare.add_argument("before")
     compare.add_argument("after")
+    compare.add_argument("--vary", help="one predeclared change: source, network, or env:V4_FLAG; omitted means identical controls")
     args = parser.parse_args(argv)
     try:
         if args.command == "inventory":
@@ -755,9 +1138,9 @@ def main(argv=None) -> int:
         elif args.command == "verify":
             result = evaluate_report(_read(args.report), _read(args.protocol) if args.protocol else None)
         else:
-            result = compare_reports(_read(args.before), _read(args.after))
+            result = compare_reports(_read(args.before), _read(args.after), vary=args.vary)
         print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
-        return 0 if result["status"] in ("passed", "verified_comparison") else 2
+        return 0 if result["status"] in ("passed", "verified_comparison", "verified_target_pass") else 2
     except (BenchmarkError, OSError, ValueError, ImportError) as exc:
         print(json.dumps({"status": "unverified", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2

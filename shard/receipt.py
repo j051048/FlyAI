@@ -70,7 +70,8 @@ class ReceiptSigner:
     observe() is on the hot path: it hashes only the small per-chunk activation tensor (tens of
     KB for a decode chunk; a few MB for a prefill chunk), so the cost is negligible vs the WAN
     ring. Chaining sha256(in)/sha256(out) per chunk yields an order-sensitive root over the whole
-    job — a node that skipped or altered any chunk produces a different root and is caught."""
+    job. The roots bind the bytes a signer declared; their consistency alone
+    does not prove that a remote node executed the model's arithmetic."""
 
     def __init__(self, priv: ed25519.Ed25519PrivateKey, swarm_id: str, job_id: str,
                  layer_start: int, layer_end: int, nonce: str | None = None):
@@ -88,7 +89,7 @@ class ReceiptSigner:
         self._out.update(_h(out_bytes))
         self.n += 1
 
-    def finalize(self, runtime_metrics: dict | None = None) -> dict:
+    def finalize(self, runtime_metrics: dict | None = None, runtime_observation: dict | None = None) -> dict:
         """Stamp pubkey + signature into a signed receipt dict and return it."""
         body = dict(self.meta, schema=SCHEMA, n_chunks=self.n,
                     in_root=self._in.hexdigest(), out_root=self._out.hexdigest(),
@@ -96,6 +97,9 @@ class ReceiptSigner:
         if runtime_metrics is not None:
             # Attach BEFORE signing; detach the live counters from this immutable job snapshot.
             body["runtime_metrics"] = validate_runtime_metrics(runtime_metrics)
+        if runtime_observation is not None:
+            from shard.runtime_observation import validate_runtime_observation
+            body["runtime_observation"] = validate_runtime_observation(runtime_observation)
         body["sig"] = base64.b64encode(self.priv.sign(_canonical(body))).decode()
         return body
 
@@ -110,6 +114,12 @@ def verify_receipt(receipt: dict, expected_pubkey: str | None = None) -> None:
             validate_runtime_metrics(receipt["runtime_metrics"])
         except (ValueError, TypeError, OverflowError) as e:
             raise ReceiptError(f"invalid runtime metrics: {e}") from e
+    if "runtime_observation" in receipt:
+        from shard.runtime_observation import validate_runtime_observation
+        try:
+            validate_runtime_observation(receipt["runtime_observation"])
+        except (ValueError, TypeError, OverflowError) as e:
+            raise ReceiptError(f"invalid runtime observation: {e}") from e
     pub_b64 = receipt.get("pubkey")
     sig_b64 = receipt.get("sig")
     if not pub_b64 or not sig_b64:

@@ -36,10 +36,11 @@ def prepare_allowed_spans(allowed_spans, n_layers, template_resources):
     if not isinstance(allowed_spans, dict) or not isinstance(template_resources, dict):
         raise ValueError("calibrated spans require node maps and measured resource capacities")
     required = {"lo", "hi", "head", "tail", "gpu_bytes", "host_bytes", "pinned_bytes", "runtime_config_sha256"}
-    permitted = required | {"stage_index", "nstages"}
+    storage_fields = {"filesystem_id", "disk_bytes", "prepare_ram_bytes", "prepare_pinned_bytes", "preparation_mode", "storage"}
+    permitted = required | {"stage_index", "nstages"} | storage_fields
     result = {}
     for node, rows in allowed_spans.items():
-        if not isinstance(rows, list) or len(rows) > 64:
+        if not isinstance(rows, list) or len(rows) > 128:
             raise ValueError("allowed_spans must be a bounded list of measured templates")
         capacities = template_resources.get(node, {})
         for key in ("available_vram_bytes", "available_ram_bytes", "pinnable_ram_bytes"):
@@ -70,13 +71,29 @@ def prepare_allowed_spans(allowed_spans, n_layers, template_resources):
             if "stage_index" in row and "nstages" in row and (row["head"] != (row["stage_index"] == 0)
                     or row["tail"] != (row["stage_index"] == row["nstages"] - 1)):
                 raise ValueError("calibrated boundary roles differ from stage geometry")
-            identity = lo, hi, row["runtime_config_sha256"]
+            if storage_fields.intersection(row):
+                if not storage_fields <= set(row):
+                    raise ValueError("preparation candidate needs its complete storage/strategy binding")
+                from .resources import StorageRequirements, STORAGE_PREPARE_SCHEMA
+                storage = StorageRequirements.from_dict(row["storage"])
+                if storage.schema != STORAGE_PREPARE_SCHEMA or (storage.layer_start, storage.layer_end, storage.head, storage.tail) != (lo, hi, row["head"], row["tail"]):
+                    raise ValueError("storage stage geometry differs from calibrated span")
+                budget = storage.preparation_budget(mode=row["preparation_mode"])
+                if any(row[key] != budget[source] for key, source in (
+                        ("filesystem_id", "filesystem_id"), ("disk_bytes", "disk_peak_bytes"),
+                        ("prepare_ram_bytes", "ram_bytes"), ("prepare_pinned_bytes", "pinned_bytes"))):
+                    raise ValueError("preparation bytes/strategy differ from the source geometry bounds")
+                fs = capacities.get("filesystems", {}).get(row["filesystem_id"], {})
+                have = fs.get("available_disk_bytes")
+                if type(have) is not int or have < row["disk_bytes"]:
+                    continue
+            identity = lo, hi, row["runtime_config_sha256"], row.get("filesystem_id"), row.get("preparation_mode")
             if identity in seen:
                 raise ValueError("duplicate calibrated template")
             seen.add(identity)
             if any(need > 0 and (capacities.get(key) is None or need > capacities[key]) for key, need in (
-                    ("available_vram_bytes", row["gpu_bytes"]), ("available_ram_bytes", row["host_bytes"]),
-                    ("pinnable_ram_bytes", row["pinned_bytes"]))):
+                    ("available_vram_bytes", row["gpu_bytes"]), ("available_ram_bytes", row["host_bytes"] + row.get("prepare_ram_bytes", 0)),
+                    ("pinnable_ram_bytes", row["pinned_bytes"] + row.get("prepare_pinned_bytes", 0)))):
                 continue
             valid.append(dict(row))
         result[node] = valid
@@ -733,6 +750,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         # The bounded search reports truncation; it is not an open-pool proof.
         groups = memory_groups
         budgets = {}
+        disk_budgets = {}
         for node in usable:
             group = groups[node]
             capacity = template_resources.get(node, {})
@@ -741,13 +759,17 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 value = capacity.get(key)
                 if value is not None:
                     entry[key] = min(entry.get(key, value), value)
+            for fs_id, fs in capacity.get("filesystems", {}).items():
+                value = fs.get("available_disk_bytes")
+                if type(value) is int and value >= 0:
+                    disk_budgets[fs_id] = min(disk_budgets.get(fs_id, value), value)
         limit = min(len(usable), hard_max_stages if hard_max_stages is not None else int(max_stages or 6))
         by_start = {}
         for node in usable:
             for row in calibrated[node]:
                 by_start.setdefault(row["lo"], {}).setdefault(node, []).append(row)
         best, visited, truncated = None, 0, False
-        def visit(cursor, order, allocation, chosen, host_used, pin_used, width):
+        def visit(cursor, order, allocation, chosen, host_used, pin_used, disk_used, width):
             nonlocal best, visited, truncated
             if visited >= 200_000:
                 truncated = True
@@ -789,18 +811,24 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                     if row["tail"] and row["hi"] - cursor < tail_floor:
                         continue
                     group = groups[node]
-                    host = host_used.get(group, 0) + row["host_bytes"]
-                    pinned = pin_used.get(group, 0) + row["pinned_bytes"]
+                    host = host_used.get(group, 0) + row["host_bytes"] + row.get("prepare_ram_bytes", 0)
+                    pinned = pin_used.get(group, 0) + row["pinned_bytes"] + row.get("prepare_pinned_bytes", 0)
                     cap = budgets.get(group, {})
                     if host > cap.get("available_ram_bytes", 0) or pinned > cap.get("pinnable_ram_bytes", 0):
                         continue
+                    fs_id = row.get("filesystem_id")
+                    disks = dict(disk_used)
+                    if fs_id is not None:
+                        disks[fs_id] = disks.get(fs_id, 0) + row["disk_bytes"]
+                        if disks[fs_id] > disk_budgets.get(fs_id, 0):
+                            continue
                     allocation[node], chosen[node] = row["hi"] - cursor, row
-                    visit(row["hi"], trial, allocation, chosen, {**host_used, group: host}, {**pin_used, group: pinned}, width)
+                    visit(row["hi"], trial, allocation, chosen, {**host_used, group: host}, {**pin_used, group: pinned}, disks, width)
                     del allocation[node], chosen[node]
         initial_width = min(limit, k_min + slack)
-        visit(0, [], {}, {}, {}, {}, initial_width)
+        visit(0, [], {}, {}, {}, {}, {}, initial_width)
         if best is None and not truncated and initial_width < limit:
-            visit(0, [], {}, {}, {}, {}, limit)
+            visit(0, [], {}, {}, {}, {}, {}, limit)
         if best is None:
             return None
         rank, order, alloc, chosen, step, pf = best

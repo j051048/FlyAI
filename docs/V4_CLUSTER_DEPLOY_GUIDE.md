@@ -1,9 +1,12 @@
 # FlyAI DeepSeek-V4 多机与多卡部署指南
 
-对齐代码快照 `c2ab623`（2026-10-08）。模型仍是
+基础严格部署合同来自 `c2ab623`（2026-10-08），本轮工作树新增有界权重准备与局部 artifact 加载，见第 2 节。模型仍是
 `deepseek-ai/DeepSeek-V4-Flash-0731`：43 个目标层，DSpark 尾节点需要完整拥有
 40、41、42 层以及 3 个 MTP 块。本指南不代表新集群已经通过 GPU 验收。
 4×RTX 5090 ≥40、6×RTX 5090 ≥30 committed decode tok/s 仍待真实硬件验证。
+
+共享 Hadamard 初始化、缓存别名、自检、strict SSH 手动部署及 P0–P2 复测步骤见
+[V4_OPERATIONS](V4_OPERATIONS.md)。手动实验工具不代替下文的生产资源租约。
 
 ## 1. 先准备可审核的部署合同
 
@@ -41,22 +44,37 @@ python -m pip install -e ".[v4,deploy]"
 旧 cu124 wheel、Python 3.10 或 CPU torch 都不是本指南的 RTX 5090 验收配置。
 新 host 不应通过静默 BF16/CPU 回退冒充支持原始 FP4 内核。
 
-V4 Stage 使用原生 reference 命名/分片格式，例如转换后的
-`model0-mp1.safetensors` 与原生 `ModelArgs` 配置。只有 HF 下载目录不等于可直接加载。
-转换工具位于 `vendor/deepseek_v4_ref/inference/convert.py`，其参数是
+V4 Stage 使用原生 reference 名称与 `ModelArgs` 配置。新路径可加载多个
+`modelNNN-mp1.safetensors` 小文件及仅包含本 stage 参数的目录；只有 HF 下载目录仍不等于可直接加载。
+当前有界流式转换、range 重打包、缓存/磁盘预算和发布步骤见
+[WEIGHT_PREPARATION.md](WEIGHT_PREPARATION.md)。它保持 vendor 数学与 tensor 字节，
+不要求 coordinator 保存完整巨型权重。各 stage 的文件与 tensor hash 必须通过后才可 READY。
+
+原始转换器位于 `vendor/deepseek_v4_ref/inference/convert.py`，其参数是
 `--hf-ckpt-path`、`--save-path`、`--n-experts`、`--model-parallel`、`--expert-dtype`；
-转换是单独的重操作，需要真实资源预算。参考版本见
+该原始转换器保留全集 `state_dicts` 后才写出，不是有界流式入口；
+`--model-parallel` 切的是 TP 专家/矩阵维度，不能拿它代替 pipeline 按层分片。
+旧转换是单独的重操作，需要真实资源预算。参考版本见
 [vendor provenance](../vendor/deepseek_v4_ref/PROVENANCE.md)。
 
-冻结实际可加载的本地目录及所有权重字节：
+冻结全局 tensor-root 与本地资产。完整 pack 实际校验全部 payload，stage 目录只校验
+本段，coordinator 资产目录不声称完整权重存在；inventory 会分别记录这些验证范围：
 
 ```bash
 python phase0/v4_benchmark.py inventory --dir /data/v4 --out local-identity.json
 ```
 
+原生 artifact 使用全模型逻辑 tensor-root 作为 `checkpoint_id`，另用
+`manifest_sha256` 绑定完整 catalog 与来源；两者不必相同。重打包保留两者和原参数名称。
+局部目录拥有精确角色/层范围 manifest 与全部选中 tensor 的字节校验，不会把局部 headers
+冒充完整模型身份。coordinator 可以只有 catalog、config、tokenizer，验证范围明确为资产，
+不能报告“完整本地权重已校验”。发布目录不可原地覆盖；重复 tensor 名或已加载文件替换会拒绝。
+
 单机多卡可以共享只读 checkpoint 文件，但每个 stage 的实际加载/专家/KV 池分别计预算。
-选择性下载是否可用取决于真实 checkpoint 分片映射；不要把多个 stage 的层范围直接
-等同于多个独立磁盘文件或低估共享 SSD 的并发读峰值。
+部署规划器是 [shard/plan.py](../shard/plan.py)，它使用真实资源与测量合同。
+选择性下载/重打包按真实 tensor 映射进行，不是把 167GB 平均除以 GPU 数；
+tail 的 MTP、embedding/head、KV、graph 和临时量均需单独核算。
+这一步准备和发布新环，不会改正在执行的环，也不代表 GPT-OSS 入口已支持 partial artifact。
 
 ## 3. 校准、KV 和专家缓存
 

@@ -38,20 +38,8 @@ def ensure_hadamard():
     device from the input, runs on GPU, and is CUDA-graph capturable -- and keep the real sm120
     sparse-attention and act_quant tilelang kernels. Real ring serving installs the extension; this is
     the synthetic bench making do without it. Only registers if the real one is genuinely absent."""
-    import importlib.util
-    import types
-    if "fast_hadamard_transform" in sys.modules:
-        return "present"
-    try:
-        if importlib.util.find_spec("fast_hadamard_transform") is not None:
-            return "real"
-    except ValueError:                          # a live module with no __spec__
-        return "present"
-    mod = types.ModuleType("fast_hadamard_transform")
-    mod.hadamard_transform = v4_kernels_cpu.hadamard_transform
-    mod._v4_cpu_backend = True
-    sys.modules["fast_hadamard_transform"] = mod
-    return "shim"
+    from v4_runtime_init import ensure_hadamard as shared
+    return shared()
 
 
 def bench_args(**ov):

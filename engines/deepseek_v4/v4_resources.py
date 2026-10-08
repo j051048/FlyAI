@@ -37,6 +37,14 @@ except ImportError:
 
 MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash-0731"
 MAX_HEADER_BYTES = 16 * 1024 * 1024
+
+
+def _artifacts():
+    try:
+        from shard import weight_artifacts
+    except ImportError:
+        import weight_artifacts
+    return weight_artifacts
 _BITS = {"BOOL": 8, "U8": 8, "I8": 8, "I16": 16, "U16": 16, "I32": 32,
          "U32": 32, "I64": 64, "U64": 64, "F16": 16, "BF16": 16,
          "F32": 32, "F64": 64, "C64": 64, "F4": 4, "F6_E2M3": 6, "F6_E3M2": 6,
@@ -198,16 +206,25 @@ def inspect_checkpoint(checkpoint_dir, *, expected_checkpoint_id=None):
             tensors[name] = {**info, **classification, "file": path.name,
                              "runtime_parameter_floor_bytes": 0 if classification["kind"] == "alias" else _runtime_parameter_floor(name, info)}
     identity_body = {"config_sha256": hashlib.sha256(config_blob).hexdigest(), "headers": headers}
-    checkpoint_id = "metadata-sha256:" + hashlib.sha256(json.dumps(identity_body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    metadata_id = "metadata-sha256:" + hashlib.sha256(json.dumps(identity_body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    checkpoint_id, artifact = metadata_id, None
+    if (directory / ".shard-model-artifacts.json").is_file():
+        module = _artifacts()
+        checker = module.verify_stage_artifacts if (directory / module.STAGE_FILE).is_file() else module.verify_weight_pack
+        artifact = checker(directory, expected_checkpoint_id=expected_checkpoint_id, verify_files=False)
+        checkpoint_id = artifact["checkpoint_id"]
     if expected_checkpoint_id is not None and checkpoint_id != expected_checkpoint_id:
         raise ResourceError("checkpoint metadata identity changed")
     return {"schema": "v4-storage-inventory/1", "calibration_status": "unmeasured",
-            "checkpoint_id": checkpoint_id, "identity_kind": "headers-and-config-only",
+            "checkpoint_id": checkpoint_id, "packing_metadata_id": metadata_id,
+            "model_id": artifact["catalog"]["model_id"] if artifact else MODEL_ID,
+            "identity_kind": "global-logical-catalogue; local packing preview" if artifact else "headers-and-config-only",
             "payload_integrity_verified": False, "structure": structure,
             "config": config, "files": headers, "tensors": tensors,
             "total_storage_bytes": sum(info["storage_bytes"] for info in tensors.values()),
             "unknown_tensors": [name for name, info in tensors.items() if info["kind"] == "unknown"],
-            "runtime_peak_bytes": None}
+            "runtime_peak_bytes": None, "directory": str(directory),
+            **({"artifact_catalog": artifact["catalog"], "artifact_pack": artifact["pack"]} if artifact else {})}
 
 
 def stage_storage_inventory(inventory, lo, hi, *, head=False, tail=False, dspark=False):
@@ -246,7 +263,7 @@ def stage_storage_inventory(inventory, lo, hi, *, head=False, tail=False, dspark
     routed = sum(info["storage_bytes"] for info in selected.values() if info["kind"] == "routed_expert")
     resident = sum(info["runtime_parameter_floor_bytes"] for info in selected.values() if info["kind"] == "resident")
     return {"schema": "v4-stage-storage-inventory/1", "calibration_status": "unmeasured",
-            "checkpoint_id": inventory["checkpoint_id"], "lo": lo, "hi": hi,
+            "checkpoint_id": inventory["checkpoint_id"], "model_id": inventory.get("model_id", MODEL_ID), "lo": lo, "hi": hi,
             "head": head, "tail": tail, "dspark": dspark, "tensors": selected,
             "routed_expert_storage_bytes": routed, "resident_parameter_floor_bytes": resident,
             "total_storage_bytes": sum(info["storage_bytes"] for info in selected.values()),
@@ -310,10 +327,50 @@ def evaluate_node_host_admissibility(lo, hi, pinnable_ram_bytes, *, total_layers
     }
 
 
-def derive_stage_storage_requirements(inventory_or_dir, lo, hi, *, head=False, tail=False, dspark=False):
-    """Derive selective pull files and storage requirement for stage [lo:hi]."""
+def storage_requirements_from_artifacts(catalog, pack, lo, hi, *, filesystem_id,
+                                       head=False, tail=False, dspark=False, allow_range_repack=True,
+                                       max_file_bytes=512 << 20, chunk_bytes=1 << 20):
+    """Full source file bytes plus separately scoped bounded repacking forecasts.
+
+    Future output file SHA256 values are unknown until written. Alternatives
+    therefore expose only pre-write geometry, retaining the real source hashes
+    and global logical identity; READY validates actual output files/tensors.
+    """
+    from shard.resources import StorageFile, PreparationOption, STORAGE_PREPARE_SCHEMA
+    module = _artifacts()
+    selected = module.select_stage_artifacts(catalog, pack, lo, hi, head=head, tail=tail, dspark=dspark)
+    paths = {row["path"] for row in selected["files"]}
+    local = {**pack, "files": [row for row in pack["files"] if row["path"] in paths],
+             "weight_map": {name: path for name, path in pack["weight_map"].items() if path in paths},
+             "offsets": {name: span for name, span in pack["offsets"].items() if pack["weight_map"][name] in paths}}
+    metadata = sum(len(module.canonical(body)) + 1 for body in (catalog, local, selected))
+    records = tuple(StorageFile(row["path"], row["size"], row["sha256"]) for row in selected["files"])
+    amount = sum(row.size for row in records) + metadata
+    host = metadata * 12 + (4 << 20)
+    options = [PreparationOption("fetch", filesystem_id, amount, host, 0)]
+    if allow_range_repack:
+        bound = module.repack_storage_bound(catalog, pack, selected, max_file_bytes, chunk_bytes)
+        options.append(PreparationOption("range_repack", filesystem_id, bound["disk_peak_bytes"],
+                                         max(4 << 20, bound["host_ram_bytes"]), bound["pinned_ram_bytes"]))
+    return StorageRequirements(model_id=catalog["model_id"], layer_start=lo, layer_end=hi,
+        storage_bytes=amount, files=tuple(row.path for row in records), manifest_sha256=catalog["manifest_sha256"],
+        schema=STORAGE_PREPARE_SCHEMA, file_records=records, checkpoint_id=catalog["checkpoint_id"],
+        artifact_id=selected["artifact_id"], filesystem_id=filesystem_id, head=head, tail=tail, dspark=dspark,
+        prepare_ram_bytes=host, preparation_options=tuple(options))
+
+
+def derive_stage_storage_requirements(inventory_or_dir, lo, hi, *, head=False, tail=False, dspark=False,
+                                      filesystem_id=None, allow_range_repack=True,
+                                      max_file_bytes=512 << 20, chunk_bytes=1 << 20):
+    """Derive actual complete file bytes, never selected tensor bytes as file sizes."""
     inventory = inspect_checkpoint(inventory_or_dir) if isinstance(inventory_or_dir, (str, Path)) else inventory_or_dir
     stage_inv = stage_storage_inventory(inventory, lo, hi, head=head, tail=tail, dspark=dspark)
+    if inventory.get("artifact_catalog") is not None:
+        if not filesystem_id:
+            raise ResourceError("artifact preparation needs an explicit target filesystem identity")
+        return storage_requirements_from_artifacts(inventory["artifact_catalog"], inventory["artifact_pack"], lo, hi,
+            filesystem_id=filesystem_id, head=head, tail=tail, dspark=dspark, allow_range_repack=allow_range_repack,
+            max_file_bytes=max_file_bytes, chunk_bytes=chunk_bytes)
     files = tuple(sorted(set(info["file"] for info in stage_inv["tensors"].values())))
     manifest_body = {"checkpoint_id": inventory["checkpoint_id"], "files": list(files), "lo": lo, "hi": hi}
     manifest_sha256 = hashlib.sha256(json.dumps(manifest_body, sort_keys=True).encode()).hexdigest()
@@ -321,30 +378,30 @@ def derive_stage_storage_requirements(inventory_or_dir, lo, hi, *, head=False, t
         model_id=MODEL_ID,
         layer_start=lo,
         layer_end=hi,
-        storage_bytes=stage_inv["total_storage_bytes"],
+        storage_bytes=sum({row["file"]: row["file_bytes"] for row in inventory["files"]}[name] for name in files),
         files=files,
         manifest_sha256=manifest_sha256,
     )
 
 
 def verify_selective_pull(checkpoint_dir, storage_req):
-    """Verify that only and all required shard files for the stage are present and uncorrupted."""
-    checkpoint_dir = Path(checkpoint_dir).resolve()
-    for fname in storage_req.files:
-        path = checkpoint_dir / fname
-        if not path.is_file():
-            raise ResourceError(f"missing selective shard file: {fname}")
-        header = read_safetensors_header(path)
-        if not header.get("tensors"):
-            raise ResourceError(f"empty or corrupted shard header: {fname}")
-    return True
+    """Full assigned payload verification; a legacy header estimate is insufficient."""
+    from shard.resources import STORAGE_PREPARE_SCHEMA
+    if storage_req.schema != STORAGE_PREPARE_SCHEMA:
+        raise ResourceError("legacy storage estimates lack payload hashes; publish an artifact catalogue first")
+    result = _artifacts().verify_stage_artifacts(checkpoint_dir, expected_checkpoint_id=storage_req.checkpoint_id,
+        expected_manifest_sha256=storage_req.manifest_sha256, lo=storage_req.layer_start, hi=storage_req.layer_end,
+        head=storage_req.head, tail=storage_req.tail, dspark=storage_req.dspark, verify_files=True)
+    if result["model_id"] != storage_req.model_id:
+        raise ResourceError("selective artifact model identity differs")
+    return result
 
 
-def load_calibration(path_or_dict, *, checkpoint_id=None):
+def load_calibration(path_or_dict, *, checkpoint_id=None, model_id=MODEL_ID):
     """Accept explicit measured requirements; no inventory-to-measurement conversion."""
     body = _json_bytes(_small_file(Path(path_or_dict)), "calibration") if isinstance(path_or_dict, (str, os.PathLike)) else path_or_dict
     requirements = PlacementRequirements.from_dict(body)
-    if requirements.model_id != MODEL_ID:
+    if requirements.model_id != model_id:
         raise ResourceError("calibration is not for DeepSeek-V4-Flash")
     if checkpoint_id is not None and requirements.provenance.checkpoint_id != checkpoint_id:
         raise ResourceError("calibration checkpoint identity mismatch")
@@ -377,6 +434,8 @@ def runtime_config_payload(stage):
     torch_module = sys.modules.get("torch")
     body["runtime_versions"] = {"torch": str(getattr(torch_module, "__version__", "unknown")),
                                 "cuda": getattr(getattr(torch_module, "version", None), "cuda", None)}
+    from v4_runtime_init import hadamard_identity
+    body["hadamard"] = hadamard_identity()
     # A calibration cannot silently survive an engine implementation change.
     directory = Path(__file__).resolve().parent
     body["engine_source_sha256"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -403,11 +462,11 @@ def placement_requirements_for_stage(stage, calibration=None, checkpoint_dir=Non
         raise NotImplementedError("V4 placement needs measured calibration for this checkpoint/range/roles; header storage bytes are not runtime peaks")
     if not str(stage.device).startswith("cuda"):
         raise ResourceError("GPU placement calibration cannot be validated against a CPU Stage")
-    requirements = load_calibration(calibration)
     directory = checkpoint_dir or getattr(stage, "_resource_checkpoint_dir", None)
     if directory is None:
         raise ResourceError("the loaded checkpoint directory is required to verify calibration identity")
-    inventory = inspect_checkpoint(directory, expected_checkpoint_id=requirements.provenance.checkpoint_id)
+    inventory = inspect_checkpoint(directory)
+    requirements = load_calibration(calibration, checkpoint_id=inventory["checkpoint_id"], model_id=inventory["model_id"])
     stage_storage_inventory(inventory, stage.lo, stage.hi, head=stage.head, tail=stage.tail,
                             dspark=getattr(stage, "_dspark_capable", stage._dspark))
     if (requirements.layer_start, requirements.layer_end) != (stage.lo, stage.hi):
@@ -537,7 +596,7 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
         props = torch.cuda.get_device_properties(device)
         hardware.update(gpu_name=props.name, gpu_uuid=str(getattr(props, "uuid", "")) or None)
     return {"schema": "v4-resource-measurement/1", "calibration_status": "measured",
-            "model_id": MODEL_ID, "checkpoint_id": checkpoint_id,
+            "model_id": (getattr(stage, "_artifact_verification", None) or {}).get("catalog", {}).get("model_id", MODEL_ID), "checkpoint_id": checkpoint_id,
             "runtime_config_sha256": runtime_config_identity(stage),
             "runtime_config_payload": runtime_config_payload(stage),
             "measured_at": datetime.now(timezone.utc).isoformat(), "node_id": socket.gethostname(),

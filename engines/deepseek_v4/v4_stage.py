@@ -101,7 +101,7 @@ WHAT IS A SEAM HERE AND NOT YET A FEATURE
 
   self-test:  python3 phase0/v4_stage.py --layers 0 4
 """
-import argparse, glob, json, os, sys, torch
+import argparse, copy, glob, json, os, sys, threading, torch
 from collections import deque
 from contextlib import nullcontext
 
@@ -203,6 +203,9 @@ _REF = None
 _ARGS = {}
 _WM = {}
 _HD = {}
+_CHECKPOINTS = {}
+_ARTIFACTS = {}
+_CHECKPOINT_LOCK = threading.RLock()
 _GLOBALS = None
 
 
@@ -222,16 +225,70 @@ def ref():
     return _REF
 
 
+def _checkpoint_path(d=None):
+    value = os.path.abspath(os.fspath(d or V4_DIR))
+    if os.path.islink(value):
+        raise RuntimeError("v4: checkpoint directory must not be a symlink")
+    return os.path.realpath(value)
+
+
+def _file_stamp(path):
+    if os.path.islink(path):
+        raise RuntimeError("v4: checkpoint files must not be symlinks")
+    stat = os.stat(path)
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _pin_checkpoint(d):
+    """Pin an immutable local generation, with cheap per-tensor file checks.
+
+    Payload hashes belong to weight_artifacts verification. These stamps guard
+    against normal local replacement after verification/opening, including an
+    old cached mmap, without rehashing giant weight files for each tensor.
+    """
+    d = _checkpoint_path(d)
+    with _CHECKPOINT_LOCK:
+        directory_stamp = _file_stamp(d)
+        config_path = os.path.join(d, "config.json")
+        config_stamp = _file_stamp(config_path) if os.path.exists(config_path) else None
+        metadata = {name: _file_stamp(os.path.join(d, name)) for name in
+                    (".shard-model-artifacts.json", ".shard-weight-pack.json", ".shard-stage-artifacts.json")
+                    if os.path.exists(os.path.join(d, name))}
+        current = _CHECKPOINTS.get(d)
+        if current is not None and current["config"] != config_stamp:
+            raise RuntimeError("v4: immutable checkpoint config changed; use a new directory")
+        if current is not None and current["metadata"] != metadata:
+            raise RuntimeError("v4: immutable checkpoint artifact metadata changed; use a new directory")
+        if current is None or current["directory"] != directory_stamp:
+            files = {os.path.basename(path): _file_stamp(path)
+                     for path in sorted(glob.glob(os.path.join(d, "model*-mp*.safetensors")))}
+            if current is not None and current["files"] != files:
+                raise RuntimeError("v4: immutable checkpoint file set changed; use a new directory")
+            current = {"directory": directory_stamp, "config": config_stamp, "files": files, "metadata": metadata}
+            _CHECKPOINTS[d] = current
+        return d, current
+
+
+def _assert_checkpoint_file(d, name):
+    d, checkpoint = _pin_checkpoint(d)
+    if _file_stamp(os.path.join(d, name)) != checkpoint["files"][name]:
+        raise RuntimeError("v4: immutable checkpoint weight changed; use a new directory")
+    return d
+
+
 def config(d=None):
     """The ModelArgs for a checkpoint dir, straight off its config.json (memoized per dir).
 
     generate.py:81 does exactly this -- the shipped config.json's keys ARE the dataclass's field
     names, deliberately. `max_batch_size`/`max_seq_len` are the two the serving path overrides."""
-    d = d or V4_DIR
-    if d not in _ARGS:
-        with open(f"{d}/config.json") as f:
-            _ARGS[d] = ref().ModelArgs(**json.load(f))
-    return _ARGS[d]
+    d, _ = _pin_checkpoint(d)
+    with _CHECKPOINT_LOCK:
+        if d not in _ARGS:
+            with open(f"{d}/config.json") as f:
+                _ARGS[d] = ref().ModelArgs(**json.load(f))
+        # ring_args applies serving limits. Do not let one caller mutate the
+        # cached checkpoint config or another already constructed stage.
+        return copy.deepcopy(_ARGS[d])
 
 
 def weight_map(d=None):
@@ -240,30 +297,94 @@ def weight_map(d=None):
     convert.py writes `model{rank}-mp{mp}.safetensors` and NO index json -- unlike an HF release
     there is nothing to read the map out of, so it is built by walking each shard's key list once.
     Cheap: safetensors headers are read without touching tensor data."""
-    d = d or V4_DIR
+    d, checkpoint = _pin_checkpoint(d)
     if d not in _WM:
-        files = sorted(glob.glob(os.path.join(d, "model*-mp*.safetensors")))
+        files = sorted(checkpoint["files"])
         if not files:
             raise RuntimeError(
                 f"v4: no model*-mp*.safetensors in {d!r} — this loader reads convert.py's OUTPUT "
                 f"format, not an HF release. Run deepseek_v4_ref/inference/convert.py first.")
         wm = {}
         for f in files:
-            with safe_open(f, "pt", device="cpu") as h:
+            _assert_checkpoint_file(d, f)
+            with safe_open(os.path.join(d, f), "pt", device="cpu") as h:
                 for n in h.keys():
-                    wm[n] = os.path.basename(f)
+                    if n in wm:
+                        raise RuntimeError(f"v4: duplicate tensor {n!r} in native checkpoint files")
+                    wm[n] = f
+            _assert_checkpoint_file(d, f)
         _WM[d] = wm
-    return _WM[d]
+    else:
+        for name in checkpoint["files"]:
+            _assert_checkpoint_file(d, name)
+    return dict(_WM[d])
 
 
 def raw(n, d=None):
     """One tensor by name, off a cached safetensors handle. k3_stage.raw, per-dir."""
-    d = d or V4_DIR
-    s = weight_map(d)[n]
+    d = _checkpoint_path(d)
+    if d not in _WM:
+        weight_map(d)
+    s = _WM[d][n]
+    path = os.path.join(d, s)
+    stamp = _CHECKPOINTS[d]["files"][s]
+    if _file_stamp(path) != stamp:
+        raise RuntimeError("v4: immutable checkpoint weight changed; use a new directory")
     key = (d, s)
-    if key not in _HD:
-        _HD[key] = safe_open(os.path.join(d, s), "pt", device="cpu")
-    return _HD[key].get_tensor(n)
+    with _CHECKPOINT_LOCK:
+        if key not in _HD:
+            _HD[key] = safe_open(os.path.join(d, s), "pt", device="cpu")
+        value = _HD[key].get_tensor(n)
+    if _file_stamp(path) != stamp:
+        raise RuntimeError("v4: immutable checkpoint weight changed; use a new directory")
+    return value
+
+
+def verify_checkpoint_artifacts(d=None, *, expected_checkpoint_id=None, expected_manifest_sha256=None,
+                                lo=None, hi=None, head=None, tail=None, dspark=None, required=False):
+    """Verify native payloads once, preserving partial-versus-complete scope.
+
+    Ordinary no-manifest directories remain the explicit legacy numerical path.
+    A declared artifact cannot fall back to header-only/legacy validation. A
+    cached witness is reused only while all verified local files stay immutable.
+    """
+    d, pinned = _pin_checkpoint(d)
+    if not pinned["metadata"]:
+        if required or expected_checkpoint_id is not None or expected_manifest_sha256 is not None:
+            raise RuntimeError("v4: verified weight artifacts required; publish a native catalogue/pack first")
+        return None
+    try:
+        from shard import weight_artifacts as artifacts
+    except ImportError:
+        import weight_artifacts as artifacts
+    with _CHECKPOINT_LOCK:
+        cached = _ARTIFACTS.get(d)
+        if cached is None:
+            kwargs = dict(expected_checkpoint_id=expected_checkpoint_id,
+                          expected_manifest_sha256=expected_manifest_sha256, verify_files=True)
+            if artifacts.STAGE_FILE in pinned["metadata"]:
+                proof = artifacts.verify_stage_artifacts(d, lo=lo, hi=hi, head=head, tail=tail, dspark=dspark, **kwargs)
+            else:
+                proof = artifacts.verify_weight_pack(d, **kwargs)
+            artifacts.verified_stage_artifact_descriptor(proof)
+            stamps = {row["path"]: _file_stamp(artifacts.safe_path(d, row["path"]))
+                      for row in proof["pack"]["files"]}
+            cached = {"proof": proof, "stamps": stamps}
+            _ARTIFACTS[d] = cached
+        proof = cached["proof"]
+        artifacts.verified_stage_artifact_descriptor(proof)
+        for name, stamp in cached["stamps"].items():
+            if _file_stamp(artifacts.safe_path(d, name)) != stamp:
+                raise RuntimeError("v4: immutable verified artifact changed; use a new directory")
+        if expected_checkpoint_id is not None and proof["checkpoint_id"] != expected_checkpoint_id:
+            raise artifacts.ArtifactError("checkpoint differs from pinned model")
+        if expected_manifest_sha256 is not None and proof["manifest_sha256"] != expected_manifest_sha256:
+            raise artifacts.ArtifactError("catalogue differs from pinned model")
+        if "stage" in proof:
+            for name, supplied in (("lo", lo), ("hi", hi), ("head", head), ("tail", tail), ("dspark", dspark)):
+                if supplied is not None and (type(supplied) is not type(proof[name]) or supplied != proof[name]):
+                    raise artifacts.ArtifactError("stage artifact assignment differs: " + name)
+        return proof
 
 
 def _set_globals(M, args):
@@ -812,6 +933,14 @@ class Stage:
                   f"w1+w3 serve as ONE fp8 launch", flush=True)
         if self._fast:
             self._reserve_chunk_scratch()
+        from v4_runtime_init import bind_attention_aliases, ensure_hadamard, probe_hadamard
+        ensure_hadamard()
+        for layer in self.layers:
+            bind_attention_aliases(layer.attn, rebind=True)
+            indexer = getattr(layer.attn, "indexer", None)
+            if indexer is not None:
+                probe_hadamard(self.device, self.dtype, (1, 1, indexer.n_local_heads, indexer.head_dim))
+                probe_hadamard(self.device, self.dtype, (1, 1, indexer.head_dim))
         for m in self._owned_modules():
             m.eval()
         # Ascending layer order, NOT the tuple's -- the reference appends a tap inside its own
@@ -925,6 +1054,8 @@ class Stage:
                 a = L.attn
                 b, n, d = a.kv_cache.shape
                 a.kv_cache = a.kv_cache.new_zeros(b, n + self._chunk_cap, d)
+                from v4_runtime_init import bind_attention_aliases
+                bind_attention_aliases(a, rebind=True)
 
     # ---- state ----
 
@@ -1558,7 +1689,7 @@ class Stage:
 
     # ---- weights ----
 
-    def load(self, d=None):
+    def load(self, d=None, *, expected_checkpoint_id=None, expected_manifest_sha256=None):
         """Load this stage's layer range (and its boundary tensors) out of a CONVERTED checkpoint.
 
         The format is convert.py's output, which is what `generate.py:91` feeds straight into
@@ -1574,7 +1705,10 @@ class Stage:
         convert.py's `--expert-dtype` was chosen for, so a GPU box constructs with the real config
         (dtype fp8, expert_dtype fp4) and loads the converted tensors as-is. A CPU parity box builds
         args.dtype='bf16' and needs a bf16 checkpoint to match; that is what the tests write."""
-        d = d or V4_DIR
+        d = _checkpoint_path(d)
+        proof = verify_checkpoint_artifacts(d, expected_checkpoint_id=expected_checkpoint_id,
+            expected_manifest_sha256=expected_manifest_sha256, lo=self.lo, hi=self.hi,
+            head=self.head, tail=self.tail, dspark=self._dspark_capable)
         wm = weight_map(d)
         for li in range(self.lo, self.hi):
             prefix = f"layers.{li}."
@@ -1599,6 +1733,7 @@ class Stage:
                 with torch.no_grad():
                     p.data.copy_(t)
         self._resource_checkpoint_dir = os.path.abspath(d)
+        self._artifact_verification = proof
         if self._expert_cache is not None:
             if self._dspark and self.tail:
                 if self._hybrid_ring_drafter is None:
@@ -1608,6 +1743,13 @@ class Stage:
                     self._hybrid_ring_drafter.tail.load(d)
                 self.observe_runtime_drafter(self._hybrid_ring_drafter)
             self.ensure_expert_cache()
+        # Detect a concurrent local change while payloads were copied into the
+        # stage; do not mark that model as successfully loaded/verified.
+        weight_map(d)
+        if proof is not None:
+            verify_checkpoint_artifacts(d, expected_checkpoint_id=expected_checkpoint_id,
+                expected_manifest_sha256=expected_manifest_sha256, lo=self.lo, hi=self.hi,
+                head=self.head, tail=self.tail, dspark=self._dspark_capable)
         return self
 
     def __repr__(self):

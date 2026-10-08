@@ -285,8 +285,11 @@ def test_live_adapter_calls_existing_coordinators_and_separate_sweep(monkeypatch
 
 
 def test_compare_rejects_changed_context_or_missing_raw_receipts():
-    before, after = report(), report(rate=60.0)
-    # Keys/hardware differ, but both sets are pinned and independently verified by the evaluator.
+    p, keys = observed_protocol()
+    def measured(rate):
+        clock=Clock(); adapter=ObservedAdapter(p,keys,clock,rate=rate); adapter.backend="live_ring"
+        return bench.run_suite(adapter,p,fresh_ring=True,clock=clock)
+    before, after = measured(50), measured(60)
     result = bench.compare_reports(before, after)
     assert result["status"] == "verified_target_pass"
     assert result["workload_speed_ratios"]["code"] == pytest.approx(1.2)
@@ -316,6 +319,94 @@ def test_checkpoint_hash_detects_content_change_and_unsafe_paths(tmp_path):
         bench.checkpoint_inventory(tmp_path)
 
 
+def logical_checkpoint(tmp_path):
+    """Small identity-only files, never a loadable 43-layer model or GPU proof."""
+    import shutil
+    torch = pytest.importorskip("torch")
+    tensors = pytest.importorskip("safetensors.torch")
+    from shard import weight_artifacts as art
+    full = tmp_path / "full"; full.mkdir()
+    config = {"n_layers": 43, "dim": 4096, "n_routed_experts": 256, "n_activated_experts": 6,
+              "hc_mult": 4, "n_mtp_layers": 3, "dspark_target_layer_ids": [40, 41, 42],
+              "dtype": "fp8", "expert_dtype": "fp4", "scale_fmt": "ue8m0"}
+    (full / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (full / "tokenizer.json").write_text("{}", encoding="utf-8")
+    tensors.save_file({"embed.weight": torch.ones(2, 2), "layers.0.test_weight": torch.arange(4).reshape(2, 2).float()},
+                      str(full / "model0-mp1.safetensors"))
+    catalog, pack = art.catalogue_directory(full, bench.MODEL_ID, source={"fixture": "identity-only"})
+    art.write_metadata(full, catalog, pack)
+    assets = tmp_path / "assets"; assets.mkdir()
+    shutil.copyfile(full / art.GLOBAL_FILE, assets / art.GLOBAL_FILE)
+    for name in catalog["assets"]:
+        shutil.copyfile(full / name, assets / name)
+    partial = tmp_path / "partial"
+    stage = art.select_stage_artifacts(catalog, pack, 0, 1, head=True)
+    def read(row, offset, size):
+        with (full / row["path"]).open("rb") as stream:
+            stream.seek(offset); return stream.read(size)
+    art.repack_stage(catalog, pack, stage, partial, read, max_file_bytes=512, chunk_bytes=17)
+    return full, assets, partial
+
+
+def test_logical_identity_is_packing_independent_and_local_hash_scope_stays_truthful(tmp_path):
+    full, assets, partial = logical_checkpoint(tmp_path)
+    complete_inventory = bench.checkpoint_inventory(full)
+    coordinator_inventory = bench.checkpoint_inventory(assets)
+    partial_inventory = bench.checkpoint_inventory(partial)
+    assert bench._checkpoint_identity(complete_inventory) == bench._checkpoint_identity(coordinator_inventory)
+    assert bench._checkpoint_identity(partial_inventory) == bench._checkpoint_identity(coordinator_inventory)
+    assert complete_inventory["local_verification"]["verification_scope"] == "complete packed payload hashes"
+    coordinator = bench.verify_checkpoint(assets, complete_inventory)
+    local = bench.verify_checkpoint(partial, complete_inventory)
+    assert coordinator["global_catalog_verified"] and not coordinator["checkpoint_bytes_verified"]
+    assert not coordinator["assigned_checkpoint_bytes_verified"]
+    assert local["assigned_checkpoint_bytes_verified"] and not local["checkpoint_bytes_verified"]
+    assert bench.verify_checkpoint(full, coordinator_inventory)["checkpoint_bytes_verified"]
+
+
+def test_logical_benchmark_requires_authenticated_cohort_and_refuses_false_full_local_proof(tmp_path):
+    _, assets, _ = logical_checkpoint(tmp_path)
+    p, keys = protocol()
+    p["checkpoint"] = bench._checkpoint_identity(bench.checkpoint_inventory(assets))
+    for node in p["hardware"]:
+        node["checkpoint_sha256"] = p["checkpoint"]["sha256"]
+        node["config_sha256"] = p["checkpoint"]["config_sha256"]
+    p = bench.seal_protocol(p)
+    assert not bench.protocol_errors(p)
+    clock = Clock(); adapter = FakeAdapter(p, keys, clock)
+    adapter.backend = "live_ring"  # Synthetic evaluator branch only, not hardware evidence.
+    adapter.artifact_verification = {**bench.verify_checkpoint(assets, p["checkpoint"]),
+                                    "engine_source_verified": True, "authenticated_cohort_verified": False}
+    r = bench.run_suite(adapter, p, fresh_ring=True, clock=clock)
+    assert bench.evaluate_report(r)["status"] == "unverified"
+    r["artifact_verification"]["authenticated_cohort_verified"] = True
+    assert bench.evaluate_report(r)["status"] == "passed"
+    r["artifact_verification"]["checkpoint_bytes_verified"] = True
+    assert bench.evaluate_report(r)["status"] == "failed"
+    r["artifact_verification"]["checkpoint_bytes_verified"] = False
+    r["artifact_verification"]["checkpoint_id"] = "tensor-sha256:" + "0" * 64
+    assert bench.evaluate_report(r)["status"] == "unverified"
+
+
+def test_logical_catalogue_and_encoder_tampering_are_rejected(tmp_path):
+    _, assets, _ = logical_checkpoint(tmp_path)
+    from shard import weight_artifacts as art
+    inventory = bench.checkpoint_inventory(assets)
+    (assets / "tokenizer.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(bench.BenchmarkError, match="asset bytes differ"):
+        bench.verify_checkpoint(assets, inventory)
+    (assets / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (assets / "special_tokens_map.json").write_text("{}")
+    with pytest.raises(bench.BenchmarkError, match="unverified local tokenizer"):
+        bench.checkpoint_inventory(assets)
+    (assets / "special_tokens_map.json").unlink()
+    body = json.loads((assets / art.GLOBAL_FILE).read_text())
+    body["tensors"]["embed.weight"]["sha256"] = "0" * 64
+    (assets / art.GLOBAL_FILE).write_text(json.dumps(body))
+    with pytest.raises(art.ArtifactError, match="logical model identity"):
+        bench.checkpoint_inventory(assets)
+
+
 def test_import_and_help_never_import_torch_or_model_modules():
     root = Path(__file__).resolve().parents[1]
     code = "import sys; import phase0.v4_benchmark; assert 'torch' not in sys.modules; assert 'v4_pipe' not in sys.modules"
@@ -341,3 +432,286 @@ def test_standalone_verifier_from_outside_repo_without_pythonpath(tmp_path):
                            "verify", str(path)], cwd=tmp_path, env=env, text=True, capture_output=True)
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert json.loads(proc.stdout)["status"] == "passed"
+
+
+def observed_protocol():
+    p, keys = protocol()
+    p["source"]["files"] = [{"name": name, "sha256": "d" * 64} for name in (
+        "engines/deepseek_v4/v4_pipe.py", "engines/deepseek_v4/v4_stage.py",
+        "vendor/deepseek_v4_ref/inference/model.py", "shard/pipeline_session.py", "shard/transport.py")]
+    p["source"]["working_tree"] = {"known": True, "dirty": True, "status_sha256": "a" * 64}
+    p["evidence_contract"] = {"coordinator_diagnostics_required": True, "runtime_observation_required": True}
+    p["network_comparison"] = {"schema": bench.NETWORK_SCHEMA, "transport": "local_test_fixture",
+        "route_identity_sha256": "a" * 64, "latency_semantics": "no_latency_claim", "measurement_method": "scripted CPU fixture"}
+    return reseal_observed_protocol(p), keys
+
+
+def reseal_observed_protocol(p):
+    """Rebind synthetic declarations, never produce physical hardware evidence."""
+    p["source"]["sha256"] = bench.digest(p["source"]["files"])
+    for node in p["hardware"]:
+        node["engine_source_sha256"] = p["source"]["sha256"]
+        node["stage_env_sha256"] = bench.digest(p["env"])
+        node["runtime_config_sha256"] = bench.digest({"env": p["env"], "source": p["source"]["sha256"]})
+        node["hadamard_backend"] = "extension" if p["env"]["V4_HADAMARD"] == "extension" else "torch"
+        node["graph_mode"] = "whole"
+    return bench.seal_protocol(p)
+
+
+def signed_observation(p, node):
+    from shard.runtime_observation import SCHEMA, digest
+    files = {row["name"]: row["sha256"] for row in p["source"]["files"]}
+    env = dict(p["env"])
+    flags = {"V4_HADAMARD": {"requested": env["V4_HADAMARD"], "parsed": env["V4_HADAMARD"],
+        "observed": node["hadamard_backend"], "verdict": "OK", "reason": "CPU-signed fixture only"}}
+    return {"schema": SCHEMA, "node_id": node["node_id"], "gpu_uuid": node["gpu_uuid"],
+        "process_run_id": node["process_run_id"], "runtime_config_sha256": node["runtime_config_sha256"],
+        "source_files": files, "source_sha256": digest(files), "environment": env, "environment_sha256": digest(env),
+        "effective_flags": flags, "effective_flags_sha256": digest(flags), "kernel_backend": "tilelang",
+        "hadamard_backend": node["hadamard_backend"], "graph_mode": node["graph_mode"], "wire_mode": "bf16",
+        "backend_identity": {"hadamard": {"requested": env["V4_HADAMARD"], "backend": node["hadamard_backend"],
+            "reason": "CPU-signed fixture only", "source_sha256": "a"*64,
+            "module_files": [{"name": "hadamard_cuda.pyd", "sha256": "b"*64}] if node["hadamard_backend"] == "extension" else
+                [{"name": "v4_kernels_cpu.py", "sha256": next((row["sha256"] for row in p["source"]["files"] if row["name"].endswith("/v4_kernels_cpu.py")), "d"*64)}],
+            "dependency_version": "fixture-version" if node["hadamard_backend"] == "extension" else None}},
+        "transport": "engine-message-socket; external route declared by deployment",
+        "versions": {"python": "3.11", "torch": node["torch"], "cuda": node["cuda"], "tilelang": node["tilelang"]},
+        "phase": "job_complete"}
+
+
+class ObservedAdapter(FakeAdapter):
+    """Actual Ed25519 fixture signatures, wholly synthetic model and device data."""
+    backend = "live_ring"  # Exercises the acceptance branch only, never a GPU speed claim.
+
+    def __init__(self, *args, observation_mutator=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.observation_mutator = observation_mutator
+
+    def generate(self, *args, **kwargs):
+        result = super().generate(*args, **kwargs)
+        decode = len(result["tokens"]) - 1
+        speculative = kwargs["mode"] != "greedy"
+        result.update(coordinator_counters={"accepted_predictions": min(3, decode) if speculative else 0,
+            "proposed_predictions": decode+3 if speculative else 0, "cancel_events": int(speculative),
+            "speculation_cycles": 2 if speculative else decode, "frames_enqueued": decode+3 if speculative else decode,
+            "frames_sent": decode+2 if speculative else decode, "replies_received": decode+2 if speculative else decode,
+            "frames_judged": decode, "stale_replies": int(speculative), "drained_replies": int(speculative),
+            "unsent_frames": int(speculative)},
+            inflight_intervals=[{"duration_s": .01, "level": 1}, {"duration_s": .1, "level": 4}] if speculative else [],
+            prefill_committed_tokens=1, g=len(result["tokens"])/2)
+        return result
+
+    def sweep(self, nonce):
+        assert nonce == self.last[0]
+        self.clock.advance(self.sweep_s)
+        receipts = []
+        for i, (node, key) in enumerate(zip(self.protocol["hardware"], self.keys)):
+            signer = ReceiptSigner(key, self.swarm_id, self.last[1], node["layer_start"], node["layer_end"], nonce=nonce)
+            for chunk in range(2):
+                signer.observe(f"boundary-{i}-{chunk}".encode(), f"boundary-{i+1}-{chunk}".encode())
+            value = signed_observation(self.protocol, node)
+            if self.observation_mutator:
+                self.observation_mutator(value)
+            receipts.append(signer.finalize(runtime_observation=value))
+        return receipts, True
+
+
+def observed_report(p, keys, *, rate=50, observation_mutator=None):
+    clock = Clock()
+    return bench.run_suite(ObservedAdapter(p, keys, clock, rate=rate, observation_mutator=observation_mutator),
+                           p, fresh_ring=True, clock=clock)
+
+
+def test_complete_diagnostics_signed_observations_and_raw_latency_distributions():
+    p, keys = observed_protocol()
+    r = observed_report(p, keys)
+    evaluation = bench.evaluate_report(r)
+    assert evaluation["valid_evidence"], evaluation
+    assert evaluation["runtime_evidence"]["signed_observation_count"] == 80
+    assert evaluation["runtime_evidence"]["not_remote_execution_attestation"] is True
+    sample = r["samples"][0]
+    timing = sample["measurement"]
+    assert timing["drain_s"] == pytest.approx(.001)
+    assert timing["full_service_s"] == pytest.approx(timing["elapsed_s"]+60)
+    assert sample["coordinator_stats"]["g"] == 4
+    assert sample["coordinator_diagnostics"]["derived"]["g_cycle"] == 3.5
+    summary = evaluation["workloads"]["code"]
+    assert summary["timing_distributions"]["receipt_sweep_s"]["samples"] == [60, 60, 60]
+    assert summary["timing_distributions"]["drain_s"]["p95"] == pytest.approx(.001)
+    assert summary["coordinator_distributions"]["inflight_time_avg"]["p50"] == pytest.approx(.41/.11)
+    assert summary["coordinator_count_distributions"]["accepted_predictions"]["samples"] == [3, 3, 3]
+    assert summary["coordinator_count_distributions"]["cancel_events"]["p95"] == 1
+    assert len(summary["inter_token_latency_s"]["samples"]) == 3*7
+    assert summary["inter_token_latency_s"]["p95"] == pytest.approx(.02)
+
+
+def test_generation_must_not_sweep_twice():
+    p, keys = observed_protocol(); clock = Clock()
+    class AlreadySwept(ObservedAdapter):
+        def generate(self, *args, **kwargs):
+            result = super().generate(*args, **kwargs)
+            result["receipt_sweep_s"] = 3.0
+            return result
+    with pytest.raises(bench.BenchmarkError, match="disable internal receipt sweep"):
+        bench.run_suite(AlreadySwept(p, keys, clock), p, fresh_ring=True, clock=clock)
+
+
+@pytest.mark.parametrize("field", ["source", "env", "backend", "process", "audit"])
+def test_authenticated_but_wrong_runtime_declarations_fail_frozen_contract(field):
+    from shard.runtime_observation import digest
+    p, keys = observed_protocol()
+    def mutate(value):
+        if field == "source":
+            value["source_files"]["engines/deepseek_v4/v4_stage.py"] = "e" * 64
+            value["source_sha256"] = digest(value["source_files"])
+        elif field == "env":
+            value["environment"]["V4_SPEC_DEPTH"] = "999"
+            value["environment_sha256"] = digest(value["environment"])
+        elif field == "backend":
+            value["kernel_backend"] = "cpu"
+        elif field == "process":
+            value["process_run_id"] = "unfrozen-process"
+        else:
+            value["effective_flags"]["V4_HADAMARD"]["verdict"] = "MISMATCH"
+            value["effective_flags_sha256"] = digest(value["effective_flags"])
+    r = observed_report(p, keys, observation_mutator=mutate)
+    assert bench.evaluate_report(r)["status"] == "failed"
+
+
+def test_unsigned_source_env_backend_edits_are_rejected_as_signature_tampering():
+    p, keys = observed_protocol(); original = observed_report(p, keys)
+    for field, value in (("kernel_backend", "cpu"), ("environment_sha256", "e"*64), ("source_sha256", "e"*64)):
+        r = copy.deepcopy(original)
+        r["samples"][0]["receipts"][0]["runtime_observation"][field] = value
+        assert bench.evaluate_report(r)["status"] == "failed"
+
+
+def test_missing_counters_and_modified_raw_intervals_do_not_claim_verified_diagnostics():
+    p, keys = observed_protocol(); original = observed_report(p, keys)
+    r = copy.deepcopy(original)
+    r["samples"][0]["coordinator_stats"]["inflight_intervals"][0]["duration_s"] = 3
+    assert bench.evaluate_report(r)["status"] == "failed"
+    r = copy.deepcopy(original)
+    from shard.benchmark_metrics import make_coordinator_diagnostics
+    s = r["samples"][0]
+    s["coordinator_stats"]["coordinator_counters"].pop("cancel_events")
+    s["coordinator_diagnostics"] = make_coordinator_diagnostics("pipelined", committed_tokens=8,
+        counters=s["coordinator_stats"]["coordinator_counters"], timing=s["coordinator_diagnostics"]["timing"],
+        inflight_intervals=s["coordinator_stats"]["inflight_intervals"])
+    assert bench.evaluate_report(r)["status"] == "failed"
+
+
+@pytest.mark.parametrize("vary", ["source", "env:V4_HADAMARD"])
+def test_declared_single_variable_comparison_allows_only_derived_identity_changes(vary, tmp_path):
+    p, keys = observed_protocol(); p["env"]["V4_HADAMARD"] = "torch"; p = reseal_observed_protocol(p)
+    q = copy.deepcopy(p)
+    if vary == "source":
+        q["source"]["files"][0]["sha256"] = "e" * 64
+    else:
+        q["env"]["V4_HADAMARD"] = "extension"
+    for node in q["hardware"]:
+        node["process_run_id"] += "-new-process"
+    q = reseal_observed_protocol(q)
+    before, after = observed_report(p, keys), observed_report(q, keys, rate=60)
+    assert bench.compare_reports(before, after)["status"] == "unverified"
+    result = bench.compare_reports(before, after, vary=vary)
+    assert result["status"] == "verified_target_pass", result
+    assert result["declared_variable"] == vary and result["changes"] == [vary]
+    assert result["frozen_controls"]["after"]["hardware"][0]["process_run_id"].endswith("new-process")
+    if vary.startswith("env:"):
+        assert result["before"]["runtime_evidence"]["stage_identities"]["test-node-0"]["hadamard_backend"] == "torch"
+        assert result["after"]["runtime_evidence"]["stage_identities"]["test-node-0"]["hadamard_backend"] == "extension"
+    a, b = tmp_path / "before.json", tmp_path / "after.json"
+    a.write_text(json.dumps(before)); b.write_text(json.dumps(after))
+    assert bench.main(["compare", str(a), str(b), "--vary", vary]) == 0
+
+
+@pytest.mark.parametrize("change", ["driver", "two_flags", "source_and_flag", "network_semantics", "output", "backend"])
+def test_comparison_rejects_mixed_build_hardware_network_semantics_or_output(change):
+    p, keys = observed_protocol(); q = copy.deepcopy(p)
+    vary = "env:V4_HADAMARD"
+    q["env"]["V4_HADAMARD"] = "extension"
+    if change == "driver":
+        q["hardware"][0]["driver"] = "other-driver"
+    elif change == "two_flags":
+        q["env"]["V4_SPEC_DEPTH"] = "8"
+    elif change == "source_and_flag":
+        q["source"]["files"][0]["sha256"] = "e" * 64
+    elif change == "network_semantics":
+        q["env"]["V4_HADAMARD"] = p["env"]["V4_HADAMARD"]
+        q["network_comparison"]["latency_semantics"] = "one_way"
+        vary = "network"
+    elif change == "backend":
+        q["hardware"][0]["graph_mode"] = "off"
+    q = reseal_observed_protocol(q)
+    if change == "backend":
+        q["hardware"][0]["graph_mode"] = "off"; q = bench.seal_protocol(q)
+    before, after = observed_report(p, keys), observed_report(q, keys)
+    if change == "output":
+        # Coherent same-ring parity can still differ BETWEEN before/after arms.
+        for sample in after["samples"]:
+            sample["tokens"][0] += 1
+            sample["output_sha256"] = bench.digest(sample["tokens"])
+    assert bench.compare_reports(before, after, vary=vary)["status"] == "unverified"
+
+
+def test_operator_only_legacy_report_is_not_effective_backend_ab_evidence():
+    before = report(); after = copy.deepcopy(before)
+    for r in (before, after):
+        r["protocol"]["network_comparison"] = {"schema": bench.NETWORK_SCHEMA, "transport": "fixture",
+            "route_identity_sha256": "a"*64, "latency_semantics": "no_latency_claim", "measurement_method": "fixture"}
+        r["protocol"] = bench.seal_protocol(r["protocol"]); r["protocol_sha256"] = r["protocol"]["sha256"]
+    assert bench.evaluate_report(before)["status"] == "passed"
+    assert bench.compare_reports(before, after)["status"] == "unverified"
+
+
+def test_declared_network_route_change_preserves_latency_semantics():
+    p, keys = observed_protocol(); q = copy.deepcopy(p)
+    q["network_comparison"]["route_identity_sha256"] = "b" * 64
+    q = bench.seal_protocol(q)
+    result = bench.compare_reports(observed_report(p, keys), observed_report(q, keys), vary="network")
+    assert result["status"] == "verified_target_pass", result
+    assert result["changes"] == ["network"]
+
+
+def test_required_signed_observation_missing_cannot_pass_and_compare_invalid_protocol_is_safe():
+    p, keys = observed_protocol(); r = observed_report(p, keys)
+    # Replace one signed receipt with a valid legacy receipt for the SAME signer/job.
+    sample = r["samples"][0]; node = p["hardware"][0]
+    signer = ReceiptSigner(keys[0], sample["swarm_id"], sample["job_id"], node["layer_start"], node["layer_end"], nonce=sample["nonce"])
+    for chunk in range(2):
+        signer.observe(f"boundary-0-{chunk}".encode(), f"boundary-1-{chunk}".encode())
+    sample["receipts"][0] = signer.finalize()
+    assert bench.evaluate_report(r)["status"] == "unverified"
+    invalid = copy.deepcopy(r); invalid["protocol"]["network_comparison"] = {"schema": bench.NETWORK_SCHEMA}
+    invalid["protocol"] = bench.seal_protocol(invalid["protocol"]); invalid["protocol_sha256"] = invalid["protocol"]["sha256"]
+    assert bench.compare_reports(r, invalid)["status"] == "unverified"
+
+
+@pytest.mark.parametrize("vary", ["source", "env:V4_SPEC_DEPTH", "env:V4_HADAMARD"])
+def test_same_backend_binary_change_cannot_hide_inside_derived_config_digest(vary):
+    p, keys = observed_protocol(); q = copy.deepcopy(p)
+    if vary == "source":
+        q["source"]["files"][0]["sha256"] = "e"*64
+    elif vary == "env:V4_SPEC_DEPTH":
+        q["env"]["V4_SPEC_DEPTH"] = "8"
+    else:
+        # auto->torch keeps the actual backend; it must not authorize binary drift.
+        q["env"]["V4_HADAMARD"] = "torch"
+    q = reseal_observed_protocol(q)
+    def binary_change(value):
+        value["backend_identity"]["hadamard"]["module_files"][0]["sha256"] = "e"*64
+    result = bench.compare_reports(observed_report(p, keys), observed_report(q, keys, observation_mutator=binary_change), vary=vary)
+    assert result["status"] == "unverified", result
+    assert "observed backends/settings" in result["reason"]
+
+
+def test_source_experiment_allows_bound_repo_hadamard_function_change():
+    p, keys = observed_protocol()
+    p["source"]["files"].append({"name": "engines/deepseek_v4/v4_kernels_cpu.py", "sha256": "d"*64})
+    p = reseal_observed_protocol(p); q = copy.deepcopy(p)
+    q["source"]["files"][-1]["sha256"] = "e"*64; q = reseal_observed_protocol(q)
+    def function_change(value):
+        value["backend_identity"]["hadamard"]["source_sha256"] = "f"*64
+    result = bench.compare_reports(observed_report(p, keys), observed_report(q, keys, observation_mutator=function_change), vary="source")
+    assert result["status"] == "verified_target_pass", result

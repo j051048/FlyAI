@@ -51,6 +51,8 @@ class Ring:
     lease_expires_at: float = 0.0
     reason: str = "planned"
     on_stopped: object = None
+    replacement_ring_id: str | None = None
+    stopping: bool = False
     guard_stop: object = field(default_factory=threading.Event, repr=False)
     guard_thread: object = field(default=None, repr=False)
 
@@ -76,6 +78,14 @@ class RingPool:
         self._accepting = True
         self.max_rings = max_rings
         self.max_history = max_history
+        self._reconciliation = {}
+
+    def record_reconciliation(self, policy_id, status):
+        """Bounded public lifecycle state; contains no filesystem/provider secrets."""
+        with self._lock:
+            self._reconciliation[policy_id] = dict(status)
+            while len(self._reconciliation) > self.max_rings:
+                self._reconciliation.pop(next(iter(self._reconciliation)))
 
     def add(self, ring_id, backend, *, model_id, cohort_id, gpu_uuids, region=None, on_stopped=None):
         if not isinstance(ring_id, str) or not ring_id or len(ring_id) > 128:
@@ -324,6 +334,47 @@ class RingPool:
                 raise RingUnavailable("alias may switch only to an already READY cohort")
             self._aliases[alias] = (model_id, cohort_id)
 
+    def publish_replacement(self, ring_id, retired_ring_ids, *, aliases=()):
+        """Publish a warmed SAME-cohort ring at request boundaries.
+
+        All validation precedes mutation. Previously issued bindings keep their
+        backend/tokenizer/leases, including queued work and prefix replay.
+        """
+        retired = tuple(retired_ring_ids)
+        names = tuple(aliases)
+        if len(set(retired)) != len(retired) or ring_id in retired:
+            raise ValueError("distinct old/new replacement rings required")
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("nonempty model aliases required")
+        with self._lock:
+            if not self._accepting or ring_id not in self._rings:
+                raise RingUnavailable("replacement pool is closed or ring is unknown")
+            new = self._rings[ring_id]
+            if not self._eligible(new):
+                raise RingUnavailable("replacement must finish signed warmup before publication")
+            old = [self._rings[key] for key in retired]
+            if any((ring.model_id, ring.cohort_id) != (new.model_id, new.cohort_id) for ring in old):
+                raise RingUnavailable("automatic replacement must preserve exact model cohort")
+            if any(name in self._aliases and self._aliases[name] != (new.model_id, new.cohort_id) for name in names):
+                raise RingUnavailable("replacement cannot silently change an existing alias cohort")
+            for name in names:
+                self._aliases[name] = (new.model_id, new.cohort_id)
+            for ring in old:
+                ring.replacement_ring_id = new.ring_id
+                if ring.state != RingState.STOPPED:
+                    ring.state, ring.reason = RingState.DRAINING, "replaced_at_request_boundary"
+            # DRAINING is already visible to admission before cleanup callbacks.
+            for ring in old:
+                if ring.state != RingState.STOPPED and not ring.bound_jobs and not ring.local_work:
+                    try:
+                        self._stop(ring)
+                    except Exception:
+                        # Publication is already complete. Keep the warmed new
+                        # route and retain old capacity until cleanup is proven.
+                        ring.reason = "replacement_cleanup_unconfirmed"
+            return {"ring_id": new.ring_id, "retired_ring_ids": list(retired),
+                    "cohort_id": new.cohort_id, "published": True}
+
     def resolve(self, model, cohort=None):
         with self._lock:
             if model in self._aliases:
@@ -425,6 +476,28 @@ class RingPool:
                 ring.state, ring.reason, ring.signed_warmup = RingState.FAILED, str(reason), False
 
     def _stop(self, ring):
+        if ring.replacement_ring_id is not None:
+            if ring.stopping:
+                return
+            ring.stopping = True
+            ring.guard_stop.set()
+            # Remote stop/cleanup acknowledgements must not block admission to
+            # the newly warmed ring or hold the queue's request boundary lock.
+            def cleanup():
+                try:
+                    ring.backend.close()
+                except Exception:
+                    with self._lock:
+                        ring.reason, ring.stopping = "replacement_cleanup_unconfirmed", False
+                    return
+                with self._lock:
+                    ring.state, ring.reason, ring.signed_warmup = RingState.STOPPED, "drained", False
+                    ring.stopping = False
+                    self._prune_history()
+                if ring.on_stopped is not None:
+                    ring.on_stopped(ring.ring_id)
+            threading.Thread(target=cleanup, daemon=True, name="replacement-cleanup-" + ring.ring_id).start()
+            return
         ring.guard_stop.set()
         ring.backend.close()
         ring.state, ring.reason, ring.signed_warmup = RingState.STOPPED, "drained", False
@@ -459,11 +532,15 @@ class RingPool:
             for ring in self._rings.values():
                 self._eligible(ring)
             return {"mode": "parallel_serial_rings", "accepting": self._accepting,
+                    **({"reconciliation": {key: dict(value) for key, value in self._reconciliation.items()}}
+                       if self._reconciliation else {}),
                     "aliases": {name: {"model_id": value[0], "cohort_id": value[1]}
                                 for name, value in self._aliases.items()},
                     "rings": [{"ring_id": r.ring_id, "model_id": r.model_id, "cohort_id": r.cohort_id,
                                "region": r.region, "state": r.state.value, "bound_jobs": r.bound_jobs,
-                               "estimated_backlog_s": r.reserved_seconds, "reason": r.reason}
+                               "estimated_backlog_s": r.reserved_seconds, "reason": r.reason,
+                               **({"replacement_ring_id": r.replacement_ring_id}
+                                  if r.replacement_ring_id is not None else {})}
                               for r in self._rings.values()]}
 
     refresh = snapshot

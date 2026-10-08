@@ -191,7 +191,11 @@ class WorkLease:
         return asdict(self)
 
 
-class LeaseLedger:
+from .artifact_leases import (ArtifactPreparationLedgerMixin, PrepareResources, PrepareRequest,
+                              PrepareLease, ArtifactPrepareGuard)
+
+
+class LeaseLedger(ArtifactPreparationLedgerMixin):
     """One shared SQLite file per host/resource domain; multiple node IDs may use it.
 
     authorize(principal, action, binding) must return the canonical authenticated
@@ -233,6 +237,7 @@ class LeaseLedger:
                 CREATE INDEX IF NOT EXISTS lease_gpu ON leases(gpu,state);
                 CREATE INDEX IF NOT EXISTS lease_domain ON leases(domain_id,state);
             """)
+            self._initialize_artifact_tables(conn)
             conn.execute("INSERT OR IGNORE INTO meta VALUES('schema',?)", (SCHEMA,))
             if conn.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0] != SCHEMA:
                 raise LeaseError("unsupported lease ledger schema")
@@ -283,6 +288,7 @@ class LeaseLedger:
         conn.execute("UPDATE leases SET state=CASE WHEN active>0 THEN 'draining' ELSE 'expired' END,"
                      "drain_reason='expired' WHERE state IN ('prepared','committed') AND expires<=?", (now,))
         conn.execute("UPDATE leases SET state=drain_reason WHERE state='draining' AND active=0")
+        ArtifactPreparationLedgerMixin._cleanup_artifacts(conn, now)
 
     @staticmethod
     def _lease(row):
@@ -345,8 +351,9 @@ class LeaseLedger:
             rows = conn.execute("SELECT resources FROM leases WHERE domain_id=? AND state IN ('prepared','committed','draining')",
                                 (memory_domain_id,)).fetchall()
             reserved = [LeaseResources.from_dict(json.loads(row[0])) for row in rows]
-            for used, budget in ((sum(r.ram_bytes for r in reserved), available_ram_bytes),
-                                 (sum(r.pinned_bytes for r in reserved), pinnable_ram_bytes)):
+            prepare_ram, prepare_pin = self._prepare_host_usage(conn, memory_domain_id)
+            for used, budget in ((sum(r.ram_bytes for r in reserved) + prepare_ram, available_ram_bytes),
+                                 (sum(r.pinned_bytes for r in reserved) + prepare_pin, pinnable_ram_bytes)):
                 if used and (budget is None or used > budget):
                     raise LeaseConflict("capacity update undercuts existing shared reservations")
             conn.execute("INSERT INTO domains VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET ram=excluded.ram,pinned=excluded.pinned",
@@ -390,8 +397,9 @@ class LeaseLedger:
             reserved = conn.execute("SELECT resources FROM leases WHERE domain_id=? AND state IN ('prepared','committed','draining')",
                                     (request.memory_domain_id,)).fetchall()
             resources = [LeaseResources.from_dict(json.loads(row[0])) for row in reserved]
-            for label, demand, limit in (("RAM", request.resources.ram_bytes + sum(r.ram_bytes for r in resources), domain["ram"]),
-                                        ("pinned", request.resources.pinned_bytes + sum(r.pinned_bytes for r in resources), domain["pinned"])):
+            prepare_ram, prepare_pin = self._prepare_host_usage(conn, request.memory_domain_id)
+            for label, demand, limit in (("RAM", request.resources.ram_bytes + sum(r.ram_bytes for r in resources) + prepare_ram, domain["ram"]),
+                                        ("pinned", request.resources.pinned_bytes + sum(r.pinned_bytes for r in resources) + prepare_pin, domain["pinned"])):
                 if demand and (limit is None or demand > limit):
                     raise LeaseConflict(f"shared {label} capacity is unknown or insufficient")
             lease_id, fence = "lease-" + uuid.uuid4().hex, gpu["fence"] + 1

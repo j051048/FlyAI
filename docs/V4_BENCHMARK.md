@@ -68,8 +68,11 @@ ranges, E2E speed and TTFT are also reported separately:
 | Six RTX 5090 GPUs | ≥30 tok/s |
 
 This is not an additional requirement that the slowest workload's E2E median exceed the target.
-New experimental contexts or kernels can be frozen in another explicit protocol, but reports with
-changed model/prompt/context/run/kernel recipes are not given a verified before/after comparison.
+New experimental contexts or kernels can be frozen in another explicit protocol. Changed model,
+prompt IDs, context or generation/run recipes do not qualify for a controlled comparison.
+An explicitly declared single source, environment flag or network-route change can be compared
+with `compare --vary source`, `--vary env:V4_FLAG` or `--vary network`, subject to the runtime
+observations and controls below. Multiple undeclared changes remain unverified.
 
 ## Cold requests and parity controls
 
@@ -99,6 +102,30 @@ post-signing `stage` debug tag, then verifies all of:
 3. Per-job nonce, job ID and swarm ID, including uniqueness across the suite.
 4. Adjacent output/input roots along the complete ring.
 5. Complete same-ring greedy token parity and the frozen measurement protocol.
+
+Protocols newly prepared after the October P0–P2 changes also require raw coordinator diagnostics
+and signed `shard-runtime-observation/1` declarations for each stage/job. These bind the actual
+process run ID, GPU UUID, executed source inventory, public requested/parsed/effective settings,
+runtime configuration, kernel/Hadamard/graph/wire backend and versions. Freeze the stage's exported
+public environment with `prepare --env-file`; extra unfrozen flags are rejected. Hadamard identity
+includes its function/module file digests and dependency version, so a same-backend binary swap
+cannot hide behind a derived runtime-configuration hash. Declarations are not remote attestation.
+
+Raw coordinator diagnostics distinguish proposed and actually committed predictions, sent/unsent
+frames, judged/stale/drained replies and unrounded time-weighted horizon occupancy. This occupancy
+may include queued work; it is not physical network occupancy. Legacy `g` definitions remain
+explicitly separate from acceptance ratios. Reports retain TTFT, decode, generation return/drain,
+receipt sweep and full service time, with P50/P95 computed from the retained raw suite.
+
+Older protocols remain readable and explicitly identify missing runtime evidence. They cannot
+qualify as controlled backend A/B experiments without those signed observations. Controlled
+comparison also requires a `prepare --network` contract freezing public route identity, transport,
+measurement method and delay semantics; both builds must produce the same committed output IDs.
+Operator inventory claims do not replace runtime observations.
+
+Deployment and a separate 32KiB echo-route probe are documented in
+[V4_OPERATIONS](V4_OPERATIONS.md). Stage receive waits include upstream work and must not be
+reported as pure wire RTT.
 
 The default recipe enables `V4_RUNTIME_METRICS=1`. Each receipt must then contain valid signed GPU
 telemetry; absent telemetry is unverified, and CPU-reference telemetry cannot qualify the GPU gate.

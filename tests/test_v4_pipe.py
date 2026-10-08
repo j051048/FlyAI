@@ -446,6 +446,7 @@ def test_keepwarm_lock_discipline(monkeypatch):
     N = 120
     a, b = _pair(timeout=10)
     got, noops, err = [], [0], []
+    interleaved = threading.Event()
 
     def rx():
         try:
@@ -453,6 +454,8 @@ def test_keepwarm_lock_discipline(monkeypatch):
                 f = recv_msg(b)
                 if f == {"op": "noop"}:
                     noops[0] += 1
+                    if 0 < len(got) < N:
+                        interleaved.set()
                 else:
                     got.append(f)
         except Exception as e:                          # a decode error IS the corruption bug
@@ -467,6 +470,8 @@ def test_keepwarm_lock_discipline(monkeypatch):
         for i in range(N):                              # header + tensor blob: multi-segment on the wire
             frame, _ = VP._make_step_frame(_h(float(i)), _ids(), i, None)
             kw.send(frame)
+            if i == 20:
+                assert interleaved.wait(2), "keep-warm did not interleave with the active stream"
             if i % 20 == 0:
                 time.sleep(0.003)                       # yield so the noop thread interleaves for real
     finally:
@@ -837,6 +842,25 @@ def _perfect_block(q, n=3, truth=None):
     at q+2..q+n+1, which is where advance_and_draft's block sits."""
     t = truth or TRUTH
     return [t[q + 2 + i] for i in range(n)]
+
+
+@pytest.mark.parametrize("blocks", [_perfect_block, lambda q: [901, 902, 903]])
+@pytest.mark.parametrize("max_new", [1, 2, 12])
+def test_raw_pipeline_measurements_account_for_real_wire_frames(blocks, max_new):
+    from shard.benchmark_metrics import make_coordinator_diagnostics, validate_coordinator_diagnostics
+    result, ring = _pipelined(blocks, max_new=max_new)
+    raw = result["coordinator_counters"]
+    assert raw["frames_sent"] == len(ring.frames) - 1  # exclude the real prefill frame
+    assert raw["replies_received"] == raw["frames_sent"]
+    assert raw["accepted_predictions"] == sum(row[0] for table in
+        (result["accept_by_depth"], result["topup_accept_by_depth"]) for row in table.values())
+    diagnostics = make_coordinator_diagnostics("pipelined", committed_tokens=len(result["tokens"]),
+        counters=raw, inflight_intervals=result["inflight_intervals"])
+    validate_coordinator_diagnostics(diagnostics)
+    actual = diagnostics["derived"]["inflight_time_avg"]
+    if actual is not None:
+        assert actual == pytest.approx(result["inflight_time_avg"], abs=0.0051)
+    assert diagnostics["counts"]["committed_decode_tokens"] == max_new - 1
 
 
 def test_pipelined_streams_the_block_as_separate_s1_frames():

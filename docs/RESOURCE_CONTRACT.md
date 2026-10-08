@@ -104,11 +104,15 @@ DSpark stage inventory requires all three MTP blocks and all target layers
 40/41/42 on the same tail. It also requires the tail's embedding, norm, head and
 HC parameters. This is architecture validation, not a new placement algorithm.
 
-The inventory's `metadata-sha256:` identity pins headers, filenames, file sizes
-and config bytes. **It does not verify tensor payload integrity.** Continue using
-the existing signed manifest/fetch validation and full checkpoint hashes in the
-benchmark envelope. Changing payload bytes while keeping headers unchanged is
-outside this cheap identity's integrity scope.
+Legacy inventory's `metadata-sha256:` identity pins headers, filenames, file sizes
+and config bytes; it does not verify payload integrity. Native artifact directories
+instead retain the catalogue's global `tensor-sha256:` checkpoint identity across
+packing changes. The separate catalogue `manifest_sha256` also pins source provenance;
+it must be compared independently, not derived from the checkpoint suffix. The header
+inspection remains `payload_integrity_verified=False`. READY and production loading use
+actual file/tensor hashes, exact roles and a stat-sealed local verification witness.
+Catalogue model IDs are preserved exactly, including the distinction between Flash and
+Flash-0731; legacy directories retain their previous fixed model ID.
 
 Example (no GPU or model download):
 
@@ -215,3 +219,54 @@ free resident allocations. Signed requirements establish provenance of a report,
 not remote hardware attestation. See
 [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md) and
 [GPT_OSS_PRODUCTION.md](GPT_OSS_PRODUCTION.md).
+
+## File storage and bounded preparation
+
+`shard-storage-requirements/2` records actual source file paths, sizes and SHA256,
+global checkpoint/catalogue identity, exact layer roles, source artifact ID and an
+explicit target filesystem ID. Complete file sizes are required: a stage selecting
+28 GB of tensors inside a 167 GB source container cannot call that a 28 GB download.
+The legacy `/1` description is not payload verification or preparation authorization.
+`verify_selective_pull` now performs complete artifact verification and refuses a
+legacy header-only estimate.
+
+Storage requirements can include independently scoped `fetch` and `range_repack`
+preparation options. Fetch includes the complete selected source containers and
+metadata. Range repacking uses the pinned logical tensor catalogue and bounded I/O
+geometry to predict its target disk/RAM peak. Future output file SHA256 values are
+unknown until written; no placeholder digest is promoted to verified evidence.
+The actual prepared files and selected tensors must pass their hashes before READY.
+These are preparation bounds, not measured GPU execution or throughput results.
+
+Offers bind each storage contract to its exact runtime calibration and advertise
+filesystem capacity/time without private local paths. Registry candidates expand
+the fitting preparation modes, allowing a small disk to choose bounded repacking
+instead of being rejected solely for the large source container. The planner sums
+disk peaks by explicit shared filesystem identity and runtime plus temporary RAM/pin
+by memory domain. Neither identity is inferred from a public IP. Formation checks
+the selected signed storage/mode again; the node enforces the locally approved source,
+exact template and mode before preparation. A planned mode cannot silently switch
+to a more expensive transfer strategy.
+
+`PrepareResources(filesystem_id, disk_peak_bytes, ram_bytes, pinned_bytes)` and
+`PrepareRequest` use the same persistent `LeaseLedger` SQLite database as GPU leases.
+Temporary conversion RAM/pin is checked transactionally against old resident leases.
+The node registers the actual target path/filesystem and checks current disk free
+space before reserving a peak. Expired or released active workers keep their budgets
+until real cleanup is acknowledged. Retained `.partial` files still consume actual
+disk free; they are never treated as freed merely because a job failed.
+
+Full local `VerifiedStageArtifacts` evidence alone authorizes cache adoption or a
+materialization discount. Repacked files may have a different artifact/file layout
+while retaining the same logical model and exact roles. Existing bytes do not need
+a second disk allocation. Final files plus metadata remain durably charged once;
+temporary RAM/peak reservations are released after the worker ends. Restart does not
+prove an old worker stopped: local recovery needs its exclusive OS job lock and exact
+work identity; no remote `cleanup_confirmed` boolean is accepted. Conservative peak
+accounting may count active written bytes twice until a preparation finishes.
+
+Capacity alternatives are triggered only when restoring fresh, valid capacity-rejected
+templates makes the same role/route plan feasible. Invalid identity/calibration,
+unknown measurements or unreachable routes are not converted into capacity success.
+Alternatives still need their own complete calibration and new ring identity. None
+of this rewrites an active ring, migrates its KV state or passes the V4 GPU speed gate.

@@ -519,6 +519,19 @@ def _ref_slim_check(attr, marker_of):
     return check
 
 
+def _check_hadamard(ctx):
+    module = _mod("v4_runtime_init")
+    if module is None:
+        return "absent", "unloaded", None
+    if getattr(module, "_IDENTITY", None) is None:
+        return module.V4_HADAMARD, "uninitialized", None
+    state = module.hadamard_identity()
+    req, observed = state["requested"], state["backend"]
+    if observed == "uninitialized":
+        return req, observed, None
+    return req, observed, req == "auto" or req == observed
+
+
 def _check_lazy_draft(ctx):
     """COORDINATOR-side, and verified from the RUN rather than the flag.
 
@@ -599,6 +612,8 @@ class Lever:
 
 
 LEVERS = (
+    Lever("V4_HADAMARD", STAGE, "v4_runtime_init", _check_hadamard,
+          "selected extension or Torch Hadamard backend, probed before serving", kind="knob"),
     Lever("V4_EXPERT_PLACEMENT", STAGE, "v4_stage", _check_expert_placement,
           "local canonical RAM experts with fixed GPU cache slots, or full device residency"),
     Lever("V4_MOE_GROUPED", STAGE, "v4_moe_grouped",
@@ -786,6 +801,10 @@ def audit(side=STAGE, stage=None):
         except Exception as e:                      # noqa: BLE001 — an audit never breaks the serve
             out.append(Finding(lv.env, lv.side, "?", "?", "UNJUDGED", f"check raised {type(e).__name__}: {e}"))
             continue
+        if req == "absent" and _mod(lv.owner) is None and obs in ("unloaded", "no-drafter-yet", "not-tail", "off"):
+            out.append(Finding(lv.env, lv.side, req, obs, "UNJUDGED",
+                               f"{lv.owner} has not been imported on this execution path; no effective claim yet"))
+            continue
         # THE ENV/MODULE GATE, ahead of the observation. `requested` is the owning module's PARSED
         # value, which is what the run obeys -- but that means an env set AFTER the module was
         # imported reads as "off" on both sides and passes as OK. Every in-process ring, bench and
@@ -802,7 +821,7 @@ def audit(side=STAGE, stage=None):
         out.append(Finding(lv.env, lv.side, req, obs, verdict,
                            "requested and live state disagree" if verdict == "MISMATCH" else ""))
     for name in _stray_env():
-        out.append(Finding(name, "?", os.environ[name], "nothing", "UNKNOWN",
+        out.append(Finding(name, "?", "<unregistered>", "nothing", "UNKNOWN",
                            "set in this process but no v4 module reads this name"))
     return out
 
@@ -859,6 +878,7 @@ ENGINE_MODULES = (
     "v4_kernels_cpu.py", "v4_sparse_attn_sm120.py", "v4_resources.py",
     "v4_expert_cache.py", "v4_hybrid.py", "v4_chunked_prefill.py", "v4_wire_codec.py",
     "v4_kv_runtime.py", "v4_privacy.py", "v4_gateway.py",
+    "v4_runtime_init.py", "v4_observability.py", "v4_artifact_contract.py", "v4_tokenizer.py",
 )
 
 _ENV_RE = re.compile(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""")
