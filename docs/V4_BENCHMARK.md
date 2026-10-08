@@ -27,10 +27,14 @@ and records:
 - Context and fixed committed generation length (defaults: 512 prompt tokens and 512 new tokens),
   greedy temperature zero, seed zero, exactly one excluded first-case request, and three measured
   warm requests for every workload. EOS is ignored to keep the token length fixed.
-- Four or six distinct single-GPU RTX 5090 hosts, actual VRAM bytes, GPU UUIDs, driver/CUDA/PyTorch/
+- Four or six distinct RTX 5090 GPUs, actual VRAM bytes, GPU UUIDs, driver/CUDA/PyTorch/
   TileLang versions, process-run identity, signing keys and assigned layer ranges. Assignments must
   tile `[0,43)`; the tail must own layers 40, 41 and 42. Every host declares matching checkpoint,
   config, source and stage-environment digests.
+
+`prepare --isolation host` is the default scattered-host protocol: each GPU must have a distinct
+host identity. `prepare --isolation none` permits colocated distinct GPUs and freezes a different
+protocol. Production placement permits co-location; it does not silently change the WAN benchmark.
 
 A protocol is sealed with an aggregate SHA-256. A changed context, prompt, kernel setting or model
 produces a different protocol. Pass `verify --protocol` to bind a report to a separately retained
@@ -60,8 +64,8 @@ ranges, E2E speed and TTFT are also reported separately:
 
 | Assignment | Required complete-suite warm committed decode median |
 |---|---:|
-| Four RTX 5090 hosts | ≥40 tok/s |
-| Six RTX 5090 hosts | ≥30 tok/s |
+| Four RTX 5090 GPUs | ≥40 tok/s |
+| Six RTX 5090 GPUs | ≥30 tok/s |
 
 This is not an additional requirement that the slowest workload's E2E median exceed the target.
 New experimental contexts or kernels can be frozen in another explicit protocol, but reports with
@@ -157,16 +161,27 @@ The tool does not publish or transmit this inventory to a third party.
 
 ```powershell
 python phase0/v4_benchmark.py prepare --dir D:/models/v4 --hardware hardware.json --out protocol.json
-python phase0/v4_benchmark.py run --protocol protocol.json --dir D:/models/v4 --head 127.0.0.1:29610 --tail 127.0.0.1:29612 --fresh-ring --out report.json
+python phase0/v4_benchmark.py run --protocol protocol.json --dir D:/models/v4 --head 127.0.0.1:29610 --tail 127.0.0.1:29612 --deployment-plan pipeline-plan.json --coordinator-key controller-receipt.key --fresh-ring --out report.json
 python phase0/v4_benchmark.py verify report.json --protocol protocol.json
 python phase0/v4_benchmark.py compare before.json after.json
 ```
 
 `prepare` loads the local tokenizer with `local_files_only=True` and `trust_remote_code=False`, uses
-the vendored V4 chat renderer and freezes the resulting IDs. It never calls the currently incomplete
-message-encoding branch of the coordinator CLI. `run` directly calls `coordinate`,
+the vendored V4 chat renderer and freezes the resulting IDs. The coordinator's message-encoding
+branch is implemented; the benchmark still uses frozen token IDs to avoid re-tokenization.
+`run` directly calls `coordinate`,
 `coordinate_dspark` or `coordinate_dspark_pipelined`, with receipts disabled inside generation, then
 uses the existing receipt sweep after timing ends. Disconnecting it leaves the stages running.
+
+On a current strict ring, `--deployment-plan` must identify exactly the same node/GPU/signers,
+layer ranges, config and real head/tail endpoints as the protocol. `--coordinator-key` uses the
+existing Python receipt-key format and must match `plan.coordinator.signer_pubkey`; its private
+bytes never enter the report. `SHARD_COORDINATOR_KEY` can supply the local key-file path.
+The versioned HELLO authenticates both roles, then binds forward and return to one signed head
+owner grant. An occupied head replies BUSY rather than putting another coordinator behind a job.
+Stop or disconnect an idle serving coordinator before giving this benchmark ownership of the ring.
+Omitting the plan selects the adapter's old low-level connection behavior and cannot connect to
+strict stage listeners; it is retained for explicitly legacy experiments, not the deployment recipe.
 
 Use `--env-file overrides.json` with **both** `inventory` and `prepare` for an explicitly different
 kernel experiment; overrides are a JSON object of string-valued `V4_*` settings. An unrecorded

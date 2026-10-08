@@ -1,9 +1,17 @@
 # MlxRuntime — the Apple-silicon backend (MAC GATE GREEN 2026-07-12)
 
+Code audit: **2026-10-08, `c2ab623`**. The result below is a historical M2.5
+slice/MLX gate, not fresh GPU acceptance or automatic mixed CUDA/MLX serving.
+Current open formations require exact cohorts and stage resource templates;
+`MlxRuntime` does not automatically provide those shared-service adapters or
+measured `placement_requirements()`. See [MODEL_RUNTIME.md](MODEL_RUNTIME.md)
+and [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md).
+
+
 `shard/mlx_runtime.py` implements `ModelRuntime` (shard/node.py — the firewall of
 docs/MODEL_RUNTIME.md) on MLX: one Mac serves a contiguous layer range of an MLX-converted
 checkpoint out of unified memory, speaking the exact per-node contract the proven CUDA stage
-(phase0/m25_stage.py) runs on.
+(engines/minimax_m25/m25_stage.py) runs on.
 
 **GATE STATUS: 11/11 real-silicon checks PASSED on a rented Scaleway M2 Pro (16 GB, macOS
 Tahoe, mlx 0.32.0 / mlx-lm 0.31.3, python 3.13) against the REAL
@@ -89,15 +97,18 @@ model), 5 (wired-limit sizing table at larger RAM), 6's prefill measurement.
 Community MLX 4-bit = group-64 **affine** quant of experts **and attention**; the NVIDIA
 path = NVFP4 experts + bf16 attention. Same accepted-kernel-numerics class as fp8 wire:
 high per-step greedy agreement, **no token-exact cross-backend parity**, drift grows with
-length. Therefore: (1) quote g per backend, never across; (2) receipts pin
-**(backend, quant scheme, checkpoint hash)** per stage — a Mac stage makes the served model
-a placement-defined mixed-quant composite and the receipt must say so; (3) before real
+length. Therefore: (1) quote g per backend/configuration, not across; (2) a mixed
+artifact/numerical policy must be explicitly bound by deployment/cohort contracts.
+Ordinary activation receipts do not themselves encode or prove backend, quantization
+or checkpoint identity. A Mac stage cannot silently join an identical-native-NVFP4
+cohort; (3) before real
 deployment, run our **own conversion keeping attention bf16** (`mlx_lm.convert` mixed-quant
 predicate, ~+4 GB total) so the Mac matches the NVIDIA precision policy.
 
 ## Target demo box
 
-Scaleway Apple-silicon M4-XL (64 GB): usable ~44 GB at the default wired limit, ~56 GB
+Historical demo projection, not a current measured recipe:
+Scaleway Apple-silicon M4-XL (64 GB): usable ~44 GB at the assumed wired limit, ~56 GB
 raised → **~20–26 layers** of M2.5-4bit (≈ 2× a 5090 stage). A 62-layer ring closes with
 two such Macs + one 48 GB CUDA anchor, or one Mac replacing two 5090 stages on an existing
 ring — the heterogeneity proof the engine-genericity decision calls for.

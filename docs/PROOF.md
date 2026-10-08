@@ -2,8 +2,10 @@
 
 "You served a 120B model across consumer GPUs on different networks" is an extraordinary
 claim, so it should be checkable by a skeptic — not taken on trust. This doc defines what a
-*verifiable* Shard run looks like and how anyone can confirm one independently. Every run can
-emit a **run receipt** (`phase0/proof_receipt.py`); receipts live in `docs/receipts/`.
+*verifiable* Shard run looks like and how anyone can confirm one independently. The historical
+**run record** helper is `phase0/proof_receipt.py`; archives live in `docs/receipts/`.
+Aligned with `c2ab623` on 2026-10-08. Keep unsigned historical run summaries, current signed
+stage receipts, benchmark measurements and local dispute helpers as distinct evidence.
 
 ## What would a fake look like?
 
@@ -25,9 +27,11 @@ inventory and measurement provide provenance for a WAN claim. Co-located distinc
 valid production assignment; their shared host budgets must be accounted once.
 
 **2. The links are real WAN, not localhost.**
-The receipt records the **measured RTT of every pipeline edge** (`phase0/mesh.py`, app-level
-round-trip over the live transport). Real inter-city internet is tens-to-hundreds of ms;
-localhost is <1 ms. *Verify:* the edge RTTs are WAN-scale and match the geographic distances.
+Retain measured routes and app-level RTTs (`phase0/mesh.py` for historical experiments).
+Current route measurements also bind logical endpoints, actual channel/dial address, time,
+TTL and latency semantics. A large RTT or geographic label alone does not prove a WAN hop;
+independent topology and packet-path measurement are needed. `recv_wait` includes engine
+queue/discard waits, and authenticated control RTT includes processing; neither is pure network RTT.
 
 **3. Output parity within an explicit numerical contract.**
 The current V4 benchmark compares committed token IDs against a greedy control on the same
@@ -36,9 +40,16 @@ floats or a different single-machine backend are bit-identical. Reference/eager,
 graph, state and rollback parity require separate tests with pinned hardware and numerics.
 
 **4. Anyone can re-run the whole thing.**
-The engine is open source (Apache-2.0). The receipt embeds the exact commit, model, layer→node
-assignment, and launch commands. *Verify:* stand up your own nodes and reproduce — same code,
-same result.
+The engine is open source (Apache-2.0). Retain exact commit/source hashes, complete checkpoint
+identity, runtime and numerical configuration, layer→node assignment, workload and launch
+commands. Independent reproduction must match those contracts and hardware/backend scope;
+an arbitrary different backend or frame shape need not produce bit-identical results.
+
+GPT-OSS's `.shard-download.json` binds immutable repo/revision and complete file sizes/digests.
+First production load hashes actual files and checks the supported full `ModelCohort`. A local
+inventory, a cohort hash and `packed_layout_verified=True` are not publisher signatures,
+hardware attestations or native GPU execution proofs. The guard explicitly reports
+`native_execution_verified=False`; details are in [GPT_OSS_PRODUCTION.md](GPT_OSS_PRODUCTION.md).
 
 **5. Signed execution records and local dispute primitives.**
 The live service signs activation roots and validates the assigned signers, complete layer
@@ -54,8 +65,8 @@ in these helpers, and they are not a per-step production proof collector.
 
 A real validator must independently load the pinned weights/backend and recover the exact
 KV, Compressor and position state before replay. An arbitrary caller-supplied replay function
-or self-declared architecture is not sufficient evidence. Billing and dispute settlement
-remain the external control plane's responsibility.
+or self-declared architecture is not sufficient evidence. Billing and actual dispute settlement
+remain the external integration's responsibility.
 
 **6. Configurable Placement Isolation (可选的部署隔离).**
 - **Co-location Allowed in Production:** Ring planning (`shard/topology.py`) defaults to
@@ -68,14 +79,20 @@ remain the external control plane's responsibility.
 - **WAN Evidence:** A co-located deployment is a valid inference run, but does not establish a
   distinct-host WAN result. Such benchmark claims retain their independent inventory and
   evidence requirements.
-- **Staked Boundary Pinning:** Sensitive input/output layers (embedding and lm_head) are pinned to
-  high-reputation staked nodes (`staked: true`), providing a placement preference, not cryptographic concealment. Legacy V4 frames carry token
+- **Optional Boundary Policy:** A configured request/placement policy may require sensitive
+  boundary roles on trusted/staked nodes. A `staked: true` declaration does not establish reputation
+  or cryptographic concealment, and public offer registration is not restricted to those nodes. Legacy V4 frames carry token
   IDs to every stage. Opt-in sealed-ID mode hides IDs from keyless score-routed middle stages,
   including pipelined token hints, while activations remain visible. Head, every hash-layer
   recipient and the tail remain trusted. Co-located processes controlled by one operator share
   that operator's trust domain. See [V4_TRUST_BOUNDARIES.md](V4_TRUST_BOUNDARIES.md).
 
-## Receipt schema (`docs/receipts/<run_id>.json`)
+## Historical run-record example (`docs/receipts/<run_id>.json`)
+
+This is an illustrative historical run summary, not the current signed stage receipt schema.
+`phase0/proof_receipt.py` writes an unsigned envelope and reports self-consistency only.
+Current service receipts must be retained in full, including their signatures and assigned keys;
+the GPT-OSS benchmark stores them inside the measured result rather than converting them to this shape.
 
 ```json
 {
@@ -102,36 +119,43 @@ skeptic checks the engine file against). `reference.token_ids` lets anyone re-ru
 
 ## How to verify a receipt (skeptic's checklist)
 
-1. **Distinct machines:** all `public_ip` differ and resolve to different networks/regions; all
-   `gpu_uuid` differ.
-2. **Real WAN:** every `edges[].rtt_ms` is WAN-scale (≫ 1 ms) and consistent with the geos.
-3. **Correct output:** re-run the same `model` + `prompt` with greedy decoding anywhere; confirm
-   the token ids hash to `output_sha256`.
-4. **Reproduce:** check out `shard_commit`, bring up nodes, run the embedded commands.
+1. **Check record scope:** distinguish unsigned/self-reported fields from assigned stage signatures;
+   run `python phase0/proof_receipt.py verify RECORD --ref-tokens CONTROL_IDS` only for its documented
+   historical self-consistency/reference check. Passing it is not verification of physical distribution.
+2. **Authenticate the assignment:** independently pin expected stage/coordinator keys, full layer
+   coverage, job identity and nonce, then verify actual stage signatures and adjacent roots.
+3. **Verify model and numerical identity:** hash complete model files and actual source/config;
+   reproduce the same pinned hardware/backend/shape contract with independently retained control IDs.
+4. **Validate topology independently:** inspect actual GPU/host inventory and measured routes for a WAN
+   claim. UUID/IP/region strings alone are declarations. Co-location is valid but is not distinct-host evidence.
+5. **Reproduce performance:** preserve workload, warm/cold scope, actual committed-token counters and
+   full timing, including retries and proof checks. Review p50/p95 and repeatability, not a best case alone.
 
 ## Receipts on file
 
 - **GLM-5.2 744B NVFP4 at ~30 tok/s over WAN** — 7 GPUs in 6 US states, pipelined spec-decode
   + CUDA-graphed draft: [`receipts/glm52-nvfp4-wan-20260618.json`](receipts/glm52-nvfp4-wan-20260618.json).
 - **gpt-oss-120B at ~40 tok/s over WAN** — 3 stages (12 layers each) + an in-region coordinator
-  across 4 US states, pipelined spec-decode; the permissionless build target:
+  across 4 US states, pipelined spec-decode, historical 2026-06-19 record:
   [`receipts/gpt-oss-120b-wan-20260619.json`](receipts/gpt-oss-120b-wan-20260619.json).
 
 ## Scope / honesty
 
-- Decoding is **greedy and deterministic**: same prompt → same tokens, every run. The receipt's
-  `tokens_match` is the **lossless-optimization check** — the CUDA-graphed speculative path is
-  byte-identical to the plain eager path of the *same engine* (computed from two real run dumps),
-  so the speedup changes nothing about the output.
-- The engine also supports **lossless temperature/top-p/top-k sampling** (`shard/specsample.py`) — not
+- A greedy record must state its exact numerical contract. A claimed `tokens_match` flag is
+  not independent evidence; retain both output dumps and the control configuration. Same-ring
+  committed token parity does not imply equality of all intermediate floating-point tensors.
+- The separate sampling experiment supports **temperature/top-p/top-k sampling** (`phase0/specsample.py`) — not
   bit-deterministic but **seeded-reproducible**, and proven lossless *distributionally* (the committed
   token distribution equals the target's): [`receipts/sampling-lossless-20260623.json`](receipts/sampling-lossless-20260623.json).
-  The greedy receipts above use the deterministic path; `temp=0` is bit-identical to it.
+  Its numerical/distributional control is scoped to that experiment. Current GPT-OSS production
+  and the M2.5 HTTP gateway have greedy contracts; this record does not enable sampling there.
 - For a **quantized** model, bit-exact reproduction across *different* engines/backends is not
   achievable in general (and not unique to Shard): batched vs single-token kernels round
   floating-point differently, so at a genuine near-tie two correct greedy decoders can pick
   different — both valid — continuations. So the proof is *within-engine* reproducibility +
   coherent correct output, not "matches your laptop's HF decode token-for-token."
-- A receipt proves *a specific run* was real, distributed, and correct. It is not a claim of
-  uptime, throughput SLAs, or that every run hits the same number — tok/s is prompt- and
-  topology-dependent and reported as a range.
+- A receipt authenticates specific declarations; independent inventory, controlled replay and
+  observation establish stronger execution claims. It does not alone prove distribution, correctness,
+  uptime or throughput SLAs. Planner predictions, CPU tests and historical speed records do not
+  certify the current strict protocol or new GPU/cache paths. The selected 2026-10-08 local
+  non-GPU set (985 passed, 3 skipped) is not a whole-repository/GPU acceptance result.

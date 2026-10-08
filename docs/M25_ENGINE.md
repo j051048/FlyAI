@@ -1,13 +1,39 @@
-# M2.5 Engine — LIVING STATE  ⟵ READ THIS FIRST every session, UPDATE IT LAST
+# M2.5 engine — historical experiments and current pointers
 
-> **The single source of truth for the sharded MiniMax-M2.5 inference engine.** Kept CURRENT (overwritten,
-> not appended). History → `STATE.md`; measurements → `docs/receipts/`; per-task plans → `.claude/plans/`.
->
-> **DISCIPLINE (the cross-session system):**
-> 1. **Session START:** read THIS file (and the one linked plan) before touching code. Do NOT re-derive state
->    from code/research — if you feel the urge to, this doc failed; fix it instead.
-> 2. **Session END:** update `RESUME HERE` + `PROVEN` + `ROADMAP` + any new `DECISION`/`OPS` lesson. Commit it.
-> 3. A pointer to this file lives in auto-memory (`m25-engine-living-state`) so even a cold session finds it.
+## Current scope (2026-10-08, `c2ab623`)
+
+This file retains the June-August M2.5 experiment log, including negative runs,
+subsequent corrections, receipt labels and former operational plans. Its dated
+"LATEST", "NEXT", prices, live-instance status, release pins and spend/commit
+instructions are historical statements, not current state or authorization.
+Do not infer today's hardware inventory or benchmark qualification from them.
+
+Current architecture is [ARCHITECTURE.md](ARCHITECTURE.md); model-specific
+execution is [MODEL_RUNTIME.md](MODEL_RUNTIME.md); open registration, exact cohorts,
+resource leases, regional fallback and shared service are in
+[OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md). GPT-OSS's actual current
+entry is [GPT_OSS_PRODUCTION.md](GPT_OSS_PRODUCTION.md); V4 controls/evidence are
+[V4_HYBRID_RUNTIME.md](V4_HYBRID_RUNTIME.md) and [V4_BENCHMARK.md](V4_BENCHMARK.md).
+Current M2.5 stage, pipe, gateway, tools and pull/launch scripts live under
+`engines/minimax_m25/`; dated bare script names below retain their historical
+context. This archive does not supersede the current documentation index.
+
+Production permits colocated distinct GPUs. Historical scattered-only runs remain
+scattered-only evidence, not a ban on local deployment. The old homogeneous
+`N=ceil(layers/capacity)` derivation does not mean one weak GPU forces all stages
+to that size. Current selection jointly evaluates real capacities/roles, directed
+effective routes, external coordinator legs and exact span/index/width templates.
+Legacy RTT-as-hop is distinct from measured one-way delay. Finite-window pipeline
+predictions are not summed serial costs replaced by max, and remain predictions.
+
+Signed receipts/reporting establish identity and commitments, not remote hardware
+attestation, truthful performance or proof of computation. The following M2.5
+numbers depend on their checkpoint, kernel/wire, K/B, prompt mix, topology and timer.
+They do not establish the V4 4x5090 >=40 or 6x5090 >=30 committed decode tok/s gates.
+Current optional V4 RAM/cache/KV/query mechanisms and separately requested GPT-OSS
+service work are not retroactively verified by these historical receipts.
+
+## Archived M2.5 launch and session log
 
 ---
 
@@ -2020,7 +2046,7 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
   number is ON the scattered ring — NOT via co-location ([[never-colocate-usable-speed-on-scattered]]).
 - **TWO-TIER framing (decided):** **scattered ring = cheap/permissionless/THROUGHPUT** (latency-tolerant); a
   **co-located/regional node or mini-cluster = fast/INTERACTIVE** (M2.5-NVFP4 ~115 GB fits on 1× H200 / 2× H200 /
-  4× RTX6000-Blackwell → no WAN → 30–50 tok/s, physics-guaranteed). WAN-sharded single-stream is the *hardest*
+  4× RTX6000-Blackwell → no WAN → historical 30–50 tok/s projection, not a guaranteed measurement). WAN-sharded single-stream is the *hardest*
   way to serve M2.5; use the right tier per workload. The engine serves the whole spectrum.
 
 ## PROVEN  (numbers + receipts — measured, honest)
@@ -2165,8 +2191,10 @@ EAGLE-3 only if the stock head underperforms (~$400–2000, SpecForge).
   - Prefer non-Asia for low-latency rings; use `inet_down` filter but it's often wrong — verify.
 - **Ring launch:** `engines/minimax_m25/m25_scatter_pipe.py --order REGION:iid:lo:hi ... --K 8 --depth 4 [--batch B]
   [--warm-only]`. `--warm-only` warms stages+sidecars then STOPS so a measurement tool runs as the SOLE first
-  coordinator (the ring's nxt_sock breaks if a gateway connects first → ALWAYS re-warm before a new coordinator
-  process). M2.5 needs ≥5 stages on 5090s (115 GB / 32 GB). fp8 KV (`M25_KV_FP8=1`) for B≥4 at ≥16k.
+  coordinator. The re-warm-per-coordinator warning was a pre-churn-fix operational
+  issue, not a current universal rule; see the dated #26/#34 corrections above.
+  Historical fit calculations depend on the measured full layer, role, KV and load
+  budgets, not just 115 GB / 32 GB. fp8 KV (`M25_KV_FP8=1`) was used for those B≥4/16k runs.
 - **Teardown:** `echo y | vastai destroy instance <iid>` (prompts y/N; piping is required), then verify
   `vastai show instances-v1 --raw` == 0. Always tear down idle boxes (cost).
 - **Provision/bootstrap tools:** `scratchpad/swarm_up.py` (rent+bootstrap N), `scratchpad/swarm_boot.py`

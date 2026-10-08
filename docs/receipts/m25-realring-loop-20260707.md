@@ -1,5 +1,12 @@
 # Real-ring pass — the permissionless loop end-to-end on live GPUs (2026-07-07)
 
+> Historical run report — reviewed 2026-10-08. Original results, failures, identifiers and
+> commands retain their recorded date and configuration; this update does not rerun or recertify them.
+> Signatures bind the recorded activation commitments, freshness and layer coverage, rather than
+> proving every participant computed honestly or that an external payment completed.
+> Current interpretation: [proof scope](../PROOF.md), [documentation index](../DOCUMENTATION_INDEX.md).
+> Current GPT-OSS/V4 deployment and numerical/measurement gates differ from these M2.5 runs.
+
 The loop ran on a real scattered ring: **place → verified pull → auto-form → serve → settle → pay per shard**,
 with the placement and settlement decisions driven by shard's own seams and the receipts verified on real
 hardware. No co-location — five EU consumer 5090s on distinct subnets.

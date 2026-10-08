@@ -59,6 +59,22 @@ and epoch-fencing rules. The coordinator must generate a fresh job nonce rather
 than reuse an old one. Public envelope validation at a keyless middle cannot
 verify the AEAD tag; trusted hash stages and the tail verify it before use.
 
+## Connection identity is a separate boundary
+
+Current strict engine sessions use `shard-pipeline-session/1`: both callers and stages prove
+possession of existing Ed25519 keys through fresh challenges, with role/index/layers/cohort,
+purpose and expected peer bound to the plan. The signed head owner grant binds forward and
+return; BUSY, expiry and fences prevent two coordinators from sharing one active model state.
+Co-located processes remain one privileged-host trust domain, and a valid HELLO does not attest
+GPU identity, weights or honest execution. Transport confidentiality still comes from the
+existing encrypted wire/libp2p route; identity checks are not a new NAT or encryption system.
+
+A `SHARD_STAGE_LEASE_CONFIG` is local runner provisioning, not peer-uploaded identity. Resource
+leases remain occupied through resident process lifetime and acknowledged cleanup. HTTP bearer
+auth, controller signing identity, token-privacy key and resource lease authority are distinct.
+Managed production uses [V4_GATEWAY.md](V4_GATEWAY.md) / [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md).
+Explicit `--legacy-protocol` runs do not inherit the strict ownership claim.
+
 ## Activation commitments and local disputes
 
 `phase0/activation_proof.py` hashes every logical tensor byte with dtype and

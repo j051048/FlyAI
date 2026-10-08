@@ -1,9 +1,18 @@
 # V4 multi-block drafting — NO, and the ring is too wide
 
+Historical record: 2026-08-01 verdict and its 2026-08-02 addendum. Original numbers, dates, branch names and reasoning below
+are retained as that snapshot's evidence, not measurements of `c2ab623`. Current strict deployment,
+RAM/KV/HTTP/lease contracts are in [V4_CLUSTER_DEPLOY_GUIDE.md](V4_CLUSTER_DEPLOY_GUIDE.md),
+[V4_NEXT_PHASE.md](V4_NEXT_PHASE.md) and [V4_BENCHMARK.md](V4_BENCHMARK.md).
+Four RTX 5090 >=40 / six >=30 committed-decode acceptance on the current recipe remains pending.
+Historical launch snippets are not today's production commands: any intentionally reproduced
+old raw-op listener needs explicit `--legacy-protocol`; current production pins a complete signed
+plan/controller key and reaches the real tail endpoint, with no silent `ret_relay` downgrade.
+
 **Verdict: do not build chained multi-block drafting. It is not unprofitable, it is unreachable** —
 the DSpark drafter cannot produce a draft for a position the ring has not already computed, so no
 amount of speculating-on-speculation moves the pipeline's fill. The measured symptom is real and the
-diagnosis behind it was not. **The action this releases is to shrink the ring from ten stages to six**,
+diagnosis behind it was not. **The action released for that historical recipe was to shrink the ring from ten stages to six**,
 worth ~1.22x on the same hardware, against the ~1.03x ceiling of the lever that was proposed.
 
 Arithmetic: `research/v4_pipe_efficiency.py` (run it, no arguments). Written 2026-08-01.
@@ -158,7 +167,7 @@ points. Every shape that can represent the data at all lands the top-up at **+3.
 > built.** Everything above prices the top-up against `q_5 = 0.68` / `g = 4.92`; the 07-31 six-stage
 > ring measures `g = 11.13`, and the lever's value is almost entirely q at the block's deepest
 > index. Re-priced on that ring the same rolling refill models **+11% to +45%** (the spread hangs on
-> the per-depth decay shape — `phase0/v4_ngram_econ.py`, and a ten-agent discrete-event calibration
+> the per-depth decay shape — `engines/deepseek_v4/v4_ngram_econ.py`, and a ten-agent discrete-event calibration
 > lands at +21% inside it). It ships as **`V4_REFILL_FLOOR`** (default 1 = the drain-only round this
 > section describes, frame for frame; `floor=B` pins in-flight at `block+1`), with the two risks this
 > section named turned into per-run measurements instead of assumptions: the re-prediction
@@ -180,7 +189,8 @@ with **F pinned at block+1**.
 | 2 | 11 | ~10-11 | no (§2) |
 | 3 | 16 | ~15-16 | no (§2) |
 
-**Rent six stages, not ten.** One honesty note on the width column, because the obvious answer is
+**The historical all-resident model favored six rather than ten stages.** This is not a
+request to rent hardware or a current capacity rule for RAM placement. One honesty note on the width column, because the obvious answer is
 slightly wrong: it is tempting to say the peak sits exactly at `D = F = block+1`, but that assumes a
 ring saturates at `D` frames. It does not — a frame occupies a *stage* or a *link*, so a ring overlaps
 about `D·(1 + hop/tau)` frames. Solving the model's one free parameter against the measured
@@ -199,7 +209,7 @@ width have to be bought together or not at all.
 
 ## 6. What to do instead
 
-1. **Shrink the ring to six.** Free, ~1.22x, and it is the direct consequence of the cap.
+1. **Historical action: shrink that ten-stage ring to six.** Its measured ~1.22x was specific to that allocation and route.
 2. **Measure `q_j` on the real ring before spending anything else.** `coordinate_dspark_pipelined` now
    reports `accept_by_depth` — hits/trials keyed by draft depth. Feed it back in with
    `research/v4_pipe_efficiency.py --accept '{"1": [h,t], ...}'` and every number above is re-derived
@@ -212,7 +222,9 @@ width have to be bought together or not at all.
    the pipelined path. That is the lever with headroom (cap becomes `V4_SPEC_DEPTH`, default 16), and
    it is worth building **only on a ring wide enough to pay for it and only after (2)** — n-gram
    acceptance on code is far below MTP's, and §3's break-even table is unforgiving about deep frames.
-4. **Do not raise `dspark_block_size`.** Shapes allow it, the trained weights do not.
+4. **The original warning was not to assume untrained widths help.** The subsequent
+`V4_DSPARK_BLOCK` experiment in the 2026-08-02 addendum made width opt-in and measured its
+acceptance cost; it did not create a universal performance guarantee.
 
 ## 7. Correction to `V4_PIPELINED_SPEC.md`
 

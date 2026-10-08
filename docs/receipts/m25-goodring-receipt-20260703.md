@@ -1,5 +1,14 @@
 # The good-ring receipt — 2026-07-03
 
+> Historical run report — reviewed 2026-10-08. Original results, failures, identifiers and
+> commands retain their recorded date and configuration; this update does not rerun or recertify them.
+> Signatures bind the recorded activation commitments, freshness and layer coverage, rather than
+> proving every participant computed honestly or that an external payment completed.
+> Current interpretation: [proof scope](../PROOF.md), [documentation index](../DOCUMENTATION_INDEX.md).
+> Current GPT-OSS/V4 deployment and numerical/measurement gates differ from these M2.5 runs.
+> The lever-ranking deltas and normalized-throughput estimates below are derived projections;
+> the measured per-cell rows retain their original raw values and conditions.
+
 **The run the perf step-back demanded:** the good-ring tok/s and the tree-verify gain had never been
 measured on the SAME ring — "10-12 tok/s" was arithmetic. This is the measurement, plus the first
 per-stage transport/compute split ever taken on a live ring (`M25_STAGE_TIMING`, PR'd on

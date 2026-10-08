@@ -1,85 +1,77 @@
-# Model runtime — the engine-genericity decision
+# Model execution behind a shared contract
 
-**One engine, every model.** The decision that makes shard a *sharded-inference engine* instead of an
-*M2.5 server*. Decided 2026-06-28.
-
-## The decision
-
-**Own the moat in-house; rent model execution behind a firewall interface.**
-
-- **In-house (the moat):** the WAN ring, transport, spec-decode coordinator, scheduler/topology, signed
-  receipts, verification numerics + determinism, economics. This is what `shard/` and the `coordinate_pipe`
-  orchestration already are — and they are already model-agnostic (`m25_pipe.py` header: *coordinate_pipe
-  only orchestrates token-ids + argmax over sockets; reused UNCHANGED, we only provide M2.5-native stage
-  serve loops*).
-- **Inherited (commodity):** the per-architecture forward pass + quant kernels, pulled from an existing model
-  registry (vLLM preferred for the production quant/MoE/attention kernels; HF Transformers as the universal
-  fallback). Accessed **only** through the `ModelRuntime` interface (`shard/node.py`) so a given backend is
-  **swappable per model** and the blast radius of churn / an exotic arch / a determinism gap is one adapter.
-
-This is **not** "all in-house" (re-deriving every architecture by hand is a treadmill that keeps us behind
-the frontier and burns the focus the moat needs) and **not** "depend on vLLM as the engine" (its
-datacenter/NCCL/trusted-owner assumptions actively fight the hostile-WAN, untrusted, per-stage-verified
-regime). It is: borrow the model zoo, own the network.
-
-## Why
-
-Model coverage is **table stakes, not a moat** — demand leaves the instant we don't run the model they want,
-but nobody pays a premium because we *do*. The durable moats are **supply liquidity**, **trustless
-verification**, and **incentive/economic design** — none of which is the model layer. So the model layer must
-be broad + instant (inherited), and the team's effort must compound on the moat (in-house).
-
-The one real pro-"build it all" argument — *verification needs deterministic execution we control* — narrows,
-when followed through, to **owning the verification/commitment layer** (already in-house) plus **pinning
-determinism on inherited kernels** (a config + validation cost; cf. batch-invariant MoE,
-[[m25-batch-invariant-moe]]). The ZK path proves the *math* (sumcheck over the matmuls), not a specific
-kernel, so it does not require owning the forward pass. Determinism does not justify hand-building the zoo.
+Code audit: **2026-10-08, `c2ab623`**. The 2026-06-28 decision separated network
+orchestration, placement and verification from model execution. It is a direction,
+not a claim that every architecture is already supported.
 
 ## The seam
 
-| Concern | Where | Notes |
-|---|---|---|
-| Transport / NAT / encrypted wire | **in-house** | `shard/transport.py`, `phase0/wire.py` |
-| Spec-decode coordinator + drafter | **in-house** | `coordinate_pipe` — already model-agnostic |
-| Scheduler / topology / heal | **in-house** | `shard/scheduler.py`, `topology.py` |
-| Receipts / challenge / verification | **in-house** | `shard/receipt.py`, `challenge.py` — the moat |
-| Determinism on the verify path | **in-house** | pin inherited kernels (batch-invariant config) |
-| Per-architecture forward pass | **inherited** | vLLM/Transformers model class, behind `ModelRuntime` |
-| Quant / MoE / attention kernels | **inherited** | vLLM (NVFP4 FusedMoE on sm_120 already proven) |
-| Weight key names / layer slicing | **derive** | from the manifest `weight_map` + config, not hardcoded |
-| Tokenizer / chat template / tool parse | **inherited** | the model's own renderer — a `chat_template.jinja`, or a Python one where the model ships no template at all (K3); plugin per family, `phase0/model_tools.py` |
+`shard/node.py` defines `ModelRuntime`: `load_shard`, `reset`, `heartbeat`,
+`placement_requirements`, `embed`, `forward` and `logits`, with optional batch
+methods. Default methods fail explicitly until implemented. Loading may materialize
+weights into declared GPU/host tiers; the interface does not itself offload experts
+or certify resource peaks.
 
-## The interface
+Existing execution paths are not all subclasses of this interface:
 
-`shard/node.py` defines `ModelRuntime` — the firewall. It captures the real per-node serve contract that
-`m25_stage.py` + `m25_pipe.py` already run on (`reset()` / `forward(hidden, start_pos)` / `run_block`, head
-embeds, tail does norm + lm_head → logits, KV lives per-layer and crops to `start_pos` for spec-decode
-rollback). Two implementations satisfy it:
+| Path | Actual implementation |
+|---|---|
+| MiniMax M2.5 | Tuned stage/coordinator in `engines/minimax_m25/`, inherited vLLM quant kernels, model-specific state/drafter |
+| Kimi K3 | `engines/kimi_k3/`, its own attention/residual boundary and rewind constraints |
+| DeepSeek V4 | `engines/deepseek_v4/v4_stage.py`, inherited reference blocks/kernels with HC, hash-routing, Compressor/Indexer and speculative-state adaptations |
+| GPT-OSS | `phase0/pipeline.py` / `specpipe.py` plus `engines/gpt_oss/network_service.py`, Transformers partial layers and native MXFP4 |
+| Apple MLX | `shard/mlx_runtime.py` implements `ModelRuntime` for MLX artifacts; separate quantization/numerical cohort |
 
-1. **`M25Runtime`** (exists, hand-rolled `phase0/m25_stage.py`) — the tuned betanet fast-path. Keep it.
-2. **`VllmRuntime`** (to build) — generic: registry → model class → slice layer list to `[lo:hi]` → drive the
-   block forward. This is the generalization of `m25_stage.py` from one model to all of them.
+A generic `VllmRuntime` loading arbitrary registry architectures is still not
+shipped. A catalog/model ID cannot create its execution, wire, state, tokenizer or
+resource adapter.
 
-Note: this **supersedes** the `docs/ARCHITECTURE.md` "per-node runtime wraps SGLang" line. The refinement:
-wrap a model-execution *library* as a swappable backend behind `ModelRuntime` — never as the engine; the
-orchestration stays ours.
+## Shared contracts and backend responsibilities
 
-## Plan
+Transport, signed offers/cohorts, resources, leases, planner, ring lifecycle and
+HTTP/SSE are shared spine modules under `shard/`. Each model owns its forward,
+reset/rewind, boundary representation, drafter inputs and numerical policy.
+Manifest/config-derived key selection is supported where implemented; recognizing
+a namespace alone does not establish model support.
 
-1. Promote `shard/node.py` from stub → `ModelRuntime` interface (the firewall). **← done with this decision.**
-2. De-risk the load-bearing assumption with a GPU spike: instantiate a model from the registry, slice its
-   layers to a block, run that block's forward in isolation, confirm finite + matches a full-model reference.
-   **Needs a GPU box — gated on ops go-ahead (don't improvise vast launches).**
-3. Build `VllmRuntime` behind the interface once the spike holds.
-4. Fix the two model-agnostic leaks. **Both done.** Weight keys now derive from the manifest `weight_map`
-   (PR #139/#140) instead of hardcoded `model.layers.{j}` / `model.embed_tokens` / `model.norm` / `lm_head`.
-   Chat rendering + tool parsing now dispatch per model family through `phase0/model_tools.py` — `m25_tools`
-   (MiniMax XML) and `k3_tools` (Kimi-K3 XTML) — selected at the call site from the served model id, with
-   `m25` as the fallback so an existing ring binds exactly the objects it always did.
-5. **Prove genericity by onboarding model #2** — a small dense model (7-8B Qwen/Llama) end-to-end over the
-   existing ring. The executable proof that this is an engine, not an M2.5 server.
-6. Retire the hand-rolled M2.5 path once `VllmRuntime` matches it bit-for-bit on M2.5.
+A cohort binds checkpoint/manifest/configuration, quantization, runtime ABI, wire
+ABI, numerical contract and real layer count. Stage calibration additionally binds
+exact span, boundary roles and runtime configuration digest. Optional stage-index
+and nstages fields constrain actual execution geometry. Explicit future-model
+profiles must not silently inherit V4/M2.5 defaults.
 
-See [[north-star-torrent-for-compute]] — M2.5 is the betanet/PoC; this decision is what lets the catalog widen
-to "many ever-bigger models." Training stays a separate engine (the rails carry over, the execution core
-does not).
+V4 resident and RAM-expert execution are separate configurations. RAM mode constructs
+canonical pinned expert banks without first allocating the whole bank on the GPU,
+then uses leased fixed GPU slots and existing kernels. Cache state stays local.
+Production misses execute on the GPU after H2D; CPU reference constructors are tests,
+not a production fallback.
+
+V4 KV working sets and query-chunk prefill preserve its actual reference state. They
+are not generic K/V eviction or tokenwise prefill. Budgets, rollback and first-shape
+output/state gates are explicit; graph modes must fit the storage mode. See
+[V4_HYBRID_RUNTIME.md](V4_HYBRID_RUNTIME.md).
+
+GPT-OSS `dtype="auto"` and the codec preserve the actual configured tensor dtype.
+Wire size follows real configuration or explicit measured evidence. Native MXFP4
+prerequisites and packed layout are checked. Inventory metadata cannot replace
+first-load full file hashing. See [GPT_OSS_PRODUCTION.md](GPT_OSS_PRODUCTION.md).
+
+Determinism/greedy parity is per backend and configuration. Receipts commit reported
+roots; they do not make different kernels/quantizations identical. MLX community
+affine-4bit and NVIDIA NVFP4 cannot silently share a cohort promising identical
+native arithmetic.
+
+## Adding a backend
+
+1. Establish checkpoint/configuration, boundary shape and required token data.
+2. Implement loading, forward/state rollback, head/tail and generation semantics.
+3. Measure isolated graph/workspace/load peaks, KV, draft and host/pinned budgets,
+   then publish exact executable templates.
+4. Validate supported numerical modes, sessions and receipts before readiness.
+5. Measure the intended hardware/workload; forecasts and CPU doubles cannot pass
+   a GPU speed or quality gate.
+
+Training needs a separate execution core. See
+[RESOURCE_CONTRACT.md](RESOURCE_CONTRACT.md),
+[OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md) and
+[MLX_RUNTIME.md](MLX_RUNTIME.md).

@@ -1,5 +1,14 @@
 # M2.5 PoC lever stack — adversarially verified projection (2026-07-16)
 
+> Historical research record — reviewed 2026-10-08 against `c2ab623`.
+> Original dates, measured values, projections, later addenda and historical commands are preserved.
+> “Active”, “next” and implementation gaps below describe the recorded experiment, not the current backlog.
+> Current placement/serving contracts: [open network](../OPEN_INFERENCE_NETWORK.md),
+> [GPT-OSS operations](../GPT_OSS_PRODUCTION.md), [V4 acceptance](../V4_BENCHMARK.md),
+> and [documentation index](../DOCUMENTATION_INDEX.md).
+> The projection tables are hypotheses at that date. Read the 2026-07-18 addendum before
+> interpreting the proposed lever stack; projected multipliers are not new hardware measurements.
+
 > Derived from the Inkling lever hunt (`inkling-lever-hunt-20260716.md`): the subset applicable to the
 > RESIDENT M2.5 ring (WAN-bound: 45 ms summed stage compute / 169 ms round / 73% wire+idle, receipts
 > 2026-07-11/12). Draft composition was attacked by a 3-lens skeptic panel (physics/double-count,

@@ -1,35 +1,46 @@
-# Shard — build status
+# FlyAI / Shard — implementation status
 
-One glance, full picture. The whole network is **5 verbs**. Engine side: JOIN, FORM, SERVE, and
-the PROVE primitives are now in; only PAY (c0mpute rails) and the live integration remain.
+Reviewed 2026-10-08 against code `c2ab623`. Current commands and documentation are indexed in
+[DOCUMENTATION_INDEX](docs/DOCUMENTATION_INDEX.md). The dated journal below records earlier experiments;
+its `DONE`, `NOW` and speed labels describe those sessions, not current cluster readiness.
 
-## The map
-1. **JOIN**  — a stranger's GPU gets in *(identity, NAT transport, pull its slice of weights)* — ✅ **DONE** (steps 1–3): libp2p identity, NAT, and content-addressed verified weight fetch.
-2. **FORM**  — the network picks nearby nodes and wires them into a swarm *(scheduler, assignment, heal)* — ✅ **engine done**: `shard/scheduler.py` auto-fits the model to heterogeneous VRAM (fat node first) + RTT-orders the ring; heal-by-rebuild. Live control-plane integration is next.
-3. **SERVE** — the swarm answers the request, fast — ✅ **DONE incl. long context**: ~40 tok/s short-ctx, and **28.2 tok/s decode at >100k context** via n-gram spec-decode (2026-06-23, receipt above).
-4. **PROVE** — each node proves it actually ran its layer — ✅ **primitives done + receipts demonstrated live**: signed per-stage receipts (`shard/receipt.py`, wired into the serve loop, in/out roots chain across the ring) + a tolerance-based layer-block challenge (`shard/challenge.py`). Reputation/policy is c0mpute-side.
-5. **PAY**   — each node gets paid for its bit *(per-node, c0mpute rails)* — the remaining piece, c0mpute-side (per-node `worker_earnings` keyed on verified receipts).
+## Current implementation
 
-Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these five, done right.
+| Area | Current code and limits |
+|---|---|
+| JOIN | Open signed GPU offers, cohort compatibility, TTL/sequence replay protection and verified model files. Sidecars retain identity/transport/NAT handling. |
+| FORM | Regional/directed-route search, heterogeneous exact calibrated spans, shared host budgets, prepare/commit/renew/release leases and resident-process fencing. Inference routes are supplied by the existing deployment/sidecar layer. |
+| SERVE | GPT-OSS and V4 open-network service adapters, signed warmup, authenticated HTTP/SSE, one serial worker per ring and parallel separate rings. No continuous batching or durable coordinator HA claim. |
+| PROVE | Fresh signed receipts, actual activation commitments, full layer coverage and chain checks; local challenge primitives. These do not prove every participant computed honestly. |
+| PAY | Consuming-network integration, outside this engine's implementation/verification scope. |
 
-## DeepSeek-V4 Dual-Resource & Expert Cache Track (11-Step Phased Sequence)
+Latest selected local CPU/socket/HTTP regression: **985 passed, 3 environment-dependent skips**.
+Actual native MXFP4 GPU execution and new V4 four/six-card acceptance remain pending live verification.
+The targets remain **4x5090 >=40 / 6x5090 >=30 valid output tok/s**, using the frozen benchmark and raw evidence.
 
-The active development track transitions DeepSeek-V4-Flash from an all-resident GPU allocation to an opt-in, verifiable dual-resource (GPU + host RAM) placement and local expert cache. Execution follows strict implementation dependencies:
+## V4 placement and runtime track
 
-| Step | Scope & Milestone | Status | Key Deliverables & Code |
-|------|-------------------|--------|-------------------------|
-| **1** | Baseline correctness & acceptance gates | ✅ **DONE** | [V4_BENCHMARK.md](docs/V4_BENCHMARK.md), `phase0/v4_benchmark.py`, target: 4×5090 ≥40, 6×5090 ≥30 tok/s |
-| **2** | Runtime metrics & signed receipts | ✅ **DONE** | [RUNTIME_METRICS.md](docs/RUNTIME_METRICS.md), `shard/runtime_metrics.py`, `shard/receipt.py` signature extensions |
-| **3** | GPU + RAM dual-resource placement contract | ✅ **DONE** | [RESOURCE_CONTRACT.md](docs/RESOURCE_CONTRACT.md), `shard/resources.py`, `probe.py` RAM/pinned/H2D probes, tail MTP budget |
-| **4** | Refactor V4 loader with dual weight pools | ✅ **DONE** | `engines/deepseek_v4/v4_stage.py`, `v4_expert_cache.py`: separate host RAM FP4 routed pool vs GPU resident params, strict checkpoint loading, expert cache slots, retain all-resident fallback |
-| **5** | Fixed-slot local GPU expert cache | ✅ **DONE** | `engines/deepseek_v4/v4_expert_cache.py`: FixedSlotCache, CacheLease locks, LFU decay eviction, atomic capacity fallback |
-| **6** | On-demand H2D DMA & kernel adaptation | ✅ **DONE** | `engines/deepseek_v4/v4_moe_grouped.py`, `v4_hybrid.py`: grouped_routed_sum slot gather with logical-id sort fold, async H2D copy, shared expert overlap |
-| **7** | Scheduler enforcement of dual-resource contract | ✅ **DONE** | `shard/scheduler.py`, `shard/plan.py`: Dual-resource bottleneck min(vram_cap, ram_cap), H2D latency bias, 4-card & 6-card tiered placement, heterogenous fat-node support, `tests/test_v4_scheduler_plan.py` |
-| **8** | Phase 1 hardware acceptance (4-node & 6-node) | ✅ **DONE** | `phase0/v4_acceptance.py`, `tests/test_v4_acceptance.py`: 6-node vs 4-node WAN/DMA tradeoff, 5 stress scenarios, CLI report |
-| **9** | Chunked prefill & controlled prefetching | ✅ **DONE** | `engines/deepseek_v4/v4_chunked_prefill.py`, `tests/test_v4_chunked_prefill.py`: PrefillChunkState, ChunkedPrefillExecutor, ControlledPrefetcher |
-| **10** | V4-dedicated KV bounds & paging | ✅ **DONE** | `engines/deepseek_v4/v4_kv_paging.py`, `tests/test_v4_kv_paging.py`: V4DualTierKVPool, KVPage, SlidingWindowKVCache, bounded VRAM |
-| **11** | Post-speedline capability expansion | ✅ **DONE** | `engines/deepseek_v4/v4_expansion.py`, `tests/test_v4_expansion.py`: CPU fallback parity, cross-node replicas, cluster policy |
+| Step | Current status | Evidence/entrypoint |
+|---|---|---|
+| 1 | Acceptance protocol/tooling implemented; hardware gate pending | [V4_BENCHMARK](docs/V4_BENCHMARK.md) |
+| 2 | Signed runtime observations implemented; not hardware attestation | [RUNTIME_METRICS](docs/RUNTIME_METRICS.md) |
+| 3 | Measured GPU/host/pinned placement contracts implemented | [RESOURCE_CONTRACT](docs/RESOURCE_CONTRACT.md) |
+| 4–6 | Opt-in local expert RAM pool/cache/demand DMA and grouped kernel paths integrated | [V4_PRODUCTION_OPTIMIZATIONS](docs/V4_PRODUCTION_OPTIMIZATIONS.md) |
+| 7 | Resource-aware joint placement and exact executable template selection implemented | [OPEN_INFERENCE_NETWORK](docs/OPEN_INFERENCE_NETWORK.md) |
+| 8 | Simulation available; real speed acceptance uses benchmark/soak and is pending | `phase0/v4_acceptance.py` sets hardware_verified=False |
+| 9 | Query-only prefill chunking and bounded local prefetch integrated with parity gates | [V4_NEXT_PHASE](docs/V4_NEXT_PHASE.md) |
+| 10 | Opt-in layer-local compressed-history KV working sets with explicit tier/workspace quotas | [V4_NEXT_PHASE](docs/V4_NEXT_PHASE.md) |
+| 11 | Standalone expansion prototypes exist; CPU main inference and cross-node expert copies are not production paths | `engines/deepseek_v4/v4_expansion.py`; [V4_TRUST_BOUNDARIES](docs/V4_TRUST_BOUNDARIES.md) |
 
+GPT-OSS current operations are in [GPT_OSS_PRODUCTION](docs/GPT_OSS_PRODUCTION.md): immutable downloads,
+full cohort validation, signed sessions, owned process cleanup, corrected committed-token measurements,
+fixed-K adaptive depth, and explicitly costed mixed-K experiments.
+
+## Historical implementation journal (2026-06)
+
+Historical throughput uses the workload and original timing conventions recorded below. The October
+GPT-OSS accounting corrections require new raw runs for a current comparison. Rental IDs and `LIVE`
+labels are dated observations; current fleet state must be queried by the operator.
 
 ## 2026-06-24 (session 4) — the REAL WARM libp2p number (parity) + the full stack over the real transport
 Fresh N=4 scattered US ring (MN·IL·MI·TX, 4 distinct 4090 hosts, even 9-layer split) + a 48GB WA hot
@@ -212,7 +223,7 @@ A reported "output breaks past ~20k context / spec-decode degrades quality" sent
   kill shell → boxes never freed; now kills by port+GPU pid). Noted gap: ring **forward links don't auto-recover**
   on coordinator churn (fault-tolerance, step 7).
 
-## Build steps  (→ verb · status)
+## Historical build steps (June 2026 snapshot)
 | # | Step | Verb | Status |
 |---|------|------|--------|
 | 0 | Engine (pipeline + spec-decode + pipelining) | SERVE | ✅ done |
@@ -225,7 +236,7 @@ A reported "output breaks past ~20k context / spec-decode degrades quality" sent
 | 7 | Heal + mid-request fault tolerance | FORM | ◑ **demonstrated** (`coordinate_pipe` resume + `phase0/heal.py` spare-splice; kill mid-gen → request completes, 2026-06-23) |
 | 8 | P2P propagation takes over from mirror | JOIN | todo *(additive)* |
 
-## Now
+## Historical status at the time
 **Step 1 (JOIN transport) DONE.** ✅ The real gpt-oss-120B, split across 4 scattered boxes (UT·CA·NV·WA) over **libp2p with per-node keys and no `SHARD_PSK`**, produced **bit-identical** greedy tokens to the committed `wire.py` receipt (sha `f646e0db…3f70`, 87 tokens). Proven incrementally: 1.1 key-auth round-trip → 1.2 engine↔sidecar tensors → 1.3a transparent TCP-over-libp2p tunnel → 1.3b PSK-free message codec → 1.3d-i cross-box libp2p over real WAN → 1.3d-ii the full 120B ring. Sidecar = `sidecar/main.go`; engine wire = `shard/transport.py`; the engine ran unmodified except `import wire → import shard.transport as wire`.
 
 **Perf path re-enabled (direct-return + pipelining over libp2p):** **44.79 tok/s warm @ depth 2**, bit-identical (sha `f646e0db…3f70`, `tokens_match_sync=True`) — i.e. **parity-or-better vs the trusted-wire 39.8** (this window's return leg was 45 ms). Sweep: PIPE d2 warm 44.8 / d4 warm 39.3 / SYNC warm 33.5. The fix was a latent race in `serve_tail_fast` — it now identifies the return channel by content (`hello_return`), not arrival order. So libp2p adds no real tax; QUIC stays a step-2 lever, not needed for parity.
@@ -239,7 +250,7 @@ Done & committed: prune of the dead 1.2 bridge, the libp2p receipt, the tail fix
 
 **Step 2 done.** JOIN's hard parts are in: engine on the wire @ ~45 tok/s, NAT-traversable, per-node paid identity. Remaining JOIN piece: **step 3** (content-addressed weight fetch — how a node pulls its layer block, trustlessly). Then **FORM** (step 4 scheduler/assignment).
 
-## Decisions locked
+## Historical design decisions (current contracts linked above)
 - **Boundary law:** dependencies point one way — `c0mpute → shard`, never reverse. Shard is a pure engine.
 - **Transport:** libp2p via a **Go** (`go-libp2p`) sidecar; Python engine talks to it over a local Unix socket.
 - **Identity folds into the libp2p step** (libp2p gives keypair identity for free — a separate identity layer would be throwaway).

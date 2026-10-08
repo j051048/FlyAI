@@ -1,5 +1,14 @@
 # V4 tree speculation — reachable, but it does not buy what it was re-opened for
 
+Historical record: 2026-08-02 tree-economics verdict. Original numbers, dates, branch names and reasoning below
+are retained as that snapshot's evidence, not measurements of `c2ab623`. Current strict deployment,
+RAM/KV/HTTP/lease contracts are in [V4_CLUSTER_DEPLOY_GUIDE.md](V4_CLUSTER_DEPLOY_GUIDE.md),
+[V4_NEXT_PHASE.md](V4_NEXT_PHASE.md) and [V4_BENCHMARK.md](V4_BENCHMARK.md).
+Four RTX 5090 >=40 / six >=30 committed-decode acceptance on the current recipe remains pending.
+Historical launch snippets are not today's production commands: any intentionally reproduced
+old raw-op listener needs explicit `--legacy-protocol`; current production pins a complete signed
+plan/controller key and reaches the real tail endpoint, with no silent `ret_relay` downgrade.
+
 **Verdict: do not build the tree yet. Branching IS reachable from the vendored head — unlike
 multi-block it needs no retraining — but a tree cannot lift the in-flight cap it was re-opened to
 lift.** It adds *candidates at the same six positions*, not deeper positions, so its entire value is
@@ -77,7 +86,7 @@ branch candidates, fatter fenced futures at cancels, and the occupancy margin sh
 **β\* ≈ 0.17–0.2**. At the 0.25–0.45 a head with 88–93% top-1 typically rescues, the tree nets
 **+4 to +8%** — on the far side of real machinery:
 
-## 4. The verifier machinery is real, and today's cannot express it
+## 4. The verifier machinery required by that historical design
 
 The tail's incremental frontier rule (`q == cfront+1 ∧ token == mfront`) already performs branch
 *selection* untouched — a wrong-branch frame simply fails the frontier test. Everything else
@@ -111,3 +120,5 @@ changes — proven bit-identical to greedy on a real socket ring, lever on and o
 `rescue_by_depth` at slots 2–3 reads **β̂ < 0.17, the tree is dead on this ring** — and with it the
 fill family is exhausted: the remaining gap to 38.5 tok/s *is* the cap of 6, and only a deeper
 trained drafter moves that.
+
+The tree was not a shipped multi-lane V4 serving capability at `c2ab623`. Signed sessions and ring-version routing do not implement per-lane KV fork/join. The beta thresholds and ceilings remain the dated model inputs above, not current hardware measurements.

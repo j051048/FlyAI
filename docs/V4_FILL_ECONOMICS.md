@@ -1,5 +1,14 @@
 # V4 fill economics after the cheap drafter — floor first, width second
 
+Historical record: 2026-08-02 fill-economics model. Original numbers, dates, branch names and reasoning below
+are retained as that snapshot's evidence, not measurements of `c2ab623`. Current strict deployment,
+RAM/KV/HTTP/lease contracts are in [V4_CLUSTER_DEPLOY_GUIDE.md](V4_CLUSTER_DEPLOY_GUIDE.md),
+[V4_NEXT_PHASE.md](V4_NEXT_PHASE.md) and [V4_BENCHMARK.md](V4_BENCHMARK.md).
+Four RTX 5090 >=40 / six >=30 committed-decode acceptance on the current recipe remains pending.
+Historical launch snippets are not today's production commands: any intentionally reproduced
+old raw-op listener needs explicit `--legacy-protocol`; current production pins a complete signed
+plan/controller key and reaches the real tail endpoint, with no silent `ret_relay` downgrade.
+
 **The cost structure that made every fill lever lose is gone, and the family reprices from
 "+3%, don't build" to the largest single opportunity in the engine.** `V4_DSPARK_MOE` took the
 tail from 14.64 to 6.00 ms/frame with drafting ~0, the ring came out flat
@@ -7,7 +16,7 @@ tail from 14.64 to 6.00 ms/frame with drafting ~0, the ring came out flat
 **29% of the 85 tok/s frame ceiling**. This doc re-derives the fill family on that ring, names what
 was built, and gives the numbers that falsify each claim.
 
-Models: `phase0/v4_ngram_econ.py` (frame-exact replay, `--ring 0801`) and `research/v4_fill_sim.py`
+Models: `engines/deepseek_v4/v4_ngram_econ.py` (frame-exact replay, `--ring 0801`) and `research/v4_fill_sim.py`
 (the same round on `v4_pipe_sim`'s per-stage FIFO chain — it queues where the replay clamps). Two
 drafter calibrations bracket every number. Written 2026-08-02.
 
@@ -129,9 +138,10 @@ The sweep that decides everything, one warm ring, six runs:
 `{floor 1, floor 5} x {width off, 8, 10}`, `V4_SPEC_DEPTH=16`, same novel prompts, co-tenancy
 checked before trusting any number (the 07-31 floor re-test died to a loaded head).
 
-## 7. Correctness status
+## 7. Historical CPU correctness scope
 
-Losslessness is absolute and proven on real localhost socket rings against the vendored
+The tested tiny CPU cases establish token/state agreement on real localhost socket rings
+against the vendored
 reference's own greedy decode: the full selftest matrix (greedy / spec / serial dspark / pipelined
 / lazy at depths 2, 3, 16 / floors 2, 3, 5) is bit-identical under `V4_DSPARK_BLOCK=7`
 (`test_the_wide_drafter_serves_exactly_what_the_default_serves`), the widened ring holds width+1
@@ -142,3 +152,5 @@ bit-equal to a reference widened the same way
 suite covers wide blocks through rejections at depths 6–7, floors 1 and width, and the W-truncation
 guard. Width moves only what is speculated; a draft is committed only when the ring's own reply
 equals it.
+
+The priced gains above are model projections. New RAM/DMA/KV working sets can change the timing inputs; only a fresh full frozen suite and raw evidence can establish the current speedline.

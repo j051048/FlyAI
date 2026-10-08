@@ -4,6 +4,9 @@
 `phase0/specpipe.py` 路径。V4 与 GPT-OSS 共用注册、资源租约、HTTP/SSE、
 会话协议和部署清单；模型算子仍由各自引擎实现。
 
+文档对齐于 2026-10-08 的 `c2ab623`。本轮 985 通过、3 跳过属于选定的
+本地非 GPU 回归集合，不是全仓 CI 或新的集群性能收据。
+
 ## 下载与模型身份
 
 GPU 节点使用完整仓库。手工部署工具需要 `deploy` 依赖；GPT-OSS 的
@@ -14,6 +17,7 @@ GPU 节点使用完整仓库。手工部署工具需要 `deploy` 依赖；GPT-OS
 pip install -e '.[gpt-oss,deploy]'
 python phase0/get_model.py openai/gpt-oss-120b /root/models/gpt-oss-120b --anonymous
 # 已下载的平铺权重：只取固定版本元数据并核对文件，不重新下载。
+
 python phase0/get_model.py openai/gpt-oss-120b /root/models/gpt-oss-120b --anonymous --verify-existing
 python phase0/gpt_oss_manifest.py --model /root/models/gpt-oss-120b --out cohort.json
 ```
@@ -24,9 +28,31 @@ python phase0/gpt_oss_manifest.py --model /root/models/gpt-oss-120b --out cohort
 内容，首次加载重新哈希实际文件，并拒绝残留根目录权重覆盖及未验证索引引用。
 未引用的 `original/` 等备份可保留。
 
+当前严格 GPT-OSS stage 和 coordinator 都要求本地目录具备
+`.shard-download.json` 中列出的**整份下载快照**，首次加载校验每个列出的文件。
+stage 只把本段模型层加载进 GPU，不代表它只下载本段权重到磁盘。
+通用 `shard.fetch` 的分块拉取是另一条路径，尚不能用一个只含本段文件的目录
+直接满足这套完整 inventory 合同；本轮没有实现 partial-inventory。
+
+需要复用 Python API 时，先调用 `shard.download_inventory.verify_inventory(...,
+verify_files=True)`，再将其返回的 `VerifiedInventory` 传给
+`shard.gpt_oss_contract.build_cohort_from_inventory`。序列化 JSON、普通 dict、
+`payload_integrity_verified: true` 声明或仅有 safetensors header 的 inventory
+都不能作为此构造器的验证证据。构造结果是完整 `ModelCohort` 描述符；下载
+清单绑定固定 repo/revision、文件大小与摘要，但本身不是发布者签名或硬件证明。
+offer 与会话签名另绑定这些公开身份字段。
+
 生成的 cohort 使用实际支持的合同：`gpt-oss-hf/1`、
 `shard-pipeline-session/1`、`greedy-native-mxfp4/1` 和 `mxfp4`。
 配置、权重身份或兼容字段不符，生产入口在加载前失败。
+
+`validate_supported_cohort(cohort, config)` 检查实际 `model_type=gpt_oss`、
+MXFP4 配置、禁止反量化、实际层数与四个支持字段。调用者另外比对原始
+`config.json` SHA256 和完整下载清单。MXFP4 guard 在 Transformers 转换前
+阻止自动反量化，转换后检查指定层的 packed 权重、scales、参数和 buffers。
+`packed_layout_verified=True` 的范围是存储布局；`native_execution_verified`
+仍为 false，不能据此宣称 GPU 内核输出或吞吐已验证。非 MXFP4 模型沿用
+通用加载器，但不能使用上述 GPT-OSS 生产合同冒充支持。
 
 ## 统一部署清单
 
@@ -40,6 +66,12 @@ python phase0/gpt_oss_manifest.py --model /root/models/gpt-oss-120b --out cohort
 所有公钥来自已经使用的 Ed25519 节点或控制器身份。私钥仅留在本机。
 `--split 20,8,8` 自动推导区间并检查总层数；已有 `--lo/--hi` 仍有边界验证。
 清单与 CLI 切分冲突会在加载前失败。
+
+严格 `specpipe.py` 默认要求 `--deployment-plan` 或节点本地租约 assignment；
+直接启动旧环必须显式给 `--legacy-protocol`。严格生产计划要求完整 cohort，
+并校验真实配置、完整权重、signer、端点及运行模板。当前 GPT-OSS 服务收据
+验证器要求各 stage 的 receipt signer 不同；同机多 GPU 的资源合法性并不会
+自动满足这个签名分配条件。
 
 ```sh
 python -m shard.pipeline_plan --plan ring.json --config /root/models/gpt-oss-120b/config.json
@@ -65,6 +97,8 @@ python phase0/deploy_oss.py --plan ring.json --nodes deployment-nodes.json
 
 原 `launch_oss/launch_ngram/launch_libp2p` 已移除清空所有 GPU/端口的行为，
 环境走 stdin。它们明确使用旧协议兼容模式；正式会话用上述清单或控制服务。
+这里不包含仍保留旧批量清理命令的 M2.5 `m25_scatter_pipe.py`；其隔离部署
+边界见 [DEPLOY_M25.md](../phase0/DEPLOY_M25.md)。
 旧单目录 V4 HTTP 包需要一起分发 `http_gateway.py` 与 `service_queue.py`。
 
 ## 开放网络服务
@@ -73,9 +107,17 @@ python phase0/deploy_oss.py --plan ring.json --nodes deployment-nodes.json
 node-leases、registry 和 `shard-open-network/1` 配置。
 
 ```sh
-SHARD_TRANSPORT=libp2p SHARD_RECEIPTS=1 \
+SHARD_TRANSPORT=libp2p SHARD_RECEIPTS=1 SHARD_COORDINATOR_KEY=/path/to/controller.key \
   python engines/gpt_oss/network_service.py --config network.json --auth-file tenants.json
 ```
+
+`SHARD_COORDINATOR_KEY` 是本机受保护私钥文件的路径，必须匹配计划中的
+协调器公钥；控制服务也可将已加载的同一控制器 key 对象注入 backend。
+HTTP 默认仅监听 `127.0.0.1:8000`；非 loopback 地址必须同时提供
+`--tls-cert` 和 `--tls-key`。`--auth-file` 必须提供 `keys`（API key→tenant）
+和 `tenants`（每租户的 `max_active/requests_per_minute/tokens_per_minute`）映射；
+每个 key 至少 16 字符，真实 key 只留在受保护文件。公开节点入网不意味着
+HTTP 推理、节点资源控制或环邻居连接免认证。
 
 每个 formation 提供完整 `cohort`、本地 `dir`、实际 `head/tail`、
 `planning_calibration` 文件和 `measurements`。节点必须广告对应角色与层范围
@@ -125,6 +167,12 @@ margin 模式，不输出私钥、token 或 prompt。节点租约覆盖加载及
 单向时间，也不是 `recv_wait`。`/metrics` 异步读取节点状态，不阻塞推理。
 这些滚动观测不能自动冒充绑定 context/frame 的规划校准。
 
+V4/GPT-OSS 共用 `shard/http_gateway.py`：认证租户可提交、查看、恢复和取消
+自己的请求；提交可用 `Idempotency-Key`。SSE 恢复使用本 job 的
+`Last-Event-ID: job_id:token_cursor:published_character_cursor`，同时绑定已经
+发布的文本前缀。只有最终完整签名收据校验通过才标记成功；先前流出的 token
+不是已完成证明。队列与恢复记录存于进程内，重启不会保留这些 job。
+
 ## 投机调优与验收
 
 `--adaptive-depth` 保持 K 和验证形状，在排空边界根据近期接受率调整深度，
@@ -157,3 +205,8 @@ V4 原四卡 >=40 / 六卡 >=30 tok/s 及原始收据、token 对照验收继续
 本轮 CPU 测试覆盖真实 socket/HTTP、签名、租约、完整小模型 V4 参考输出、
 GPT-OSS 合成 oracle 和失败恢复。真实 MXFP4 GPU 执行、吞吐与持续稳定性需要
 在集群上重测，不能用 CPU 数字通过硬件速度线。
+
+2026-06-19 的 [GPT-OSS WAN 历史记录](receipts/gpt-oss-120b-wan-20260619.json)
+报告约 40 tok/s，2026-08-02 的 [V4 历史矩阵](receipts/v4-flash-matrix-20260802.json)
+汇总 30.15 tok/s。它们保留当时配置与观测范围，不能认证本轮严格协议、下载
+校验、混合缓存或测量修正后的性能。

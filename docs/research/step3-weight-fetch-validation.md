@@ -1,5 +1,21 @@
 # Step 3 — content-addressed verified weight fetch: validation report
 
+> Historical research record — reviewed 2026-10-08 against `c2ab623`.
+> Original dates, measured values, projections, later addenda and historical commands are preserved.
+> “Active”, “next” and implementation gaps below describe the recorded experiment, not the current backlog.
+> Current placement/serving contracts: [open network](../OPEN_INFERENCE_NETWORK.md),
+> [GPT-OSS operations](../GPT_OSS_PRODUCTION.md), [V4 acceptance](../V4_BENCHMARK.md),
+> and [documentation index](../DOCUMENTATION_INDEX.md).
+> This early signed-manifest/block-fetch validation is separate from the current local
+> `.shard-download.json` full-snapshot GPT-OSS loading contract. Metadata/header checks and small-file
+> tests did not hash every byte of the complete checkpoint. Resolved/verified paths are documented
+> in the current guides; the original finding list and historical line numbers remain here.
+> Current resolution: `shard.fetch._safe_rel` rejects lexical/symlink path escapes;
+> `MirrorProvider` uses Content-Range placement and signed per-shard revisions;
+> `Libp2pProvider` is implemented rather than the stub described below.
+> The strict GPT-OSS full-inventory entrypoint requires all listed snapshot files,
+> while generic block/range fetching remains a separate contract.
+
 Validates the JOIN-pillar mechanism that lets a node pull ONLY its layer block's
 weights from any provider and verify every byte against a signed manifest before
 loading. Files under test: `shard/manifest.py`, `shard/fetch.py`,

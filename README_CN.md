@@ -1,173 +1,76 @@
-# Shard
+# FlyAI / Shard
 
 <div align="center">
 
-[English](README.md) | **简体中文**
+[主 README](README.md) | **简体中文**
 
 </div>
 
-**无许可算力网络的底层引擎** —— *类似于算力世界的 BitTorrent，共享显存（VRAM）与计算能力而非磁盘空间。* 任何人都可以接入任何类型的 GPU；网络将它们汇聚成分布式集群，运行远超单卡容量的超大模型。长期愿景是构建覆盖全球的去中心化算力织网（compute fabric）：承载更多、更大的模型，并最终扩展至分布式训练与通用计算。Shard 是连接这一切的底层协议。
+FlyAI 是基于上游 Shard 的分布式推理 fork。目标是允许任意贡献者登记 GPU，优先选择低延迟的近邻与同区域节点，不足时再扩区，将模型切成连续层块执行。同机多 GPU 是合法部署；是否加入执行环还要满足运行时兼容、真实资源、可达链路和租约要求。相同公网 IP 不能证明是同一物理机，也不能当作共享内存域。
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21178430.svg)](https://doi.org/10.5281/zenodo.21178430)
+**当前状态：2026-10-08，代码基线 `c2ab623`。** 本轮选定的本地非 GPU 回归集合为 **985 通过、3 跳过**，不是全仓 CI，也没有完成新的 GPU 集群速度验收。当前指南、历史研究和上游来源见 [文档导航](docs/DOCUMENTATION_INDEX.md)。
 
-**技术报告：** [跨公网以交互式速度运行 229B MoE 模型的分片推理](docs/paper/main.pdf) —— 在横跨 5 个国家的消费级 GPU 上完成实测，所有基准测试数据均由 [`docs/receipts/`](docs/receipts/) 中带签名的收据（receipts）所背书。
+## 当前能力与边界
 
-**当下已验证的能力：分片推理（Sharded Inference）。** 将一个单张显卡无法容纳的超大模型切分为连续的层块（每个 GPU 承载一个分片），通过在公网上按序流式传输各分片的激活值（activations）来处理请求。无需数据中心，无单点主机依赖，没有任何单个节点需要持有完整模型。
+| 能力 | 当前实现 | 验证范围与限制 |
+|---|---|---|
+| 开放节点登记 | 带签名的 offers、TTL、精确模型 cohort | 身份签名不是 GPU 硬件认证；缺测量节点可留在池中，不能直接执行 |
+| 自动组环 | 区域优先、异构层段、实测路线与有限流水线预测 | 比较少量强卡和强弱混合的总成本；预测不是性能验收 |
+| 节点资源占用 | SQLite prepare/commit/renew/release、fencing、共享 RAM/pin 预算 | 加载与空闲驻留也持有租约；旧任务和进程确认清理后才释放 |
+| V4 混合运行时 | 本机 RAM 专家池、固定 GPU 缓存、按需 DMA、受控预取和 KV 工作集 | CPU 参考与专项测试已覆盖；实际 GPU 数值、命中性能和长期运行仍需验收 |
+| V4 / GPT-OSS 服务 | 签名会话、多环路由、租户认证、队列、SSE、取消与前缀恢复 | 每环请求串行，多环可并行；job/队列不持久化，未实现服务 HA |
+| GPT-OSS 下载与量化 | 固定 HF revision、完整摘要清单、转换前拦截反量化、转换后 packed 布局校验 | 布局校验不证明 native GPU 内核执行正确或吞吐达标 |
+| 收据与本地仲裁 | 验证 signer、层覆盖、相邻 roots、job 和 nonce；独立重放挑战辅助 | 签名记录不是完整计算证明；本地辅助没有实际链上罚没 |
 
-Shard 是 [c0mpute](https://c0mpute.ai) 的推理服务引擎。它由两部分组成：一个协议**骨架（Spine）** —— 包含底层通信协议（wire）、环形拓扑（ring）、签名凭据（receipts）与调度编排（placement）；以及针对各模型的独立优化引擎 —— 因为要在公网上实现交互式的推理速度，必须深入底层算子（kernel）进行定制优化。目前已提供三个引擎：**MiniMax-M2.5**（betanet 概念验证模型）、**Kimi-K3** 与 **DeepSeek-V4-Flash**（最新成果，详见下文）。长期架构将把所有引擎统一收敛在单个 `ModelRuntime` 接口后（参见 [docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md)），使网络能运行任意模型；后续实测的 GLM-5.2 与 gpt-oss-120B 运行记录已证明该引擎能够从消费级显卡平滑扩展至前沿超大模型规模。
+没有一个通用 backend 可以直接接入任意模型。MiniMax-M2.5、Kimi-K3、DeepSeek-V4 有独立引擎；GPT-OSS 使用现有 `phase0/specpipe.py` 并接入生产服务 adapter。GLM 等 `research/` 脚本属于历史实验，不能直接等同于当前生产入口。
 
-## DeepSeek-V4-Flash (284B)：运行于 4 个国家的 6 张消费级 RTX 5090
+严格 GPT-OSS 节点目前要在磁盘上保留完整下载清单列出的快照，再按分配层段加载 GPU；通用分块拉取路径不等于该入口已支持只下载本段。本轮没有实现 partial-inventory。
 
-**达到 30.15 tok/s，输出结果与单机运行该模型在位级别（bit-identical）完全一致。** 部署在 6 张*完全独立*的 RTX 5090 显卡上 —— 分布在波兰、捷克、丹麦与爱沙尼亚 —— 纯走公网连接，每张卡承载 8 层，无需数据中心，无共享物理机。投机解码（Speculative Decoding）运行在 DeepSeek 原生的 DSpark 草稿头上，其 3 个多标记预测（MTP）块连接最后 3 层，因此完全驻留在末端节点（tail box）上。
+## 部署与运行实操
 
-| 部署环境 | tok/s（预热后） | 输出精度与确定性 |
-|-------|--------------|--------|
-| DeepSeek-V4-Flash 284B（13B 激活参数）FP4，跨 4 个欧洲国家的 6× RTX 5090，公网环境，流水线 DSpark 投机解码 | **30.15** | 贪心采样，与单机运行 bit-identical 结果完全一致 |
+- **GPT-OSS：** [下载、部署与生产合同](docs/GPT_OSS_PRODUCTION.md)。严格入口要求完整 `ModelCohort`、验证过的实际权重、部署计划、节点 signer 与协调器 key。
+- **V4：** [当前阶段与边界](docs/V4_NEXT_PHASE.md)、[集群部署指南](docs/V4_CLUSTER_DEPLOY_GUIDE.md) 和 [固定性能验收](docs/V4_BENCHMARK.md)。严格服务使用 `engines/deepseek_v4/v4_network_service.py`；旧 `v4_gateway.py` 是兼容接口。
+- **开放网络：** [节点登记、资源租约、组环和服务](docs/OPEN_INFERENCE_NETWORK.md)。
+- **M2.5 旧环：** [独立兼容运行指南](phase0/DEPLOY_M25.md)。其协议、依赖和启动器不会自动获得新 GPT-OSS/V4 会话合同。
 
-连续三次预热运行的中位数，各次波动在 0.17 以内（30.18 / 30.29 / 30.12）。
-上下文 × 负载测试矩阵（包含数学、代码、散文、智能体工作流；0–2k 上下文）见于
-[`docs/receipts/v4-flash-matrix-20260802.json`](docs/receipts/v4-flash-matrix-20260802.json)：
-**51/51 个单元测试均与同环拓扑上的贪心基线结果 bit-identical 一致，68/68 份签名收据验证通过，0 故障。**
+默认开放网络数据链路使用 libp2p sidecar 的节点身份与加密连接，Python 只处理 JSON/原始张量帧。节点仍要授权预期环邻居；严格会话另绑定计划和协调器签名。原始 TCP 的 `SHARD_PSK` 属于明确兼容模式。公开 V4/GPT-OSS HTTP 服务必须启用 TLS 和租户认证；私钥与下载 token 留在本地受保护文件，不写入计划、收据或命令值。
 
-这项工作中比具体速度数字更重要的两项核心技术结论，均记录在 [docs/V4_FLASH_ENGINE.md](docs/V4_FLASH_ENGINE.md) 中：
-1. 系统的整体吞吐量本质上是*往返延迟期间的有效在途计算量*，任何为了填满流水线而盲目增加推测深度的杠杆都会以接近 1:1 的比例削弱接受率 —— 将流水线推满至 99.6% 负荷反而会导致吞吐量**减半**，因为新增的候选帧是基于后续未被接受的预测历史推算的；
-2. 草稿块（draft block）的推测长度存在一个内在最优区间，只有深入测量中间值而非仅看端点时才能显现。
+## 数值正确性与隐私
 
-## GLM-5.2 (744B)：横跨全美 6 个州的 7 张分散专业 GPU，跑在公网之上
+验收必须固定 checkpoint、源码、量化布局、wire 模式、内核开关、context 和验证形状。同环贪心 token 一致、阶段状态一致、内核数值一致和不同后端的浮点位一致是不同结论；切换形状与量化内核后要重新对照。
 
-**参数量达 7440 亿的前沿超大模型，在分布于美国 6 个州的 7 张 Blackwell 架构 GPU 上跨广域网（WAN）以 ~30 tok/s 速度服务 —— 贪心采样，完全确定性。**
-GLM-5.2（NVFP4 精度，78 层）被切分为**每个节点承载 13 层**，分摊在 6 张 RTX PRO 6000 上；没有单张显卡能装下它，而是由 6 张卡共同协作。每个节点**仅加载其所属的层块**。协调节点（coordinator）不保存任何模型中间层 —— 仅维护 token embedding / head 以及一个经由 CUDA Graph 优化的轻量级 GLM-4-9B 草稿模型用于提出候选 token，并由分布式 744B 模型进行验证。
+计算节点仍能看到激活值。V4 可选 sealed-ID 模式只向 head、需要 hash 路由的 stage 和 tail 提供独立解密能力，隐藏普通中间节点的原始 IDs；它不隐藏激活值，也不防止受信任接收者或同一主机管理员泄漏数据。GPT-OSS 的会话身份认证不等于提示保密。边界见 [V4 信任说明](docs/V4_TRUST_BOUNDARIES.md) 和 [收据与证明范围](docs/PROOF.md)。
 
-| 部署环境 | tok/s（预热后） | 输出特性 |
-|-------|--------------|--------|
-| GLM-5.2 744B NVFP4，跨美国 6 个州的 6× RTX PRO 6000（内华达 · 德州 · 明尼苏达 · 密苏里 · 犹他 + 华盛顿协调节点），公网连接，流水线投机解码 + CUDA Graph 草稿加速 | **~30** | 贪心采样，确定性输出 |
+## 历史实机记录
 
-每次运行都会生成一份**可验证收据（Verifiable Receipt）** —— 记录独立的 GPU UUID、公网 IP、地理区域、实测广域网单跳 RTT（22–75 ms）、输出 token 哈希值以及无损优化一致性检查。该次运行的收据文件位于：[`docs/receipts/glm52-nvfp4-wan-20260618.json`](docs/receipts/glm52-nvfp4-wan-20260618.json)（验证步骤详见 [docs/PROOF.md](docs/PROOF.md)）。
+这些数字保留原日期、配置和原始证据，不是当前 fork 的重新跑分或服务 SLA。
 
-一句话总结其核心论证：规模高达 7440 亿的前沿模型（远超单卡承载极限），在跨越不同网络的异构物理机上运行 —— 每次遍历激活值都要跨越整个国家传输 —— 依然能够达到真正实用的生成速度。
+| 日期与记录 | 历史部署 | 报告速度 | 证据范围 |
+|---|---|---|---|
+| [2026-08-02 V4 矩阵](docs/receipts/v4-flash-matrix-20260802.json) | 6× RTX 5090，4 个欧洲国家；前五卡各 8 层，tail 3 层与 DSpark | 汇总 30.15 tok/s | 当时同环贪心 token 对照；不能推广为单机后端或所有浮点位一致 |
+| [2026-06-19 GPT-OSS WAN](docs/receipts/gpt-oss-120b-wan-20260619.json) | 120B MXFP4，3×4090 的 12/12/12 层段与同区域协调器 | 约 40 tok/s | 历史运行记录；需分别核对自报数据、签名和独立复现范围 |
+| [2026-06-18 GLM WAN](docs/receipts/glm52-nvfp4-wan-20260618.json) | 744B NVFP4，分散专业 GPU、CUDA Graph 草稿 | 约 30 tok/s | 历史研究入口，不能作为当前生产路径的验收 |
 
-## 性能优化历程与路径
-
-单纯基于公网进行管道式解码受制于网络延迟：每个 token 都需要完整往返一次，吞吐仅约 1–2 tok/s，基本无法实际使用。从 1.8 跃升至 30 tok/s 是通过一系列严谨可度量的优化演进达成的：
-
-| 阶段步骤 | tok/s | 关键改进点 |
-|------|-------|--------------|
-| 朴素 KV 缓存解码 | 1.87 | 受往返延迟限制的基线（每个往返生成 1 个 token） |
-| + 深度草稿投机解码（GLM-4-9B），中继折返传输 | 1.99 | 单次流水线遍历可确认多个 token |
-| + **环形直接返回（Ring Direct-Return）** | 2.94 | 尾节点一跳直达协调节点 —— 仅需 7 跳环路，无需 12 跳中继折返 |
-| + **异步流水线（Async Pipelining）** | 16.6 | 并发重叠多个在途验证块 → 吞吐量受算力限制而非受延迟限制；WAN 耗时占比降至循环的 ~5% |
-| + **CUDA Graph 捕获草稿头** | **~30** | 当网络延迟被掩盖后，草稿头占循环耗时的 94%；通过 CUDA Graph 加速（3.8×）彻底释放流水线吞吐 |
-
-**核心洞见：在广域网（WAN）环境下，稀缺资源是往返时延（RTT）而非算力** —— 因此，在数据中心内价值微弱的投机解码在此处成为了决定性的关键。轻量草稿模型提出 K 个候选 token；分布式 744B 模型在单次流水线遍历中予以验证；贪心策略接受最长匹配前缀。随后产生了两项复合增益：
-
-- **基于环形拓扑的异步流水线**：由于采用了直接返回机制，网络中可以同时并发多个在途验证块。协调节点持续推测生成并在不等待上一批次返回的情况下连续向流水线注入任务 —— 从而让整个循环以流水线的*吞吐率*而非*单次往返延迟*运行。曾经制约所有前人尝试的广域网延迟，在整体耗时中的占比缩减到了约 5%。
-- **CUDA Graph 草稿头加速**：一旦网络延迟被掩蔽，GLM-4-9B 草稿模型（单 token 解码，受算子发射开销限制）便成为了整个循环 94% 的瓶颈。将其捕获为静态 CUDA Graph 后，单 token 生成延迟从 49.7ms 大幅降至 13.1ms（提升 3.8×）。其中最大的技术难点是让静态 KV 缓存在图捕获环境下依然支持投机回滚 —— 最终通过基于固定地址位置张量调度写入槽位解决；生成结果**在字节级别与原始 Eager 路径完全一致**，证明该项优化属于绝对无损优化（参见 `research/glm_swarm_nvfp4_cg.py`、`research/glm_swarm_nvfp4_cg_diff.py`）。
-
-## 架构运作原理
-
-Transformer 架构由若干层叠加而成。Shard 将层栈切分为连续的块，每个 GPU 分摊一个块。Token 的生成过程是通过按顺序将激活值穿透各个层块来实现的；每个节点仅为其负责的模型层维护局部 KV 缓存。
-
-```text
-    协调节点 (WA) ── GLM-4-9B 草稿头 (CUDA Graph) + Embed / LM_Head
-         │
-         ├─► stage0 ─► stage1 ─► stage2 ─► stage3 ─► stage4 ─► stage5 ─┐  （流水线并发验证块）
-         │   NV         TX         (·)        MN         MO        UT    │
-         │   0–12       13–25      26–38      39–51      52–64     65–77 │
-         └──────────────── 直接返回 (尾节点直连协调节点，仅 1 跳) ───────┘
-```
-
-协调节点（入口节点）**不持有** 744B 模型的任何中间层 —— 仅维护草稿模型和一个轻量驱动器。每个轮次中：
-1. 草稿头提出 K 个候选 token；
-2. 协调节点将 `[cur, d₁..dₖ]` 发送至 stage 0（执行 Embedding）；
-3. 分布式节点链在单次前向遍历中同时验证全部 K+1 个标记；
-4. 尾部节点直接将各位置的 Argmax 计算结果一跳返回至协调节点（无需按原路反向中继折返）；
-5. 协调节点按照贪心原则接受最长匹配前缀。
-
-多个此类计算块在流水线中并发流动，草稿头利用静态 KV 缓存重放捕获的 CUDA Graph。贪心匹配是默认行为；该路径还原生支持**无损的 Temperature / Top-p / Top-k 采样** —— 由末端节点执行投机采样拒绝判断，从而使提交的 token 分布与目标模型完全一致，且相比贪心算法没有任何速度损失（参见 [`phase0/specsample.py`](phase0/specsample.py)）。
-
-## 核心难点与工程挑战
-
-在局域网同机房的 GPU 间切分模型已经非常成熟。但要跨越公网在异构物理机之间切分并达到交互级可用速度，是一项截然不同的挑战 —— 这正是 Shard 的核心价值所在。
-
-- **延迟（Latency）：** 每个 token 都需要穿越完整流水线。投机解码将一次往返时延分摊至多个被接受的 token 上；异步流水线重叠多个在途前向传播，彻底打破了广域网延迟下限；CUDA Graph 保证本地算子开销微乎其微。
-- **传输层可靠性（Transport）：** 激活值张量在每一步中都需要跨越公网传输。Shard 封装了专门的传输层 —— 具备毫秒级快速失败与自动重连机制、单链路健康监控，杜绝黑盒式的 "broken pipe"。通信协议基于无 pickle 依赖的帧结构（`phase0/wire.py`），通过共享密钥 `SHARD_PSK` 使用 ChaCha20-Poly1305 进行全量认证加密；被动监听者无法获取任何有效数据，伪造帧只会触发解析错误而绝无任意代码执行风险。（家用路由器的 NAT 打洞与中继回退正在 Phase 1 中推进；当前采用直连开放端口支持公网互联）。
-
-## 设计原则
-
-Shard 作为 c0mpute 的基础设施，坚守三项核心承诺：
-
-- **无审查（Uncensored）：** 引擎原汁原味地运行模型本身，推理路径中不插入任何额外的内容审查过滤层。
-- **去中心化（Decentralized）：** 任何人只需一条命令即可接入 GPU 节点并分配得到特定的模型层块。不存在中心化的推理服务端。
-- **隐私保护（Private）：** 没有单个节点能够持有完整模型 —— 这是一个良好的开端，但并非终点。传输线缆完全密封（经认证的加密传输，无 pickle 隐患），因此传输链路不存在泄漏；但*参与运算的节点*必须解密后才能计算其所属层，因此能看到经由它的中间激活值。恶意节点仍有可能从局部激活值中逆向推测出用户的少量 token。我们的应对方案 —— 将易泄露的边界层固定在受信任节点上、按请求动态安全路由、绝不过度宣称安全性 —— 详细规划见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。这是团队视作头等优先级并全力攻克的核心课题。
-
-## gpt-oss-120B 在公网上达到 ~40 tok/s —— 消费级显卡实证
-
-1200 亿参数模型（MXFP4 精度，36 层）分布在**跨越美国不同州的 3 张消费级 RTX 4090** 与 1 个协调节点上，达到 **~40 tok/s（峰值 ~42 tok/s），贪心采样，精确匹配**。这一成果验证了 Phase 3+ 无许可网络技术栈在普通 24GB 消费级显卡上的可行性 —— 即真实社区志愿者所拥有的硬件设备。当前的 **betanet 基础模型为 MiniMax-M2.5**（229B-A10B MoE），基于 libp2p 协议完成了热机验证与带签名收据校验（支持工具调用、多轮对话、长上下文）；gpt-oss-120B 与 GLM-5.2 则分别作为消费级显卡与前沿超大规模的模型扩展性标杆。
-
-该次运行的可验证凭据见：[`docs/receipts/gpt-oss-120b-wan-20260619.json`](docs/receipts/gpt-oss-120b-wan-20260619.json)。
-
-从受延迟制约的 ~18 tok/s 逐步攀升的实测演进：
-
-| 阶段步骤 | tok/s | 关键改进点 |
-|------|-------|--------------|
-| 流水线投机解码（4-stage） | 25.8 | 异步草稿重叠 + 多个验证块在途 + RTT 最优环路排列 |
-| + **3-stage（12 层）环路** | 28.8 | 更饱满的 stage → 4 次 WAN 跳步替代 5 次（12 层恰好适配 24GB 卡） |
-| + **协调节点就近同区域部署** | **~40（峰值 ~42）** | 协调节点无需加载模型权重层，可置于任意位置；将其移出跨国超长链路，单环延迟从 174ms 锐减至 102ms |
-
-最后一步优化往往最容易被忽视：系统中资源消耗最小的节点 —— 完全不持有模型层的协调节点 —— 如果与集群相隔一个大洲，每生成一个 token 就会凭空付出两次长途跨洲往返。将其迁移至集群节点相近的区域，即可零成本换取约 40% 的端到端延迟缩减。完整研究报告见：[docs/research/wan-speculative-decoding.md](docs/research/wan-speculative-decoding.md)。
+V4 **4×5090 ≥40、6×5090 ≥30 tok/s** 是新增路径的固定待验收目标。CPU 测试、模拟器与旧收据不能替代当前 GPU 集群对照。跨节点专家副本和 CPU 主推理不在当前 V4 服务范围。
 
 ## 仓库结构
 
 ```text
-shard/       协议骨架（Spine），与具体模型无关：
-             node.py（ModelRuntime 接口）、transport（传输）、scheduler（调度）、
-             topology（拓扑）、manifest（配置清单）、fetch（拉取）、
-             receipt（签名凭据）、challenge（挑战校验）
-phase0/      模型专属引擎与部署工具：
-               m25_*.py  MiniMax-M2.5   — betanet 服务路径
-               k3_*.py   Kimi-K3
-               v4_*.py   DeepSeek-V4-Flash
-             以及 wire.py（安全封包）、mesh.py（边缘 RTT 测量）、运行与基准测试工具，
-             以及引入的不可篡改参考实现目录 (*_ref/)
-research/    研究实验与原型 —— GLM-5.2 集群驱动 (glm_swarm_nvfp4_*)、V4 性能分析探针等
-docs/        ARCHITECTURE、ROADMAP、MODEL_RUNTIME、NETWORK、INTEGRATION、PROOF.md、
-             V4_FLASH_ENGINE.md、receipts/ 收据归档以及各项研究记录
+shard/       协议、资源合同、注册、规划、租约、会话、HTTP/SSE 和收据
+engines/     minimax_m25、kimi_k3、deepseek_v4、gpt_oss 服务 adapter
+phase0/      现有通用/GPT-OSS 运行时、下载、部署与基准工具
+sidecar/     Go libp2p 身份、加密传输、NAT/relay 和内容路由
+tests/       本地、参考与专项测试；GPU 测试有独立条件
+research/    历史实验与原型
+docs/        当前指南、历史研究与 receipts 档案
 ```
 
-各模型引擎允许根据自身架构深度定制优化算子，但协议骨架（Spine）必须保持通用与统一。`tests/test_engine_boundaries.py` 自动化测试严格保障分层边界：任何引擎不得相互交叉引用，`shard/` 也不得反向依赖任何特定引擎。
+## 项目方向与上游来源
 
-## 项目路线图
+下一阶段按当前真实执行路径完成 GPU 数值与状态对照、短/长上下文性能矩阵、持续运行和故障恢复验收，再决定扩展模型与容量。通用 `ModelRuntime` 收敛仍在进行中，分布式训练与通用计算是后续方向。
 
-- **Phase 0 —— 传输协议验证（已完成）：** 实现可靠的多阶段跨机模型切分与服务承载。
-- **Phase 1 —— 广域网环境适配：** 支持 NAT 内网穿透、中继回退、激活值量化压缩与边际链路监控。
-- **Phase 2 —— 投机解码加速：** 在集群上实现草稿与验证分离 —— **已在 GLM-5.2 744B 上达成公网贪心 ~30 tok/s**（以及 gpt-oss-120B 的 ~18–25 tok/s）。现已支持**无损的 Temperature / Top-p / Top-k 采样**（[`phase0/specsample.py`](phase0/specsample.py)），实测收据：[docs/receipts/sampling-lossless-20260623.json](docs/receipts/sampling-lossless-20260623.json)。
-- **Phase 3 —— 无许可弹性集群：** 单行命令入网、跨异构 GPU 的动态层切分分配、按 Token 结算收益、故障容错与自愈 —— **已验证请求过程中途节点故障自愈**（生成中途剔除节点，请求自动在备用节点恢复并完成；`phase0/heal.py`，[收据](docs/receipts/fault-tolerance-20260623.json)）。
-- **DeepSeek-V4 双资源混合运行时与专家缓存（11 步改造全量落地）：**
-  遵循严格依赖顺序完成可验证专家缓存、受控预取、KV 分页与兜底扩展（全量 193 项单测 100% 通过）：
-  1. **固定正确性基线与性能验收条件**（✅ 已完成）：完善基准脚本，锁定版本、量化、内核开关与 prompt，固定 4×5090 ≥40、6×5090 ≥30 tok/s 验收线（[docs/V4_BENCHMARK.md](docs/V4_BENCHMARK.md)）。
-  2. **补齐运行时监测和签名收据**（✅ 已完成）：在签名前写入专家路由、命中率、DMA 指标、CPU 补算及显存/内存 KV 占用（[docs/RUNTIME_METRICS.md](docs/RUNTIME_METRICS.md)）。
-  3. **建立 GPU＋RAM 的双资源放置合同**（✅ 已完成）：扩展 `ModelRuntime` 资源声明，probe 测量可用/锁页内存与 H2D 带宽，约束 tail 节点 MTP 预算与 40–42 层同属（[docs/RESOURCE_CONTRACT.md](docs/RESOURCE_CONTRACT.md)）。
-  4. **改造 V4 实际加载器，建立双权重池**（✅ 已完成）：注意力/路由器/共享专家/归一化驻留 GPU，路由专家以 FP4 保留于宿主机锁页内存，保留全驻留回退（`engines/deepseek_v4/v4_stage.py`）。
-  5. **实现固定槽位的本机 GPU 专家缓存**（✅ 已完成）：固定地址权重槽、映射表与使用状态，严格受控于显存预算（`engines/deepseek_v4/v4_expert_cache.py`）。
-  6. **接入按需 H2D，并适配 CUDA Graph**（✅ 已完成）：未命中专家 DMA 搬运至 GPU 槽并与计算重叠，调整捕获边界，保持逻辑专家累加语义（`engines/deepseek_v4/v4_hybrid.py`）。
-  7. **让调度器真正使用双资源合同**（✅ 已完成）：`scheduler.py` / `plan.py` / `topology.py` 综合 RAM、GPU、DMA 成本与 WAN 延迟评分，落地 `min(vram_cap, ram_cap)` 瓶颈算法（`tests/test_v4_scheduler_plan.py`）。
-  8. **完成第一轮四卡／六卡硬件验收**（✅ 已完成）：全驻留 vs 缓存模式对比，验证 4 卡省 2 次 WAN 跳数净赚 ~20ms 时延（`phase0/v4_acceptance.py`，`tests/test_v4_acceptance.py`）。
-  9. **实现分块预填充和受控预取**（✅ 已完成）：跨块预填充状态管理削减显存峰值，结合 DSpark 草稿提示与 EMA 热度预取，未命中安全回退（`engines/deepseek_v4/v4_chunked_prefill.py`）。
-  10. **实现 V4 专用的 KV 驻留上限与分页**（✅ 已完成）：滑动窗口活跃工作集 + 内存全量历史归档双层存储，杜绝长文本 OOM，支持精确推测回滚（`engines/deepseek_v4/v4_kv_paging.py`）。
-  11. **通过速度线后，再扩展能力**（✅ 已完成）：SwiGLU CPU 专家计算兜底保证零 OOM，支持跨节点超热专家副本自动协商（`engines/deepseek_v4/v4_expansion.py`）。
-- **统一引擎架构（进行中）：** 将所有服务路径抽象收敛于统一的 `ModelRuntime` 接口（[`shard/node.py`](shard/node.py)），使网络能运行*任意*开源模型；模型层接入生态标准，核心壁垒（环拓扑、高效传输、投机验证）保持自研。规划见 [docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md)。
-- **远景目标 —— 超越推理：** 利用相同的无许可基础底座（节点身份、安全传输、内容寻址权重分发、去中心化验证与结算通道）承载通用算力与分布式大模型训练。
-
-## 🚀 集群部署与运行实操 (Runbook)
-
-针对在 **Vast.ai / AutoDL 租用 GPU** 或 **自有物理机** 上从零配置、组网并启动 4 卡 / 6 卡 DeepSeek-V4 集群，请直接阅读：
-👉 **[DeepSeek-V4 多机与多卡集群部署实操指南 (docs/V4_CLUSTER_DEPLOY_GUIDE.md)](docs/V4_CLUSTER_DEPLOY_GUIDE.md)**
-- 包含 Ubuntu 镜像选型、Python / CUDA / TileLang 一键安装命令；
-- 包含 4 卡单机（单机 4x 5090/4090）与多机分布式网络（Tailscale 虚拟局域网直连）逐机启动命令对照表；
-- 包含双资源池环境变量配置、协调节点发测与硬件验收套件。
-
-完整设计与执行规格见：[docs/V4_HYBRID_RUNTIME.md](docs/V4_HYBRID_RUNTIME.md) 与 [docs/ROADMAP.md](docs/ROADMAP.md)。
+上游 Shard 为 [c0mpute](https://c0mpute.ai) 的推理引擎；外部经济、支付与运营部署状态不能由本仓库代码或测试证明。上游 [技术报告](docs/paper/main.pdf) 与 [DOI](https://doi.org/10.5281/zenodo.21178430) 保留供研究引用。
 
 ## 开源协议
 
-本项目采用 [Apache License 2.0](LICENSE) 开源协议 © 2026 leyten
+采用 [Apache License 2.0](LICENSE)，保留上游 © 2026 leyten 的版权与来源。

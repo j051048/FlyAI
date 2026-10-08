@@ -1,327 +1,177 @@
-# FlyAI DeepSeek-V4 多机与多卡集群部署实操指南 (Runbook)
+# FlyAI DeepSeek-V4 多机与多卡部署指南
 
-本指南针对在 **Vast.ai、AutoDL 等云端租机平台** 或 **自有 GPU 物理机** 上部署并运行 DeepSeek-V4-Flash-0731（43层 MoE + 3个 DSpark MTP 投机块）分布式流水线推理集群，提供完整的端到端实操步骤。
+对齐代码快照 `c2ab623`（2026-10-08）。模型仍是
+`deepseek-ai/DeepSeek-V4-Flash-0731`：43 个目标层，DSpark 尾节点需要完整拥有
+40、41、42 层以及 3 个 MTP 块。本指南不代表新集群已经通过 GPU 验收。
+4×RTX 5090 ≥40、6×RTX 5090 ≥30 committed decode tok/s 仍待真实硬件验证。
 
-当前代码的配置、部署合同、认证服务与硬件验收以 [V4_NEXT_PHASE.md](V4_NEXT_PHASE.md)
-为准。下列拓扑示例需要按真实节点的校准结果调整；RAM/KV 路径尚未完成四卡／六卡
-GPU 性能验收。使用 Python 3.11 或更新版本，以及实测支持 sm120 的 CUDA PyTorch／
-TileLang 环境；旧 CUDA 12.4 安装示例不适合作为 RTX 5090 的运行时标准。
+## 1. 先准备可审核的部署合同
 
----
+当前生产路径使用 `shard-pipeline-plan/1`、完整 `model_cohort`、每个 stage 的
+签名公钥，以及 `coordinator.signer_pubkey`。所有进程必须使用同一份执行合同；
+角色、索引、层范围、cohort、用途和 expected peer 都经过双向挑战签名检查。
+私钥不放进计划、报价、收据或日志。stage 的 `SHARD_NODE_KEY` 与其计划公钥对应；
+协调器使用自己的 `--coordinator-key`，或 `SHARD_COORDINATOR_KEY` 文件路径。
 
-## 目录
-1. [硬件要求与拓扑形态](#1-硬件要求与拓扑形态)
-2. [环境准备与依赖安装（每台设备均需执行）](#2-环境准备与依赖安装每台设备均需执行)
-3. [模型权重准备与存放规范](#3-模型权重准备与存放规范)
-4. [场景 A：单机多卡环境（4卡或6卡在一台主机上）](#4-场景-a单机多卡环境4卡或6卡在一台主机上)
-5. [场景 B：跨机分布式环境（多台独立租机或局域网主机）](#5-场景-b跨机分布式环境多台独立租机或局域网主机)
-6. [发起推理与健康检查](#6-发起推理与健康检查)
-7. [常见排错与避坑指南 (FAQ)](#7-常见排错与避坑指南-faq)
+开放网络的完整流程见 [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md)：
+签名报价 → 精确校准 → prepare/commit 租约 → 已批准的本机启动模板 → 签名 warmup → READY。
+`LeasedProcessRunner` 持有常驻进程的资源，直到实际子进程退出后才确认清理。
+只看到端口可连、GPU 空闲或一份遥测报告，不等于资源已经预订。
 
----
+显存、RAM、可锁页内存、磁盘、加载峰值和共享 PCIe 必须按实际权重与运行配置计量。
+不存在“32GB RAM 自动安全承载 4–6 层”或固定每层专家字节数的通用准入保证。
+同主机的 RAM/pinned 预算合并核算；重复 GPU UUID 不能重复计容量。
+磁盘需求由实际下载文件和临时转换空间决定，不能按层数假定只需 30–50GB。
+详见 [RESOURCE_CONTRACT.md](RESOURCE_CONTRACT.md) 和 [COLOCATION_POLICY.md](COLOCATION_POLICY.md)。
 
-## 1. 硬件要求与拓扑形态
+## 2. 环境与权重
 
-### 1.1 推荐配置与动态容量准入（取消全局固定 64GB/300GB 门禁）
-系统现已全面升级为**实测容量感知的异构放置机制（Capacity-Driven Heterogeneous Placement）**。主机 RAM 与 SSD 不再受限于全局硬性门槛（64GB/300GB 降级为定价与性能档位），而是依据各节点实测可锁页内存（Pinnable RAM）与可用磁盘空间按需分配层块：
+从完整 checkout 运行，使用 Python 3.11+：
 
-- **GPU 算力要求**：
-  - 4 ~ 6 张 RTX 5090 (32GB) 或 RTX 4090 (24GB) / A100 / H100。
-- **主机内存（RAM 与 Pinnable Memory，异构自适应）**：
-  - **按层动态推导**：DeepSeek-V4-Flash 全量 43 层路由专家总权重约 137GB，单层路由专家仅占 **~3.19GB**。
-  - **瘦节点准入**：配备 32GB 内存（实测 Pinnable RAM $\ge 20\text{GB}$）的主机现在可以安全加入集群，规划器会自动为其分配 4~6 层的小层块；配备 64GB~128GB 内存的大主机则自动承载 12~15 层。
-  - **折损透明上报**：规划器会生成机器可读的 `impairment_report`，明确指出受限资源并量化由于承载较小层块给整环带来的步时影响（Step Penalty）。
-- **硬盘空间（选择性拉取，Selective Shard Pull）**：
-  - **取消全量 300GB 强制要求**：节点无需下载全量模型权重，仅需拉取自身所分层范围对应的 Safetensors 分片文件（每个分片约 3.5GB，单节点通常仅需 30GB~50GB 可用磁盘）。
-  - **完整性签名校验**：每次启动通过签名 Manifest 校验本地分片文件完整性，杜绝损坏或缺失文件。
-
-### 1.2 流水线拓扑（Fire-Forward Pipeline）
-数据流动采用单向环形/流水线拓扑，配合直接返回通道：
-```
-[Client / Coordinator]
-       │ (发送请求与 Prompt)
-       ▼
-   [Stage 0] (嵌入层 + Layer 0..10)
-       │ (单向前向传递 Hyper-Connections)
-       ▼
-   [Stage 1] (Layer 11..21)
-       │
-       ▼
-   [Stage 2] (Layer 22..32)
-       │
-       ▼
-   [Stage 3 / Tail] (Layer 33..42 + 3×MTP投机块 + LM Head)
-       │
-       └────────────────── (返回生成的 Token) ───────────────► [Coordinator]
-```
-
----
-
-## 2. 环境准备与依赖安装（每台设备均需执行）
-
-在租用的 Vast.ai 实例或自有主机（推荐操作系统 **Ubuntu 22.04 LTS**，CUDA ≥ 12.4）中执行以下命令：
-
-### 2.1 克隆仓库与创建虚拟环境
 ```bash
-# 1. 克隆代码仓库
 git clone https://github.com/j051048/FlyAI.git
 cd FlyAI
-
-# 2. 创建并激活 Python 3.10/3.11 虚拟环境
 python3 -m venv .venv
 source .venv/bin/activate
-
-# 3. 升级 pip
-pip install --upgrade pip
+python -m pip install -e ".[v4,deploy]"
 ```
 
-### 2.2 安装 PyTorch 与核心计算依赖
-根据你的 CUDA 版本安装匹配的 PyTorch（以 CUDA 12.4/12.6 为例）：
-```bash
-# 安装 PyTorch
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+项目 extras 安装共用依赖，不自动证明 CUDA PyTorch、TileLang 或驱动适合 RTX 5090。
+在实际 sm120 主机上安装已验证的 CUDA/TileLang 组合，并保存精确版本和源码 hash。
+旧 cu124 wheel、Python 3.10 或 CPU torch 都不是本指南的 RTX 5090 验收配置。
+新 host 不应通过静默 BF16/CPU 回退冒充支持原始 FP4 内核。
 
-# 安装基础运行依赖
-pip install safetensors huggingface_hub transformers accelerate pytest
+V4 Stage 使用原生 reference 命名/分片格式，例如转换后的
+`model0-mp1.safetensors` 与原生 `ModelArgs` 配置。只有 HF 下载目录不等于可直接加载。
+转换工具位于 `vendor/deepseek_v4_ref/inference/convert.py`，其参数是
+`--hf-ckpt-path`、`--save-path`、`--n-experts`、`--model-parallel`、`--expert-dtype`；
+转换是单独的重操作，需要真实资源预算。参考版本见
+[vendor provenance](../vendor/deepseek_v4_ref/PROVENANCE.md)。
+
+冻结实际可加载的本地目录及所有权重字节：
+
+```bash
+python phase0/v4_benchmark.py inventory --dir /data/v4 --out local-identity.json
 ```
 
-### 2.3 安装 TileLang（FP4 内核支持）
-FlyAI 采用 TileLang 作为统一的 FP4 GEMM 与 MoE 算子编译器：
+单机多卡可以共享只读 checkpoint 文件，但每个 stage 的实际加载/专家/KV 池分别计预算。
+选择性下载是否可用取决于真实 checkpoint 分片映射；不要把多个 stage 的层范围直接
+等同于多个独立磁盘文件或低估共享 SSD 的并发读峰值。
+
+## 3. 校准、KV 和专家缓存
+
+RAM 专家池、缓存、KV 和查询分块是 opt-in。本段是配置示例，不是已过线配方：
+
 ```bash
-pip install tilelang
-```
-
----
-
-## 3. 模型权重准备与存放规范
-
-模型：`deepseek-ai/DeepSeek-V4-Flash-0731`（FP4 权重，约 150GB）。
-
-### 3.1 下载权重
-可在主节点或各节点统一放置在 `/root/v4` 或自定义路径（如 `/data/models/deepseek-v4`）：
-```bash
-# 示例：使用 huggingface-cli 下载
-pip install -U "huggingface_hub[cli]"
-huggingface-cli download deepseek-ai/DeepSeek-V4-Flash-0731 \
-  --local-dir /root/v4 \
-  --local-dir-use-symlinks False
-```
-
-> **提示**：如果是单机多卡（单台机器插了4张或6张卡），只需下载一份存放在 `/root/v4`，所有卡共享读取即可。
-
----
-
-## 4. 场景 A：单机多卡环境（4卡或6卡在一台主机上）
-
-如果是在 Vast.ai 上租了一台 **4×RTX 5090/4090** 的单台多卡主机，所有卡通过本机环回接口（`127.0.0.1`）通信，配置最简单且吞吐最高。
-
-### 4.1 核心环境变量设置（启用 4 卡双资源池优化）
-在启动前配置运行时参数：
-```bash
-# 启用主机内存专家池，显存内设置 32 个动态 LRU 槽位
+export V4_DIR=/data/v4
 export V4_EXPERT_PLACEMENT=ram
-export V4_EXPERT_CACHE_SLOTS=32
+export V4_EXPERT_CACHE_SLOTS=2
 export V4_EXPERT_CACHE_RESERVE_MIB=2048
-
-# 启用流水线预取与分块 Prefill
-export V4_PREFILL_QUERY_CHUNK=512
-export V4_EXPERT_PREFETCH=1
-
-# 启用运行时监控
+export V4_MOE_IN_GRAPH=0
+export V4_DSPARK_MOE=0
 export V4_RUNTIME_METRICS=1
-
-# 模型存放目录
-export V4_DIR=/root/v4
 ```
 
-### 4.2 4 卡单机启动脚本（推荐保存为 `run_4gpu_local.sh`）
-在项目根目录下创建并运行：
+`V4_EXPERT_CACHE_SLOTS` 与总字节预算二选一。每层及 MTP 的路由专家保存在本机
+pinned RAM，缓存未命中通过本机 DMA 进入 GPU；生产主路径没有 CPU 专家回退，
+也没有跨节点取专家。更完整的限制见 [V4_HYBRID_RUNTIME.md](V4_HYBRID_RUNTIME.md)。
+`V4_PREFILL_QUERY_CHUNK` 只分块注意力/Indexer 查询，保留投影、Compressor、HC、MoE
+的原数学形状。`V4_KV_PLACEMENT=layer` 的预算与 graph 限制见 [V4_NEXT_PHASE.md](V4_NEXT_PHASE.md)。
+
+按实际 stage 的边界角色添加 `--head`、`--tail`、`--dspark`，再填入已确定的参数：
+
 ```bash
-#!/bin/bash
-set -e
-
-CKPT_DIR="/root/v4"
-
-echo "=== 启动 Stage 3 (Tail 节点，层 33..43 + DSpark MTP) 位于 GPU 3 ==="
-CUDA_VISIBLE_DEVICES=3 python -m engines.deepseek_v4.v4_pipe stage \
-  --stage 3 --nstages 4 --lo 33 --hi 43 \
-  --port 29623 --dspark --dir "$CKPT_DIR" &
-PID_S3=$!
-
-echo "=== 启动 Stage 2 (层 22..33) 位于 GPU 2 ==="
-CUDA_VISIBLE_DEVICES=2 python -m engines.deepseek_v4.v4_pipe stage \
-  --stage 2 --nstages 4 --lo 22 --hi 33 \
-  --port 29622 --next 127.0.0.1:29623 --dir "$CKPT_DIR" &
-PID_S2=$!
-
-echo "=== 启动 Stage 1 (层 11..22) 位于 GPU 1 ==="
-CUDA_VISIBLE_DEVICES=1 python -m engines.deepseek_v4.v4_pipe stage \
-  --stage 1 --nstages 4 --lo 11 --hi 22 \
-  --port 29621 --next 127.0.0.1:29622 --dir "$CKPT_DIR" &
-PID_S1=$!
-
-echo "=== 启动 Stage 0 (Head 节点，层 0..11) 位于 GPU 0 ==="
-CUDA_VISIBLE_DEVICES=0 python -m engines.deepseek_v4.v4_pipe stage \
-  --stage 0 --nstages 4 --lo 0 --hi 11 \
-  --port 29610 --next 127.0.0.1:29621 --dir "$CKPT_DIR" &
-PID_S0=$!
-
-echo "所有 4 个 Stage 节点启动完成，等待组网建立连接..."
-wait $PID_S0 $PID_S1 $PID_S2 $PID_S3
+python engines/deepseek_v4/v4_resources.py measure --checkpoint /data/v4 \
+  --lo 33 --hi 43 --tail --dspark --device cuda:0 --max-seq 8192 \
+  --prefill-tokens 512 --decode-tokens 512 --output tail-observations.json
+python -m shard.host_probe --devices 0,1,2,3 --host-id rig-a --dir /data/v4 \
+  --pin-budget-mib 8192 --out rig-a-io.json
+python -m shard.deployment measured-deployment.json --out deployment-check.json
 ```
 
----
+这里的范围、长度、GPU ordinal 和 pin 数值仅展示合法参数，必须换成真实方案。
+资源观察不自动构成完整校准；host probe 只验证本次分配/并发 I/O，不保留租约。
+校准需要全部加载峰值、保留空间、来源、时间及 `runtime_config_payload`，其余必须明确未知。
 
-## 5. 场景 B：跨机分布式环境（多台独立租机或局域网主机）
+## 4. 同机与跨机数据路线
 
-如果是在 Vast.ai 租用了 **4 台独立的单卡实例**，或者使用 4 台局域网内的不同物理机，网络配置需注意以下细节。
+同机 GPU 间可用 loopback/private endpoint；跨机优先已有 libp2p sidecar、可达内网或
+经过实际测量的受控隧道。复用现有身份和 NAT 能力，不要求另装一套网络系统。
+同公网 IP 不是同物理主机的证明，也不能直接推出 zero RTT 或 hairpin 一定不可用。
+`-L`/`-R` 都可能形成合法路线；需要核对实际监听与拨号端，防止旧绑定把连接送错 stage。
 
-### 5.1 网络方案建议
-- **局域网物理机（推荐）**：各机处于同一交换机子网（如 `192.168.1.100 ~ 103`），直接配置内网 IP。
-- **跨公网/Vast.ai 多实例（强烈推荐组建虚拟局域网）**：
-  - 建议在各租机上安装 **Tailscale**（一键组网）：
-    ```bash
-    curl -fsSL https://tailscale.com/install.sh | sh
-    tailscale up
-    ```
-    组网后各机将获得 `100.x.y.z` 的内网 IP，互相 ping 通即可，无需在 Vast.ai 管理面板上做繁琐且容易出错的公网端口映射。
+生产默认允许同主机/子网的不同 GPU。host/subnet/adjacent_host 隔离是显式故障域或
+WAN 实验策略；未知身份不能伪装成不同主机。新报价加入不改正在执行的环。
+严格 V4 必须让 coordinator return 到达真正的 tail listener：当前 `--ret-relay`
+旧 ingress 桥接只保留给显式 legacy 实验，不能默降级进 strict 环。
 
-### 5.2 4 机集群角色与命令对照表（假设采用局域网 IP）
-- **Node 0 (Head 节点)**: IP `100.64.0.10`, GPU 0
-- **Node 1 (Middle 节点)**: IP `100.64.0.11`, GPU 0
-- **Node 2 (Middle 节点)**: IP `100.64.0.12`, GPU 0
-- **Node 3 (Tail 节点)**: IP `100.64.0.13`, GPU 0
+## 5. 当前生产 HTTP 入口
 
-#### 步骤 1：在 Node 3（Tail 节点）上启动
+先完成本机模板、报价、测量、注册与 controller 配置，随后运行：
+
 ```bash
-export V4_EXPERT_PLACEMENT=ram
-export V4_EXPERT_CACHE_SLOTS=32
-export V4_DIR=/root/v4
-
-python -m engines.deepseek_v4.v4_pipe stage \
-  --stage 3 \
-  --nstages 4 \
-  --lo 33 \
-  --hi 43 \
-  --bind 0.0.0.0 \
-  --port 29610 \
-  --dspark \
-  --dir /root/v4
+python engines/deepseek_v4/v4_network_service.py --config network.json \
+  --auth-file /run/private/tenants.json --host 127.0.0.1 --port 8000
 ```
 
-#### 步骤 2：在 Node 2 上启动
+`network.json` 为 `shard-open-network/1`。该路径由共享 controller 启动批准的 leased
+模板、生成 strict 计划、续租并要求真实签名 warmup。公开监听需要 TLS certificate/key。
+Bearer 文件保护 HTTP；它不是 engine Ed25519 key。READY 后多个串行环可并发服务，
+每个请求固定 backend/version；这不是 continuous batching 或持久化 HA。
+
+`v4_gateway.py --deployment` 和 `--ring-pool` 是现有环的兼容入口。在 `c2ab623` 其
+CLI loader 不注入 strict plan/controller key，故不应用来连接 strict stage。
+不要把它的 deployment 资源检查混同于新的连接身份认证。详见 [V4_GATEWAY.md](V4_GATEWAY.md)。
+
+## 6. 手工严格协议烟测
+
+下面只是使用自己已分配硬件的手工启动示例；它不自动创建/续租节点资源。
+假设校准后计划确实指定四个本机端口和示例范围，四份私钥已匹配计划：
+
 ```bash
-export V4_EXPERT_PLACEMENT=ram
-export V4_EXPERT_CACHE_SLOTS=32
-export V4_DIR=/root/v4
-
-python -m engines.deepseek_v4.v4_pipe stage \
-  --stage 2 \
-  --nstages 4 \
-  --lo 22 \
-  --hi 33 \
-  --bind 0.0.0.0 \
-  --port 29610 \
-  --next 100.64.0.13:29610 \
-  --dir /root/v4
+CUDA_VISIBLE_DEVICES=3 SHARD_NODE_KEY=/run/private/stage3.key \
+  python engines/deepseek_v4/v4_pipe.py stage --stage 3 --nstages 4 --lo 33 --hi 43 \
+  --port 29623 --dir /data/v4 --dspark --receipts --deployment-plan pipeline-plan.json
+CUDA_VISIBLE_DEVICES=2 SHARD_NODE_KEY=/run/private/stage2.key \
+  python engines/deepseek_v4/v4_pipe.py stage --stage 2 --nstages 4 --lo 22 --hi 33 \
+  --port 29622 --next 127.0.0.1:29623 --dir /data/v4 --receipts --deployment-plan pipeline-plan.json
+CUDA_VISIBLE_DEVICES=1 SHARD_NODE_KEY=/run/private/stage1.key \
+  python engines/deepseek_v4/v4_pipe.py stage --stage 1 --nstages 4 --lo 11 --hi 22 \
+  --port 29621 --next 127.0.0.1:29622 --dir /data/v4 --receipts --deployment-plan pipeline-plan.json
+CUDA_VISIBLE_DEVICES=0 SHARD_NODE_KEY=/run/private/stage0.key \
+  python engines/deepseek_v4/v4_pipe.py stage --stage 0 --nstages 4 --lo 0 --hi 11 \
+  --port 29610 --next 127.0.0.1:29621 --dir /data/v4 --receipts --deployment-plan pipeline-plan.json
 ```
 
-#### 步骤 3：在 Node 1 上启动
+各条命令在独立终端/监督器执行，或者只记录并回收自己启动的 PID；不能杀全部 GPU
+进程或 `pkill -f` 清整个矿工环境。跨机时按同一计划填真实 `--next`、端口与绑定地址，
+保留已认证/加密的数据路线，不能仅把监听暴露公网当作连接安全。
+
 ```bash
-export V4_EXPERT_PLACEMENT=ram
-export V4_EXPERT_CACHE_SLOTS=32
-export V4_DIR=/root/v4
-
-python -m engines.deepseek_v4.v4_pipe stage \
-  --stage 1 \
-  --nstages 4 \
-  --lo 11 \
-  --hi 22 \
-  --bind 0.0.0.0 \
-  --port 29610 \
-  --next 100.64.0.12:29610 \
-  --dir /root/v4
+python engines/deepseek_v4/v4_pipe.py coord --dir /data/v4 --receipts \
+  --deployment-plan pipeline-plan.json --coordinator-key /run/private/controller-receipt.key
 ```
 
-#### 步骤 4：在 Node 0（Head 节点）上启动
-```bash
-export V4_EXPERT_PLACEMENT=ram
-export V4_EXPERT_CACHE_SLOTS=32
-export V4_DIR=/root/v4
+该低层 CLI 使用 stdin NDJSON，参数名是 `jobId`、`maxNew`，不是 `max_new_tokens`。
+请求示意（nonce 替换为新随机 32 字节的 64 位十六进制，swarmId 与实际计划一致）：
 
-python -m engines.deepseek_v4.v4_pipe stage \
-  --stage 0 \
-  --nstages 4 \
-  --lo 0 \
-  --hi 11 \
-  --bind 0.0.0.0 \
-  --port 29610 \
-  --next 100.64.0.11:29610 \
-  --dir /root/v4
-```
-
----
-
-## 6. 发起推理与健康检查
-
-当所有 Stage 节点均已成功加载权重并握手连接后，可以在 **Node 0**（或任一能访问 Node 0 与 Tail 节点的机器）上启动 **协调器（Coordinator）** 发起测试。
-
-### 6.1 使用 `coord` 驱动推理
-```bash
-# 单机多卡场景：
-python -m engines.deepseek_v4.v4_pipe coord \
-  --head 127.0.0.1:29610 \
-  --tail 127.0.0.1:29623 \
-  --dir /root/v4
-
-# 多机分布式场景（例如 Node 0 和 Node 3）：
-python -m engines.deepseek_v4.v4_pipe coord \
-  --head 100.64.0.10:29610 \
-  --tail 100.64.0.13:29610 \
-  --dir /root/v4
-```
-
-### 6.2 发送测试 Prompt (输入 JSON 请求)
-协调器启动后，通过标准输入接收推理请求：
 ```json
-{"prompt": "Hello DeepSeek-V4! Explain quantum computing in 3 sentences.", "max_new_tokens": 128}
+{"jobId":"smoke-1","swarmId":"actual-ring-id","nonce":"<fresh-64-hex>","messages":[{"role":"user","content":"Briefly explain quantum computing."}],"maxNew":128,"dspark":true,"pipelined":true}
 ```
-终端将实时输出流水线处理进度、首字延迟（TTFT）以及生成的速度（tok/s）。
 
-### 6.3 运行全量硬件验收测试套件 (Phase 0 Acceptance)
-```bash
-python -m phase0.v4_acceptance
-```
-若所有检查项（Pinned Host Memory 速度、TileLang FP4 核函数、流水线拓扑校验）均输出 `[PASS]`，则表明当前硬件集群已完全达标。
+它输出 `SHARD_JOB_*` 控制记录；token 事件是提交进度计数。面向客户的文本/SSE、
+认证、取消、幂等与完整 attempt 证据使用 HTTP 服务；低层 CLI 烟测不是生产验收报告。
 
----
+## 7. 验收与排错
 
-## 7. 常见排错与避坑指南 (FAQ)
+`python -m phase0.v4_acceptance` 只运行 CPU 分析/缓存模拟，不能证明硬件过线；
+完整硬件速度验收使用下述冻结 benchmark 协议。
+实际流程是 [V4_BENCHMARK.md](V4_BENCHMARK.md) 的冻结 suite + raw receipt/parity 检查，
+再按 [V4_NEXT_PHASE.md](V4_NEXT_PHASE.md) 做独立 soak 合同。不同 warm/cold、提示词、
+cohort 或环境的数字不能拼成达标报告。
 
-### Q1: 启动时报 `ConnectionRefusedError: [Errno 111] Connection refused`？
-- **原因**：上一跳节点尚未加载完模型或未开始监听端口。
-- **解决**：DeepSeek-V4 各 Stage 加载权重约需 1~3 分钟。建议**从后向前启动**（先启动 Stage 3，再启动 Stage 2、1、0），或者设置连接超时重试环境变量：
-  ```bash
-  export V4_DIAL_RETRY_S=300
-  ```
-
-### Q2: 报错 `CUDA out of memory` (显存 OOM)？
-- **原因**：未开启主机内存双资源池，或者显存内缓存槽位设置过大。
-- **解决**：确保设置了 `export V4_EXPERT_PLACEMENT=ram`，并调小 GPU 槽位数：
-  ```bash
-  export V4_EXPERT_CACHE_SLOTS=16
-  export V4_EXPERT_CACHE_RESERVE_MIB=4096
-  ```
-
-### Q3: 报 `RuntimeError: failed to pin memory`？
-- **原因**：Linux 系统的内存锁定量配额（`ulimit -l`）过小。
-- **解决**：在终端执行提升配额：
-  ```bash
-  ulimit -l unlimited
-  ```
-
-### Q4: 跨机运行时节点卡在握手无响应？
-- **原因**：云服务器（如 Vast.ai）防火墙未放行相应端口，或 Stage 启动时默认绑定了 `127.0.0.1` 导致外部无法连接。
-- **解决**：
-  1. 启动 Stage 时务必加上 `--bind 0.0.0.0`。
-  2. 若使用 Vast.ai，优先采用 Tailscale 等内网穿透工具组网，避免公网端口映射不通的问题。
+握手错误先查完整 plan、双方 key、公钥和角色/端口；BUSY 表示已有远端 owner，不应
+强占或杀别人的任务。Connection refused 查实际下一跳是否 READY 及有界 dial 重试。
+OOM 查真实 resident/KV/cache/graph/load 峰值，而不是只改 `V4_EXPERT_PLACEMENT`。
+pin 失败查整个主机可锁页预算与实际分配；不能仅凭一次小拷贝或盲目提高 `ulimit` 保证容量。
+本轮 985 passed、3 skipped 是选定 CPU/socket 回归，不是全仓 CI 或新 GPU 集群成绩。

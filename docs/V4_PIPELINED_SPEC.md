@@ -1,11 +1,20 @@
 # V4 pipelined speculation — the async `coordinate_dspark`
 
+Historical record: 2026-08-01 design and 2026-08-02 refill addendum. Original numbers, dates, branch names and reasoning below
+are retained as that snapshot's evidence, not measurements of `c2ab623`. Current strict deployment,
+RAM/KV/HTTP/lease contracts are in [V4_CLUSTER_DEPLOY_GUIDE.md](V4_CLUSTER_DEPLOY_GUIDE.md),
+[V4_NEXT_PHASE.md](V4_NEXT_PHASE.md) and [V4_BENCHMARK.md](V4_BENCHMARK.md).
+Four RTX 5090 >=40 / six >=30 committed-decode acceptance on the current recipe remains pending.
+Historical launch snippets are not today's production commands: any intentionally reproduced
+old raw-op listener needs explicit `--legacy-protocol`; current production pins a complete signed
+plan/controller key and reaches the real tail endpoint, with no silent `ret_relay` downgrade.
+
 **The highest-ceiling structural lever for the DeepSeek-V4-Flash ring.** Turn the serial, one-chunk
 DSpark round into a *streamed* one: send the drafted block as `B+1` separate `s=1` frames back-to-back
 so the `D=6` pipeline stages fill instead of `5/6` sitting idle, and the per-token replay penalty
 disappears. This is the path from the current ~1.3 tok/s (DSpark ties greedy) to a projected **10–20
 tok/s single-stream**. Designed 2026-08-01. Gated on — and unblocked by — the W-deep speculative
-rollback proven in `phase0/v4_stage.py` (`_spec_ckpts`/`_seek`) and
+rollback proven in `engines/deepseek_v4/v4_stage.py` (`_spec_ckpts`/`_seek`) and
 `tests/test_v4_stage.py::test_multi_deep_rollback_across_boundaries`.
 
 This document is the design + throughput projection + effort estimate. The correctness proof it depends
@@ -15,7 +24,8 @@ on is already landed and green; see "The gate, and why it is green" below.
 
 ## 1. The ceiling we are hitting
 
-`coordinate_dspark` today (`phase0/v4_pipe.py:1208`) is a synchronous propose→verify→commit loop:
+`coordinate_dspark` in that snapshot (then `phase0/v4_pipe.py:1208`, now moved to
+`engines/deepseek_v4/v4_pipe.py`) was a synchronous propose→verify→commit loop:
 
 ```
 reset(spec+dspark) → prefill → { send [cur]+drafts as ONE chunk ; WAIT for the reply ;
@@ -31,7 +41,8 @@ block moves*, not of the model:
    serial on top of that.
 
 2. **The block travels as ONE frame and each stage replays it token-by-token** (`v4_stage.py` `forward`,
-   the `start_pos>0 and s>1` branch loops per position — `phase0/v4_stage.py:538-542` region). A
+   the `start_pos>0 and s>1` branch loops per position — historical `phase0/v4_stage.py:538-542`,
+   now moved to `engines/deepseek_v4/v4_stage.py`). A
    `K`-token block costs `K` sequential per-token stage computes *at every stage*. This is the
    "replay penalty," and it is **why DSpark (1.34 effective tok/s) merely ties greedy (1.43)**: the
    drafter's `g` is spent paying for the serial replay, so speculation buys nothing.
@@ -69,7 +80,7 @@ now `B+1` frames are in flight when a rejection is detected, not one chunk.
 ## 3. The gate, and why it is green
 
 The whole lever was blocked on one correctness question, because the speculative rollback rests on an
-invariant with **zero margin** (`phase0/v4_stage.py` `_snapshot` docstring): the compressed KV regions
+invariant with **zero margin** (`engines/deepseek_v4/v4_stage.py` `_snapshot` docstring): the compressed KV regions
 (`kv_cache[:, win:]` and `Indexer.kv_cache`) are deliberately **not** snapshotted, on the argument that
 a slot a rejected frame poisoned is *always rewritten before its first read*. Bounded to one chunk
 today, a W-deep rollback crossing a `ratio`-block **compression boundary** could have violated it and
@@ -243,7 +254,7 @@ step even before the WAN round-trip it also removes from the critical path.**
 - **`τ = 26ms` is itself a target**, contingent on the grouped-MoE kernel + CUDA graphs landing on V4;
   `40ms` graphed is the nearer-term figure and still yields 10–12.5 tok/s.
 
-## 7. Effort estimate
+## 7. Historical pre-implementation effort estimate
 
 | piece | status / effort |
 |---|---|
@@ -254,7 +265,7 @@ step even before the WAN round-trip it also removes from the critical path.**
 | Wire protocol | epoch on every frame/reply; the tail's cur-frame reply already carries `draft` (reused). |
 | Real-ring measurement | required before trusting §5 — `a`, `L` vs `τ`, and the achieved `τ`. |
 
-## 8. GO / NO-GO
+## 8. Historical build decision
 
 **GO to build.** The correctness gate — the only thing that could have made this unsafe — is proven
 green: multi-deep rollback is bit-exact across compression boundaries, and the mutation-check shows the
@@ -381,7 +392,7 @@ every mid-run one. `V4_REFILL_FLOOR` (coordinator lever, default 1 = the drain-o
 frame) consumes a reply's block at or below the named in-flight level, streaming only positions past
 the deepest frame in flight; `floor = B` pins in-flight at `block+1`. Priced at **+11..+45%** on the
 07-31 ring, the spread hanging on the per-depth acceptance decay — see
-`docs/V4_MULTIBLOCK_VERDICT.md` §4's correction and `phase0/v4_ngram_econ.py`. Three prices travel
+`docs/V4_MULTIBLOCK_VERDICT.md` §4's correction and `engines/deepseek_v4/v4_ngram_econ.py`. Three prices travel
 with it, all instrumented rather than assumed: a mid-run block's deep drafts condition on its own
 prefix, not the in-flight frames (`topup_agree/topup_disagree`, and topped-up frames scored apart in
 `topup_accept_by_depth`); the family is non-monotone at the low end (floor=2 can price below
@@ -392,8 +403,9 @@ defeated at `floor >= B`, with the bill visible as `drafts_issued` against `fram
 
 ### 9.6 Remaining risk for a real-ring run
 
-1. **`a` and `L` are still unmeasured** (§6, unchanged). This build removes the confound; it does not
-   answer the question.
+1. **At this design snapshot `a` and `L` remained unmeasured** (§6). Later repository
+   measurements apply to their own dated configurations; neither a CPU test nor old estimates
+   replace fresh measurements for the current deployment.
 2. **Backpressure is untested at WAN scale.** The coordinator's frames are token ids (tens of bytes) so
    its sends cannot realistically block, but the *ring* now carries `B+1` frames of `4 × dim` activation
    where it carried one chunk. Bytes/token are unchanged; bytes in flight are not.
@@ -405,3 +417,13 @@ defeated at `floor >= B`, with the bill visible as `drafts_issued` against `fram
    topology it can only be removed with an out-of-band cancel path (§9.3).
 5. **Single sequence.** The tail's reply protocol is row 0's, as in the serial path; batching still needs
    the ragged accept path first.
+
+## Current connection wrapper versus the historical numerical frame
+
+`c2ab623` adds authenticated `shard-pipeline-session/1` around these numerical payloads.
+HELLO binds both pinned keys, ring/cohort, roles, spans and purpose; the signed head owner grant
+binds forward/return, TTL and fencing. The existing speculation `epoch` is a separate cancel
+fence inside a job. HTTP serving also binds job/swarm/nonce and verifies one final attempt's
+complete receipt chain. The old frame-field table above is not the entire current outer protocol.
+Use the strict plan/key entrypoints linked above; legacy byte-identical comparisons refer to the
+historical low-level API and do not establish authenticated ownership of a new production ring.

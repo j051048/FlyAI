@@ -1,5 +1,12 @@
 # Honest reasoning-ON baseline (n-gram only) — 2026-06-29
 
+> Historical run report — reviewed 2026-10-08. Original results, failures, identifiers and
+> commands retain their recorded date and configuration; this update does not rerun or recertify them.
+> Signatures bind the recorded activation commitments, freshness and layer coverage, rather than
+> proving every participant computed honestly or that an external payment completed.
+> Current interpretation: [proof scope](../PROOF.md), [documentation index](../DOCUMENTATION_INDEX.md).
+> Current GPT-OSS/V4 deployment and numerical/measurement gates differ from these M2.5 runs.
+
 Scattered 6-box EU ring (FR-SE2-GB-CZ-SE-NO, libp2p), single-stream, REASONING ON, K=8 depth=4,
 n-gram drafter only. research/m25_honest_bench.py. NO copy-repetition, NO think-skip.
 

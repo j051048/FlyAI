@@ -1,6 +1,16 @@
 # WAN-optimal speculative decoding
 
-*Research track. Status: active (2026-06-16). This is a design record — the
+> Historical research record — reviewed 2026-10-08 against `c2ab623`.
+> Original dates, measured values, projections, later addenda and historical commands are preserved.
+> “Active”, “next” and implementation gaps below describe the recorded experiment, not the current backlog.
+> Current placement/serving contracts: [open network](../OPEN_INFERENCE_NETWORK.md),
+> [GPT-OSS operations](../GPT_OSS_PRODUCTION.md), [V4 acceptance](../V4_BENCHMARK.md),
+> and [documentation index](../DOCUMENTATION_INDEX.md).
+> Old `verify/recv` timings combine network, queue and compute; they are not independent RTT probes.
+> Historical GPT-OSS gain/full-accept/resume accounting is not the current committed-token metric.
+> Current same-K adaptive depth and separately costed mixed-K experiments need new raw measurements.
+
+*Historical research track. Recorded status: active (2026-06-16). This is a design record — the
 evidence that motivated it and the plan it justifies, in the spirit of an RFC.*
 
 ## Why this track exists

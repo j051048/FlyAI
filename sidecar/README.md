@@ -1,70 +1,67 @@
-# sidecar — shard's libp2p transport daemon
+# sidecar — Shard's libp2p transport daemon
 
-A Go (`go-libp2p`) daemon that runs next to the Python engine on every node. It owns the
-node's keypair identity (an ed25519 key → libp2p PeerId) and moves activation frames
-between adjacent pipeline stages over authenticated, encrypted libp2p streams. Per the
-boundary law ([../docs/INTEGRATION.md](../docs/INTEGRATION.md)) it knows only **peers and
-bytes** — nothing about `$ZERO`, accounts, payments, or the orchestrator.
-
-It's a single static binary (no CGO), so we build once and `scp` it to any linux/amd64
-node — a node needs no Go toolchain to run it.
+Aligned with the repository on 2026-10-08. The Go `go-libp2p` daemon runs beside the Python engine, owns its Ed25519 PeerId identity and moves activation frames over authenticated, encrypted peer streams. It handles peers and bytes, not accounts, payments or model math. See the current [integration boundary](../docs/INTEGRATION.md).
 
 ## Build
 
+`go.mod` currently declares Go **1.25.7** and `go-libp2p v0.48.0`; use that file and `go.sum` as the dependency source of truth. `GOTOOLCHAIN=auto` may obtain a required toolchain when the installed Go is older. Pin the actual build/toolchain and retain the binary digest for deployment; the minimum Go directive alone is not a binary provenance proof.
+
+POSIX-shell example for a static Linux/amd64 binary:
+
 ```sh
 cd sidecar
-GOTOOLCHAIN=auto GOPROXY=https://goproxy.cn,https://goproxy.io,direct go build -o /tmp/sidecar .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=auto go build -trimpath -o sidecar .
 ```
 
-Two load-bearing build pins (in the spirit of `phase0/setup_box.sh`'s `kernels` pin):
+A node running that binary does not need Go installed. Match the target OS/architecture; this is not a universal binary for all hosts. Configure an appropriate Go module proxy in your own environment if default resolution is unavailable; old mirror reachability notes are not current availability guarantees.
 
-- **Go `1.25.7` + `go-libp2p v0.48.0`** — `go.mod` is the source of truth. A local Go ≥1.22
-  with `GOTOOLCHAIN=auto` fetches the pinned 1.25.7 toolchain by itself; it just needs a
-  proxy that serves toolchains (`goproxy.cn` does, `goproxy.io` does not — hence the order
-  above; a plain `apt`/tarball Go ≥1.25 also works with any proxy).
-- **`GOPROXY` fallback list** — `proxy.golang.org` returns `403` on some module zips
-  (and Go only falls back to `direct` on `404`, not `403`), which stalls the whole resolve.
-  The mirrors above serve them fine.
+## Engine tunnels and ring authorization
 
-## Run as a tunnel (how the engine uses it)
-
-The sidecar is a transparent TCP↔libp2p tunnel. Pin the libp2p port to the node's
-public-mapped port; the engine then dials/listens on localhost and the sidecar carries
-each connection to/from the right ring neighbour:
+The interface is **localhost TCP↔libp2p**, not Unix socket/gRPC. Pin the public-mapped libp2p listen port and keep Python engine/tunnel endpoints loopback where that is the intended isolation boundary.
 
 ```sh
-# a stage: accept inbound streams -> the local engine, and carry the engine's
-# next-hop connection to the downstream peer over libp2p
-sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/29600 \
-        -inbound 127.0.0.1:29610 \
-        -forward 127.0.0.1:29611=/ip4/<peer_ip>/tcp/<peer_port>/p2p/<peer_id> \
-        -allow <predecessor_peer_id>
+./sidecar -key /path/to/node.key -listen /ip4/0.0.0.0/tcp/29600 \
+  -inbound 127.0.0.1:29610 \
+  -forward 127.0.0.1:29611=/ip4/PEER_IP/tcp/PEER_PORT/p2p/PEER_ID \
+  -allow PREDECESSOR_PEER_ID
 ```
 
-Tunnel hardening flags:
+Replace the uppercase address/identity placeholders with actual deployment values. `-forward` is repeatable and accepts `localAddr=peerMultiaddr[,peerMultiaddr...]`: supply direct and relay-circuit candidate addresses when needed. Releases predating comma-list support cannot be substituted into such a deployment.
 
-- `-allow PEERID` (repeatable) — only these (Noise-authenticated) PeerIds may open
-  inbound activation streams; anyone else is reset before the engine is dialed.
-  No `-allow` flags = open (legacy).
-- `-frame-timeout N` — absolute per-frame deadline in seconds (default 60): once a
-  frame's first prefix byte arrives, the whole frame must complete within N or the
-  tunnel closes (slow-loris guard). Pre-frame idle is unlimited. `0` = legacy raw pipe.
+| Flag | Actual behavior |
+|---|---|
+| `-key PATH` | Persist/reuse the node key and PeerId; keep the file private and out of source control |
+| `-allow PEERID` (repeatable) | Only listed authenticated peers may open inbound activation streams; no flags retains open legacy mode |
+| `-frame-timeout N` | Per-frame absolute completion deadline from its first prefix byte, default 60 s; pre-frame idle is unbounded; `0` enables legacy raw piping |
+| `-announce MULTIADDR` | Advertise a configured public address before automatically detected addresses |
+| `-quic` | Add a corresponding QUIC/UDP listener; requires actual UDP reachability |
+| `-relay` | Run a circuit-relay-v2 service on a suitable public host |
+| `-relays ADDR,ADDR` | Use configured relay peers; reservation/advertised circuit routes support NAT'd nodes |
+| `-dht-bootstrap ADDR` (repeatable) | Configure the shard content-routing DHT bootstrap peers |
+| `-seed manifest.json=modelDir` | Announce and serve manifest shards via the DHT/block-fetch path |
+| `-fetch-cid CID`, `-fetch-out PATH` | One-shot content fetch; `-fetch-size` and `-fetch-timeout` bound its expected bytes and deadline |
+| `-prove CHALLENGE`, `-verify peerid,nonce,b64sig` | Identity ownership proof helpers, not compute/hardware attestations |
 
-The engine runs unchanged except one import: `import wire` → `import shard.transport as
-wire` (see `../shard/transport.py`). Proven: gpt-oss-120B across 4 scattered boxes over
-libp2p, no `SHARD_PSK`, bit-identical to the trusted-wire receipt
-(`../docs/receipts/gpt-oss-120b-libp2p-20260619.json`).
+NAT port mapping, hole punching and relay mechanisms are implemented. They do not guarantee a direct path through every CGNAT or arbitrary firewall. Inspect actual dialable addresses, relay/direct connection logs and route measurements. The application must also authorize the expected coordinator/predecessor/return roles; public contributor registration is compatible with restricted membership of an assigned ring.
 
-## Self-test — identity + connect-by-key + round-trip (connectivity check)
+## Encryption and message contracts
+
+libp2p provides peer authentication and link encryption (Noise/TLS transport configuration). Python uses `shard.transport`'s length-prefixed JSON headers and raw tensor blobs. The raw TCP `phase0/wire.py` PSK mode remains an explicit alternative; a libp2p ring does not need one shared `SHARD_PSK`.
+
+This transport authenticates bytes and the remote peer, not model correctness. Local plaintext socket access is part of the node's local trust boundary. The new strict GPT-OSS/V4 pipeline sessions additionally bind plan, signer, nonce, role, range and owner fence. M2.5 retains its own compatibility greetings; swapping an import alone does not upgrade every engine to that strict session protocol.
+
+## Connectivity self-test
 
 ```sh
-# terminal A (listener): prints its PeerId + dialable multiaddr, writes the addr to a file
-/tmp/sidecar -key /tmp/a.key -addrfile /tmp/addrA
+# Terminal A: persists one identity and writes a dialable address.
 
-# terminal B (dialer): connects by key, round-trips a 2 MiB activation-sized frame
-/tmp/sidecar -key /tmp/b.key -peer "$(cat /tmp/addrA)" -size 2097152
-# -> ROUND-TRIP OK: 2097152 bytes echoed by <A's PeerId> ...
+./sidecar -key /tmp/a.key -addrfile /tmp/addrA
+
+# Terminal B: separate identity, one 2 MiB framed round trip.
+
+./sidecar -key /tmp/b.key -peer "$(cat /tmp/addrA)" -size 2097152
 ```
 
-`ROUND-TRIP OK` with two distinct PeerIds = the transport is up, authenticated by key, and
-intact. No `SHARD_PSK` anywhere.
+The output `ROUND-TRIP OK` proves connectivity and frame round-trip for that test. It does not establish WAN geography, NAT success on another host, GPU execution or throughput.
+
+The [2026-06-19 GPT-OSS libp2p record](../docs/receipts/gpt-oss-120b-libp2p-20260619.json) retains the historical raw-TCP/libp2p numerical comparison. It is not a new hardware result for the current binary or strict service. Publisher manifest verification and full model/receipt controls belong to their separate [evidence contracts](../docs/PROOF.md).

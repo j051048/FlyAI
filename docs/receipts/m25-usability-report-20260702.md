@@ -1,5 +1,12 @@
 # MiniMax-M2.5 sharded engine — usability ceiling report (2026-07-02)
 
+> Historical run report — reviewed 2026-10-08. Original results, failures, identifiers and
+> commands retain their recorded date and configuration; this update does not rerun or recertify them.
+> Signatures bind the recorded activation commitments, freshness and layer coverage, rather than
+> proving every participant computed honestly or that an external payment completed.
+> Current interpretation: [proof scope](../PROOF.md), [documentation index](../DOCUMENTATION_INDEX.md).
+> Current GPT-OSS/V4 deployment and numerical/measurement gates differ from these M2.5 runs.
+
 Single-stream, **reasoning ON**, greedy, lossless (signed receipts). Scattered 6×RTX-5090 EU ring over libp2p: **Hungary → Italy → Norway → Denmark → Czechia → Bulgaria** (one stage per /24 subnet + machine; 62 layers split ~10/stage). fp8 activations on the wire. K=8, depth=4. Two drafter arms on the **same warm ring**: chain-EAGLE vs tree-hybrid (best-first EAGLE tree, M=12).
 
 > **Honest framing — read first.** These are *this ring's* numbers, and it is a **middling rental draw**: chain reason-math here = 4.0 tok/s at g≈3.6, versus **11.8 tok/s at the same g≈3.7 on a good ring (2026-06-30)**. tok/s = g × traversal-rate, so at equal accept the ~3× spread is pure ring quality (RTT/jitter), not the engine. The portable, ring-independent signal is **g (accepted tokens per WAN round-trip)**; absolute tok/s scales with the ring. Projected onto a good ring, the reasoning cells land ~**10–14 tok/s**. We do not yet have a good-draw run for the headline absolute number — that needs RTT-ordered provisioning (next).

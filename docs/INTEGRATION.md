@@ -1,245 +1,76 @@
-# Shard × c0mpute — the done-right architecture
+# Integration boundaries: engine, control plane and external networks
 
-*The build spec for taking a hand-deployed swarm to a permissionless one, with no rip-out
-debt. This is the internal engineering contract; [NETWORK.md](NETWORK.md) is the public
-narrative. (Supersedes the transport/scheduler/integration sections of the older
-[ARCHITECTURE.md](ARCHITECTURE.md), which predates the proven stack — SGLang→transformers,
-aioquic→libp2p, shared PSK→per-node keys.) Betanet target: **MiniMax-M2.5 on scattered consumer
-5090s** — the proof-of-concept for sharded inference; the engine runs any model behind one
-`ModelRuntime` interface ([MODEL_RUNTIME.md](MODEL_RUNTIME.md)), so the catalog widens from there.*
+Aligned with `c2ab623`, 2026-10-08. FlyAI is a fork of the upstream Shard engine used by c0mpute. This document describes the code in this repository; external worker releases, billing and payment deployments need their own evidence. Current operations are documented in [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md), [GPT_OSS_PRODUCTION.md](GPT_OSS_PRODUCTION.md) and [V4_NEXT_PHASE.md](V4_NEXT_PHASE.md).
 
----
+## Dependency boundary
 
-## 0. The law
+The engine must not depend on c0mpute accounts, USDC, pricing, stake or payment APIs. A separate network may consume its public node offers, assignments, measurements and receipts. This repository now includes a reusable reference registration/control/service implementation; saying that all registration, scheduling and routing live only in c0mpute is obsolete.
 
-> **Dependencies point one way: `c0mpute → shard`, never the reverse.**
+| Repository component | Responsibility |
+|---|---|
+| `shard/offers.py` | Open signed offers, exact model cohorts, sequence and TTL validation |
+| `shard/locality.py`, `planning_cost.py`, `plan.py`, `topology.py` | Sparse measured routes, locality tiers, resource-aware layer assignment and finite-workload cost predictions |
+| `shard/control_plane.py` | Offer registry and identity-authenticated node resource RPC; configured controller orchestration |
+| `shard/leases.py`, `leased_runtime.py` | Durable local quotas/fencing and the actual resident engine process lifetime |
+| `shard/pipeline_plan.py`, `pipeline_session.py` | Strict assignment and nonce-signed drive/forward/return sessions |
+| `shard/ring_pool.py`, `ring_router.py`, `service_queue.py`, `http_gateway.py` | Ready-ring routing, per-ring serial work, bounded tenant admission, HTTP/SSE and cancellation |
+| Model engines/adapters | Actual loading, kernels, KV state, token rendering and runtime-specific receipts |
+| External integrations | Accounts, money, invoices, reputation policy, actual settlement and deployment distribution |
 
-Shard is a pure engine: given a model and a set of peers, it swarms them to serve tokens
-fast, with content-verified shards and per-node verifiable receipts. Shard knows **nothing**
-about `$ZERO`, `privy_id`, USDC, payments, reputation, or the orchestrator. If shard ever
-imports a c0mpute concept, the boundary leaked — and that's the rip-out debt we refuse.
+The common `ModelRuntime` interface is still a migration direction, not proof that an arbitrary model runs unchanged. Model-specific kernel and state contracts remain distinct.
 
-This isn't tidiness. It's the proof of permissionlessness: an engine that doesn't depend on
-the network's permission system can run under *any* network. **Shard is BitTorrent the
-protocol; c0mpute is the swarm that speaks it.**
+## Identity and transport
 
-Every "which repo?" is answered by this rule. Runs on a contributor's GPU → shard. Network
-brain (identity, money, reputation, tracker, catalog) → c0mpute. The wire between them → a
-protocol contract, defined here, named on both sides.
+Nodes reuse their existing Ed25519 libp2p identity. Offers are signed by that identity; an account system may independently prove and store ownership. There is no account requirement or operator whitelist for registering a valid offer. Execution still requires supported model/runtime, measured capacity, reachable routes and a live committed lease.
 
----
+The [Go sidecar](../sidecar/README.md) exposes localhost TCP tunnels, not a new Python Unix-socket/gRPC interface. It owns libp2p peer authentication, link encryption, optional QUIC, relay reservation/hole punching, and a dedicated DHT/block-fetch path. Activation traffic uses point-to-point streams. Each production ring authorizes its intended neighbors; omitting `-allow` retains the sidecar's open legacy mode and is not the recommended ring policy.
 
-## 1. The two halves
+`shard.transport` handles JSON headers and raw tensor blobs over that local connection. Raw TCP through `phase0/wire.py` with a shared `SHARD_PSK` remains explicit compatibility. Neither link encryption nor an authenticated peer proves correct model execution, and local engine/sidecar endpoints must stay in their intended trust boundary.
 
-**shard (the engine — what a contributor installs):**
-- The inference engine (pipeline split + speculative decoding + pipelining — proven: ~40
-  tok/s gpt-oss-120B, ~30 tok/s GLM-5.2 744B over WAN).
-- The **node-agent**: loads its assigned layer block, joins the ring, runs the block,
-  forwards activations, emits signed per-batch receipts.
-- The **transport sidecar** (libp2p) and the **layer-block challenge** primitive.
+## Model identity: two different manifests
 
-**c0mpute (the network brain):**
-- The **tracker** (orchestrator): node pool, registration, job routing.
-- The **scheduler**: forms swarms from the pool (the assignment protocol).
-- The **latency graph**, the **swarm registry**, the **reputation** system, the **economy**
-  (per-node payment), the **MODEL_CATALOG**.
+**Signed publisher manifest / assigned block fetch.** The existing `shard.manifest` and `shard.fetch` path uses content IDs, independently pinned publisher keys, expected model/layer metadata and monotonic manifest versions. `mf1:<name>@<cid>` pins canonical bytes; the name is advisory. Peers or mirrors can provide untrusted bytes, which are checked against the trusted manifest. The pin must come from trusted distribution/configuration, not the same untrusted assignment being checked.
 
-**The contract:** the protocol messages in §7–§8. Implemented on both sides; owned by neither.
+**GPT-OSS complete HF download inventory.** `phase0/get_model.py` resolves one immutable HF commit, verifies size plus upstream SHA256/Git-blob digest, resumes through `.part`, and installs verified files atomically. `.shard-download.json` binds repo, revision and the full file digest list; it is a local content manifest, not a publisher signature. Root loader overrides and unverified index targets are rejected, while unreferenced nested backups may remain.
 
----
+The public recipe is `verify_inventory(model_dir, verify_files=True)` followed by `build_cohort_from_inventory(verified)`. Serialized JSON, a stored PASS boolean and safetensors config/index/header metadata cannot substitute for actual complete payload hashing. The resulting full `ModelCohort` binds checkpoint/config identities, quantization, runtime ABI, wire version, numerical contract and layer count; `cohort_id` hashes that exact descriptor. Offers and sessions sign their use of it, not its hardware or publisher authenticity.
 
-## 2. Identity (kills the shared PSK)
+The current strict GPT-OSS stage and coordinator require every file listed in the complete download inventory to be present locally and verified. A stage loads only its assigned layers into GPU memory, but its disk directory is a complete verified snapshot. Generic block-range fetching is a separate path; partial inventories are not implemented for this strict entry.
 
-Today every node shares one `SHARD_PSK`. That's replaced by **per-node keys**:
+GPT-OSS supports `gpt-oss-hf/1`, `shard-pipeline-session/1`, `greedy-native-mxfp4/1` and `mxfp4`. Production load also checks actual raw config bytes and full local files. Native quantization guards prevent Transformers fallback before conversion and validate packed weights/scales afterward; their storage-layout result does not certify GPU math or speed.
 
-- Each node generates a **libp2p keypair → PeerId** (stable network identity). This lives in
-  shard — it's the engine's identity, nothing c0mpute-specific.
-- **Binding to a c0mpute account:** at registration the node signs a challenge proving
-  control of *both* its PeerId and its `cwt_`/`privy_id`. c0mpute records the binding. The
-  node-agent only ever exposes "here is my PeerId + a signature"; c0mpute does the binding.
-  Law preserved.
+## Planning, admission and resource lifetime
 
-Result: authentication is per-node and cryptographic; `SHARD_PSK` retires.
+Search near-neighbor and same-region candidates first, expanding when they cannot fit. Compare a few strong cards with strong-plus-weak combinations using stage compute, actual payload routes, finite in-flight feedback, acceptance/discard assumptions and resource budgets. Fewer hops alone does not establish the faster plan; weak stages can set the pipeline floor.
 
----
+Layer assignment uses actual supported calibrated spans and roles. Trace identity binds node/GPU/cohort/runtime, layer range, frame size, context, warmness, time and TTL. Unknown/unbound measurements cannot make a node fast. Header storage is a physical floor, not allocator/load/graph peak. All planner results remain scoped predictions until measured on the actual ring.
 
-## 3. Transport — libp2p via sidecar
+Distinct GPU UUIDs can share a physical host. Aggregate RAM and pin quotas use an explicit memory domain and one local ledger; a shared public IP is only a discovery clue. Optional host/subnet isolation and request-specific trust preferences do not turn registration into a trusted-operator whitelist. Unknown budgets fail closed for requirements needing them.
 
-A mature **Go/Rust libp2p daemon runs as a sidecar** on each node; the Python engine talks
-to it over a local Unix socket / gRPC (local hop ≈ 0.1 ms, nothing against a WAN ring).
+Node-local authenticated RPC prepares and commits a lease bound to ring, cohort, node, GPU, resources, expiry and increasing fence. Remote controllers may select locally configured executable templates; they cannot supply arbitrary argv/environment or claim a caller identity in request data. Loading and idle resident weights count as work. Expiry/revocation refuses new work, stops the owned runtime and retains allocation until the old work/process is confirmed cleaned up.
 
-What we use libp2p for:
-- **Noise/TLS encryption + QUIC** on every link.
-- **NAT traversal** — AutoNAT detects reachability, **DCUtR hole-punching**, **circuit-relay-v2**
-  fallback for hard NATs. *This is the whole point — home GPUs behind NAT are the thesis.*
-- **Kademlia DHT** for peer discovery + content routing.
-- **Direct streams** for the activation hot-path between adjacent ring stages. Gossipsub is
-  for control/discovery only — **never on the hot path.**
+`shard.managed_launch` is a manual process helper with durable pre-spawn reservation and explicit orphan recovery. It confirms owned process termination before clearing records and protects against PID reuse. It does not reserve GPU/RAM and cannot replace the node lease contract.
 
-The sidecar replaces `phase0/wire.py`'s role (PSK-authenticated TCP). The sidecar owns
-connection + NAT; the engine streams activation bytes through it.
+## Request and service contract
 
----
+The strict plan fixes full contiguous layer coverage, actual stage/coordinator endpoints and signing identities. Nonce challenge signatures bind plan, role, index, range and channel purpose. Owner/fencing metadata prevents an old coordinator or frame being relabeled into a new session. Expected return listeners and bounded first-frame/reconnect waits are part of that contract.
 
-## 4. Model propagation — content-addressed
+Strict production services are `engines/gpt_oss/network_service.py` and `engines/deepseek_v4/v4_network_service.py`. The older V4 gateway is a compatibility interface. M2.5 has its own legacy swarm-token/receipt protocol; the new session ABI is not silently imposed on it.
 
-A node only needs *its* block, so it only fetches a fraction of the model.
+V4/GPT-OSS share authenticated HTTP/SSE with per-tenant quotas and job visibility. Public listening requires TLS; default listening is loopback. API keys, coordinator keys, HF tokens and sealed-ID secrets belong in protected local files. The coordinator key path must match the plan identity. Deployment sends environment through SSH stdin rather than command values.
 
-- **Manifest** (signed JSON): `{model_id, layer_count, tokenizer, arch, shards:[{shard_id,
-  sha256, size}], publisher_pubkey, signature}`.
-- A node fetches its shards from **any provider** via libp2p content routing and **verifies
-  each chunk against the manifest hash** on arrival. A malicious peer physically cannot feed
-  you corrupted weights.
-- **Catalog:** c0mpute's `MODEL_CATALOG` holds a pointer to the manifest (CID/URL +
-  publisher pubkey). Adding a model = publish a manifest + add a catalog entry.
+A ring executes one job at a time; multiple ready rings can run in parallel. Idempotency, queue/history and retained SSE prefixes are in memory. Cancellation/deadlines abort owned work, and permitted same-ring retries re-prefill the committed prefix. Durable job/coordinator HA and migration to arbitrary replacement rings are not implemented. Warmup and completion require valid final receipts and live leases; streamed prefixes are provisional until final validation.
 
-**Manifest resolution (the ref seam, decided 2026-07-20):** the assignment carries
-`manifestRef = mf1:<name>@<cid>` — the CID (of the signed canonical manifest bytes, same
-`cidv1_raw` scheme as shard_ids) is normative, the name advisory. Trust splits into two
-required, independent layers: the **CID pins WHICH manifest** (substitution/rollback among
-validly-signed manifests dies on bytes, before parsing) and the **pinned publisher signature
-pins WHO published it** (`verify_manifest(expected_pubkey)`; the pin is a constant baked into
-the daemon's distribution, mirrored in these docs — NEVER carried by the assign channel it
-guards). `shard.fetch --manifest-cid <ref> --pubkey <pin> --expect-model-id/--expect-layer-count`
-enforces all gates in the engine, fail-closed; the control plane's checks are early-loud-failure
-hygiene, never the trust boundary. Manifests carry a signed monotonic `version` (resolvers
-refuse a decrease). Delivery is any untrusted transport (at launch: a static HTTPS file on the
-orchestrator origin — the ~100KB doc doesn't need the peer path the 115GB of weights use).
-This seam protects HONEST nodes from a poisoned supply chain; a malicious node can load
-anything — that stays receipts/auditor/reputation territory (§6).
+## Receipts, privacy and external settlement
 
-**Propagation seam:** the source is pluggable. Now → a seed **mirror is just the first
-provider**. Later → peers announce the shards they hold and **P2P takes over** — additive,
-zero rework, because the fetch was content-verified from day one.
+Stage signatures authenticate declared activation roots, role/range, job identity and nonce. Verifiers check pinned signers, coverage and adjacency. They do not prove physical GPUs, source execution or all model operations. GPT-OSS's current production verifier requires distinct stage receipt signers; reusable host PeerId/GPU offer identities alone do not remove that receipt constraint.
 
----
+`phase0/activation_proof.py` and `fraud_proof.py` are local replay/commitment helpers. A trusted adjudicator must independently recover pinned weights, backend, architecture and exact KV/position state. Their recommendations explicitly do not execute escrow or on-chain penalties. Historical payment notes describe an external integration, not automatic settlement provided here. See [PROOF.md](PROOF.md).
 
-## 5. The swarm engine (shard — proven)
+Inference nodes see activations. V4 sealed IDs restrict raw IDs and token hints to designated head/hash/tail recipients, while keyless middle stages forward an opaque envelope. This does not hide activations or protect from the privileged operator of a shared host. Staked boundary preference is a policy choice, not cryptographic confidentiality. GPT-OSS authentication does not provide the V4 sealed-ID mechanism.
 
-A model is a stack of layers split into contiguous blocks, one block per GPU; activations
-stream through in a ring. A **coordinator** holds no layers, runs a small draft, and drives
-**speculative decoding** (draft proposes K tokens → distributed model verifies all in one
-ring traversal → greedy commit), with **pipelining** (many traversals in flight). The
-node-agent's job per swarm: load its block, link its ring neighbors via the sidecar, run the
-block, forward activations, **sign a receipt per batch**.
+## Evidence and remaining work
 
----
+Historical [GPT-OSS 2026-06-19](receipts/gpt-oss-120b-wan-20260619.json) and [GLM 2026-06-18](receipts/glm52-nvfp4-wan-20260618.json) reports retain approximately 40 and 30 tok/s respectively. Historical [V4 2026-08-02](receipts/v4-flash-matrix-20260802.json) reports 30.15 tok/s with same-ring token comparisons. None certifies the current strict services or new cache/KV paths.
 
-## 6. Receipts + verification (the canary, upgraded for swarms)
-
-c0mpute's current anti-cheat is a whole-model canary: send a math+nonce prompt, check the
-answer. **It cannot probe a stage-node** — a node holding layers 12–23 never sees a prompt,
-it transforms an activation tensor. Swarms need two new things, and they split cleanly across
-the law:
-
-**(a) Signed receipts (shard emits, c0mpute consumes).** Each stage node signs
-`{swarm_id, job_id, batch_id, layer_range, in_hash, out_hash}` with its node key. The
-coordinator collects receipts and submits them on `job:complete`. Payment integrity falls
-out for free: c0mpute pays each node per its signed receipts; the coordinator **can't
-fabricate** a node's receipt (needs its key), and a node **can't be paid** without producing
-one. This kills coordinator-takes-all and stops the coordinator stealing pay.
-
-**(b) Layer-block challenge (shard provides the primitive, c0mpute owns the policy).** A
-verifier feeds a stage-node a **known activation** whose correct `out_hash` was computed by
-re-running that block on a trusted/redundant node. Mismatch → strike. Shard exposes only
-"run this block on this input → output hash"; *when* to probe, *how* to score, *when* to
-eject is c0mpute policy. This is the stage-node analogue of the existing canary.
-
-**Reputation upgrade (c0mpute).** Today reputation is binary (`banned` / not). Swarms need a
-**graded score** the scheduler consumes — to prefer reliable nodes, to **pin leaky boundary
-layers (embedding/final) to the most-trusted nodes** (privacy), and to gate who may
-coordinate. The existing recent-window ban logic stays; we add the gradient on top.
-
-**Verification seam:** economic-now (strike → reputation hit → eject + withhold pay) →
-crypto-later. The receipt's `in_hash/out_hash` slot is exactly where a cheap proof drops in.
-
----
-
-## 7. The scheduler / tracker (c0mpute — the centralized seam)
-
-Holds the node pool, a **sparse, decaying latency graph** (full N² doesn't scale; stale
-jitter lies), the swarm registry, reputation, and the catalog. To serve a model:
-
-1. Pick a **low-latency cluster** with enough VRAM for the model + a coordinator.
-2. Fit **contiguous blocks to each node's VRAM, fat nodes first** (fewer hops).
-3. Order the ring to minimize the loop; **place the coordinator in-region** (this lever was
-   worth ~50% — 174→102 ms).
-4. Assign.
-
-**`swarm:assign`** → each chosen node:
-```
-{ swarm_id, manifest_ref, layer_start, layer_end, role: "stage"|"coordinator",
-  peers: [{ peer_id, addr, layer_range }], coordinator_peer }
-```
-Node fetches its shards (if uncached), loads, links neighbors, signals ready. All ready →
-swarm live.
-
-**Heal, don't reshuffle.** A dropped node → pull a replacement from the pool, reload its
-block, re-link the ring. New joins land in the **pool**, never reshuffle a running swarm
-(pure churn). Global re-optimization runs on a slow cadence or on break, never per-join.
-
-**Control-plane seam:** centralized first. It holds **no weights and no user data**, so
-decentralizing it later (gossip, elected schedulers) is a clean swap, not a rewrite.
-
----
-
-## 8. Job flow + payment (per-node)
-
-```
-client → c0mpute tracker → job:new → coordinator
-coordinator runs coordinate_pipe over the ring
-  → job:token (stream) → client
-  → job:complete { response, tokensGenerated, receipts[] } → tracker
-tracker verifies receipts → attributes tokens per node → pays via worker_earnings
-```
-
-Each node earns for the tokens its block helped produce (coordinator earns for draft +
-drive). Same c0mpute rails, no coordinator-takes-all.
-
----
-
-## 9. The seams, stated honestly
-
-| Seam | Now (correct, not debt) | Later (clean swap) |
-|---|---|---|
-| Control plane | centralized scheduler (holds no weights/data) | gossip / elected |
-| Verification | economic: strike + eject + withhold pay | cryptographic proof in the hash slot |
-| Propagation | seed mirror = first provider | P2P peers take over (additive) |
-
-None of these is an "in-between" that gets ripped out — each is the right interface with a
-capability switched on later.
-
----
-
-## 10. Build sequence — done right, exercised early
-
-No throwaway code, but a real swarm runs *soon* so the design gets pressure-tested.
-
-1. **Identity + handshake** — per-node keys ⟷ `privy_id` binding; retire `SHARD_PSK`.
-2. **libp2p sidecar + activation data-plane** — replace `wire.py`; 2-node swarm over libp2p,
-   LAN → NAT. *First NAT-traversed link.*
-3. **Manifest + content-addressed fetch** — mirror as first provider; node pulls + verifies
-   its block.
-4. **Scheduler (central) + assignment** — auto bring-up a swarm from a pool. *First fully
-   automatic swarm.*
-5. **Job routing + signed receipts + per-node payment** — **live & earning on c0mpute.**
-6. **Reputation upgrade + layer-block spot-check** — trust hardening.
-7. **Heal + mid-request fault tolerance.** ◑ *Demonstrated (2026-06-23): engine resume primitive `coordinate_pipe(resume_ids, resumable)` + spare-splice healer `phase0/heal.py` — kill a node mid-gen, the request resumes on a spare and completes. [receipt](receipts/fault-tolerance-20260623.json).*
-8. **P2P propagation** takes over from the mirror (additive).
-
-Each step leaves a running, correct system.
-
----
-
-## 11. What's genuine research (not pretending otherwise)
-
-- **Layer-block spot-check at scale**, and eventually a cheap cryptographic proof to replace
-  re-compute-and-compare.
-- **Mid-request KV fault tolerance** — the *recover-and-complete* half is demonstrated
-  (re-prefill prompt+committed on a spliced-in spare, resume; `phase0/heal.py`). What's still
-  research: *seamless* migration — a hot pre-warmed standby (no reload) + re-prefilling only the
-  dropped block (via upstream activation checkpointing) instead of the full committed prefix.
-- **Decentralized scheduling** — the control-plane seam, when we take it.
-- **Privacy** — boundary-layer pinning + trusted-only routing; earns its word phase by phase.
-
-Everything before those is engineering we've already proven variants of.
+The selected 2026-10-08 local non-GPU suite reported 985 passed and 3 skipped. Next acceptance requires real native kernels, numerical/state controls, measured resource/runtime templates, actual routes, short/long-context workload matrices and sustained fault recovery. Planning predictions, signed declarations and local tests remain separate forms of evidence.

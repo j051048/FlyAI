@@ -1,5 +1,8 @@
 # Physical placement and co-location policy
 
+Code audit: **2026-10-08, `c2ab623`**. Production permits colocated distinct GPUs;
+historical distinct-host benchmark protocols remain separate.
+
 Production inference allows different GPUs on the same physical host or subnet to contribute
 adjacent layer ranges. The planner chooses stages using their actual resource capacity and the
 measured communication mesh. Co-location by itself is not a reason to reject a feasible, faster
@@ -71,8 +74,10 @@ the host allocations for KV offload, expert pools, draft/MTP pools, pinned buffe
 the aggregate. A pinned subset is checked against the shared pinned limit and is not added to
 total RAM again. Retained canonical expert pools are not assumed to be shared across processes.
 
-The planner's shared-host aggregation applies to the declared RAM/pinnable-RAM requirements and
-known `host_id` groups. Supply model budgets covering the additional host reservations above;
+The scalar RAM planner aggregates layer requirements by known `host_id` or declared
+`memory_domain_id`. Exact-template planning sums actual host and pinned bytes
+against a conservative domain capacity; the lease ledger repeats this reservation
+check atomically. Supply budgets covering the allocations above;
 co-location does not manufacture missing resource measurements. Shared SSD quotas and bandwidth
 also need verification by the admission/deployment layer, rather than treating this isolation
 policy as a complete disk or I/O resource scheduler.
@@ -101,6 +106,12 @@ remote relay even while their GPUs share a host. Solve that as a route and reach
 configure and measure an accessible local/private endpoint, or cost the public path that is
 actually available. A blanket physical-host ban does not fix a bad route. The policy does not
 invent local link costs or replace missing mesh measurements with an assumed fast path.
+Edges are directed effective channels; alternative routes between one pair may
+have different reachability, including same-IP hairpin failure. Version 2 records
+the actual dialer/connect endpoint and one-way/RTT normalization. Legacy RTT stays
+conservative RTT-as-hop. A valid chain need not form a bidirectional head-star,
+and an external coordinator's entry/return legs are measured separately. See
+[OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md).
 
 ## Inference placement and replica independence are separate
 

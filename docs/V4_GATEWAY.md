@@ -1,6 +1,7 @@
 # Authenticated V4 serial service
 
-`engines/deepseek_v4/v4_gateway.py` exposes an existing V4 ring as a bounded text-chat service.
+The shared HTTP implementation is `shard/http_gateway.py`; the V4 backend lives in
+`engines/deepseek_v4/v4_gateway.py`. It exposes an existing V4 ring as a bounded text-chat service.
 It directly calls the current greedy, serial DSpark and pipelined DSpark coordinators. It does
 not launch/rent GPU nodes, download models, provide continuous batching or claim durable HA.
 The single-ring dispatcher owns one ring. `--ring-pool` now runs one serial worker
@@ -8,14 +9,38 @@ per verified leased ring, sharing tenant quotas and idempotency across the pool.
 The complete open-contribution workflow, renewal ownership and rolling-version
 routing are documented in [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md).
 
-## Startup and admission
+## Current managed entrypoint (`c2ab623`)
 
-Production startup requires both an authentication file and a concrete, measured
-`shard-deployment/1` bundle. `check_deployment()` must accept the resource contracts, runtime
+For managed production use the open-network adapter. It forms leased rings from signed offers
+and exact stage calibrations, injects a signed pipeline plan and controller key, starts approved
+local stage templates, and requires successful signed warmup:
+
+```sh
+python engines/deepseek_v4/v4_network_service.py \
+  --config network.json --auth-file /run/private/v4-gateway-auth.json \
+  --host 127.0.0.1 --port 8000
+```
+
+`network.json` uses `shard-open-network/1`; see [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md).
+HTTP bearer keys authenticate clients. The separate controller Ed25519 key authenticates engine
+HELLO and node lease RPC. Stage public keys, exact cohort, layer ranges and controller public key
+are pinned in `shard-pipeline-plan/1`. Forward and return bind to one signed head owner grant;
+an occupied head replies BUSY. Idle head-control pings renew ownership without reading tail replies.
+Strict V4 routes must reach the actual tail listener. The old `--ret-relay` ingress is refused
+in strict mode; it is not a transparent production fallback.
+
+## Existing-ring compatibility adapter
+
+The standalone single-ring and `--ring-pool` CLI loaders retain measured deployment checks,
+but at `c2ab623` do not inject `pipeline_plan`/`coordinator_key` into their backend. They require
+explicitly legacy stage listeners and are not the current strict managed deployment recipe.
+`check_deployment()` still checks the resource contracts, runtime
 configuration, shared RAM/pinned budgets, GPU/port identities and concurrent host-I/O evidence.
 The served model/layer count, signer assignments, stage context limits, optional `coord_env`,
 and sealed-token mode/key identity must match that bundle. Public bundles must not contain
 swarm secrets or private key-file configuration.
+
+Compatibility example on a privately controlled ring started with `--legacy-protocol`:
 
 ```sh
 python engines/deepseek_v4/v4_gateway.py \
@@ -25,9 +50,10 @@ python engines/deepseek_v4/v4_gateway.py \
   --mode pipelined --max-context 8192 --warmup-timeout-s 300
 ```
 
-The bundle supplies the pinned signer/layer map. Optional `--assignments` cross-checks a separately
+The compatibility bundle supplies the pinned signer/layer map. Optional `--assignments` cross-checks a separately
 retained map; it cannot replace or contradict the deployment gate. Stage processes must enable
-receipts and support strict reply binding before the service starts.
+receipts and support per-job reply binding before this adapter starts. Reply binding is separate
+from the newer authenticated connection HELLO.
 
 Startup performs a real two-token request through the chosen coordinator mode, with a fresh nonce
 and full signature/signer/job/swarm/coverage/chain validation. It does not consume tenant quota.
@@ -94,6 +120,13 @@ key returns 409; the same payload returns its retained job/result without anothe
 Idempotency is in-memory, bounded and currently retained for up to 600 seconds/128 completed jobs.
 Process restart loses it. Private prompt/payload storage is released on terminal transitions.
 
+Multiple rings share client limits and idempotency. `shard_cohort` selects a known exact version;
+`shard_region` is a routing preference. Each admitted job remains fixed to one backend/tokenizer
+through retry and SSE resume. Alias cutover requires a READY target; old jobs retain their version.
+DRAINING rejects new bindings while admitted work finishes under renewed leases. Stopped workers
+and bounded ring history are reclaimed. Several serial rings can execute concurrently; this is
+request-level routing, not continuous batching.
+
 SSE events use IDs `<job-id>:<committed-token-count>:<published-character-count>`. Supply that exact
 `Last-Event-ID` with the same idempotency key to resume delivery. The character offset distinguishes
 an incomplete UTF-8 suffix from a final replacement character at the same token position. Legacy
@@ -131,7 +164,7 @@ admission. CLI SIGTERM/SIGINT uses a separate HTTP shutdown thread to avoid `ser
 ## CPU validation
 
 ```sh
-python -m pytest tests/test_service_queue.py tests/test_v4_gateway.py -q
+python -m pytest tests/test_service_queue.py tests/test_v4_gateway.py tests/test_v4_multi_gateway.py tests/test_ring_pool.py tests/test_ring_router.py tests/test_pipeline_session.py tests/test_v4_session.py -q
 ```
 
 Tests use actual HTTP/SSE handlers, deterministic fake token callbacks and real Ed25519 receipts.
@@ -139,3 +172,5 @@ They cover fairness/admission, deduplication, cancellation/deadlines while recei
 replay prefix mismatch, forged receipts, readiness warmup, tenant isolation, streaming cursors and
 terminal-state races. They validate service control behavior without loading a model or claiming
 four/six-card throughput.
+
+Current four-card >=40 / six-card >=30 committed-decode acceptance remains unmeasured on the new recipe. The 2026-10-08 selected CPU/socket regression (985 passed, 3 skipped) is not a full-repository CI result or a GPU benchmark.

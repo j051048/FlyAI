@@ -1,5 +1,12 @@
 # M2.5 EAGLE-3 hybrid drafter — FIRST on-engine measurement (2026-06-29)
 
+> Historical run report — reviewed 2026-10-08. Original results, failures, identifiers and
+> commands retain their recorded date and configuration; this update does not rerun or recertify them.
+> Signatures bind the recorded activation commitments, freshness and layer coverage, rather than
+> proving every participant computed honestly or that an external payment completed.
+> Current interpretation: [proof scope](../PROOF.md), [documentation index](../DOCUMENTATION_INDEX.md).
+> Current GPT-OSS/V4 deployment and numerical/measurement gates differ from these M2.5 runs.
+
 **Verdict: GATE FAILS as-is.** The EAGLE-3 hybrid lifts reasoning accept to only **~0–3%**, not the
 ~2.5 / ~30% the head's authors reported (thoughtworks 1.78× MT-bench). The n-gram path is healthy, so
 the ring is fine — the fault is isolated to the EAGLE drafter. Root cause not yet pinned (see below).

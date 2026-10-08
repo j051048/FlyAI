@@ -7,11 +7,17 @@
 top-level `config.json`, `generation_config.json`, and the tokenizer files. Only the
 `*.safetensors` weight shards are omitted (they are pulled per box at run time).
 
+## Adapter paths (reviewed 2026-10-08)
+
+The upstream snapshot and license above retain their original provenance. Current deployment
+uses the adapter under `engines/deepseek_v4/`; see [the documentation index](../../docs/DOCUMENTATION_INDEX.md).
+Reference math/tokenizer files are unchanged by this documentation alignment.
+
 ## Why this is vendored, not reimplemented
 
 The shard V4 engine **rents** this math; it does not rewrite it. This mirrors the K3
-precedent in `phase0/kimi_k3_ref/` and the runtime policy in `docs/MODEL_RUNTIME.md`.
-`phase0/v4_stage.py` instantiates the reference `Block`s for a contiguous layer range
+precedent in `vendor/kimi_k3_ref/` and the runtime policy in [runtime policy](../../docs/MODEL_RUNTIME.md).
+`engines/deepseek_v4/v4_stage.py` instantiates the reference `Block`s for a contiguous layer range
 and drives them across the pipeline. It never reimplements:
 
 - the hybrid attention (`Attention`: MLA latent + sliding window + the `Indexer`/`Compressor`
@@ -21,7 +27,7 @@ and drives them across the pipeline. It never reimplements:
 - the DSpark drafter (`DSparkBlock`, `forward_spec`, the Markov + confidence heads).
 
 Keeping these byte-identical means version skew and any upstream fixes are absorbed in
-`v4_stage.py`, in one auditable place, rather than by editing code we do not own.
+`engines/deepseek_v4/v4_stage.py`, in one auditable place, rather than by editing code we do not own.
 
 ## The one contract that matters for the pipeline
 

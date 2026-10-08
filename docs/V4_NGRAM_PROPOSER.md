@@ -1,5 +1,14 @@
 # V4 pipelined speculation — the tap-free proposer, and what it is actually worth
 
+Historical record: 2026-08-02 experimental, deliberately unmerged proposer branch. Original numbers, dates, branch names and reasoning below
+are retained as that snapshot's evidence, not measurements of `c2ab623`. Current strict deployment,
+RAM/KV/HTTP/lease contracts are in [V4_CLUSTER_DEPLOY_GUIDE.md](V4_CLUSTER_DEPLOY_GUIDE.md),
+[V4_NEXT_PHASE.md](V4_NEXT_PHASE.md) and [V4_BENCHMARK.md](V4_BENCHMARK.md).
+Four RTX 5090 >=40 / six >=30 committed-decode acceptance on the current recipe remains pending.
+Historical launch snippets are not today's production commands: any intentionally reproduced
+old raw-op listener needs explicit `--legacy-protocol`; current production pins a complete signed
+plan/controller key and reaches the real tail endpoint, with no silent `ret_relay` downgrade.
+
 > **STATUS, 2026-08-02: measured, priced, and left UNMERGED.** The implementation this document
 > describes (`V4_PIPE_PROPOSER`, the match gate, the hybrid) lives on branch
 > `v4/ngram-pipe-proposer` and was deliberately not ported onto `v4/truth`: the verdict below —
@@ -7,8 +16,8 @@
 > refill floor instead (`V4_REFILL_FLOOR`, see `docs/V4_MULTIBLOCK_VERDICT.md` §4's correction),
 > which needs no new proposer and no workload luck. On the 07-31 ring the bar got harder, not
 > easier: on top of `floor=5` a tap-free extension breaks even only at flat q ≥ 0.62–0.89
-> (`phase0/v4_ngram_econ.py`), and measured n-gram acceptance on novel text is 0.016 — a 40× miss.
-> The acceptance harness (`phase0/v4_ngram_accept.py`) and the per-depth instrumentation are
+> (`engines/deepseek_v4/v4_ngram_econ.py`), and measured n-gram acceptance on novel text is 0.016 — a 40× miss.
+> The acceptance harness (`engines/deepseek_v4/v4_ngram_accept.py`) and the per-depth instrumentation are
 > merged; the proposer machinery stays on its branch until someone shows a tap-free proposer with
 > real acceptance on NOVEL text, which n-gram is not.
 
@@ -54,14 +63,25 @@ if your agent harness genuinely re-emits whole files.
 Two orders of magnitude between them. **Every tok/s this lever adds is a repetition number.** DSpark-
 only and DSpark+n-gram are reported separately throughout; this document never blends them.
 
-**Recommendation.** Ship it — it is opt-in, default OFF, provably free when it cannot help (§4), and
+**Historical proposal, not the landing decision.** The branch proposed shipping an opt-in
+lever, argued free when it cannot help (§4), and
 it is the only thing that lifts the `block+1` in-flight cap at all. Do not budget any throughput for
 it on coding work. Then run one ring job on the ACTUAL bench prompt and read
 `ngram_silent / (ngram_rounds + ngram_silent)` off the return dict: that single ratio decides, in one
 run, whether the workload is a copy workload. Everything else here is arithmetic on top of it.
 
-Reproduce: `python3 phase0/v4_ngram_accept.py --k 8`, `--traces <jsonl> --margin 0 --ng 2`,
-`python3 phase0/v4_ngram_econ.py`.
+The historical acceptance analysis can still be invoked from the checkout, with the shared
+`phase0/ngram_draft.py` import path explicit (POSIX shell):
+
+```bash
+PYTHONPATH=phase0 python engines/deepseek_v4/v4_ngram_accept.py --k 8
+PYTHONPATH=phase0 python engines/deepseek_v4/v4_ngram_accept.py --traces traces.jsonl --margin 0 --ng 2
+python engines/deepseek_v4/v4_ngram_econ.py
+```
+
+PowerShell uses `$env:PYTHONPATH = "phase0"` before the acceptance command. At `c2ab623`,
+invoking that file directly without this import path fails before argument parsing. These tools
+score declared traces/reference continuations; they neither launch a serving ring nor prove speed.
 
 ---
 
@@ -165,7 +185,7 @@ reference Transformer's greedy stream bit for bit, whichever proposer filled the
 deep it filled it. Proven, not asserted, on real `shard.transport` sockets over a real multi-stage
 ring:
 
-- `phase0/v4_pipe.py selftest` — `ngram` and `hybrid` at W = 2, 6, 16, plus a perfect proposer and
+- the experimental branch's pipe selftest — `ngram` and `hybrid` at W = 2, 6, 16, plus a perfect proposer and
   the gated hybrid: **all bit-identical to the vendored reference's greedy decode, receipts settling.**
 - `tests/test_v4_pipe.py::test_a_tap_free_proposer_is_lossless_at_every_depth` — the same grid as a
   parametrised test.
@@ -250,7 +270,7 @@ prompt is the one number that settles which regime a given harness is in.
 
 ## 7. What the next ring run must measure
 
-The coordinator now reports, per proposer and never blended:
+The unmerged experimental coordinator reported, per proposer and never blended:
 
 ```
 accept_by_depth        {depth: (hits, trials)}   the MTP block's
@@ -271,3 +291,8 @@ depth is expensive. `docs/V4_PIPELINE_EFFICIENCY.md` measured the latter on the 
 found the "N% full / idle stages" framing there to be an artefact of dividing a per-frame `on_box` by
 the timed window's mean `s`. Do not size this lever off a fill estimate that has not been checked
 against that counter.
+
+Current status: `V4_PIPE_PROPOSER` and `V4_PIPE_NGRAM_MINMATCH` are not serving flags in
+`c2ab623`. The current V4 coordinator's separate `spec`/`specK`/`specNg` path and the GPT-OSS
+`phase0/specpipe.py` n-gram/adaptive-depth path do not mean this historical V4 hybrid proposer
+was merged. The acceptance/economics scripts remain analysis tools, not current hardware gates.

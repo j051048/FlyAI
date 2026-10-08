@@ -1,5 +1,14 @@
 # GLM-5.2 on consumer Blackwell (RTX 5090)
 
+> Historical research record — reviewed 2026-10-08 against `c2ab623`.
+> Original dates, measured values, projections, later addenda and historical commands are preserved.
+> “Active”, “next” and implementation gaps below describe the recorded experiment, not the current backlog.
+> Current placement/serving contracts: [open network](../OPEN_INFERENCE_NETWORK.md),
+> [GPT-OSS operations](../GPT_OSS_PRODUCTION.md), [V4 acceptance](../V4_BENCHMARK.md),
+> and [documentation index](../DOCUMENTATION_INDEX.md).
+> This is the recorded GLM research topology, not an advertised current generic model backend.
+> The engine/source recipe, workload and warm/cold conditions must accompany its reported speed.
+
 *Research record. Status: feasibility de-risked end to end; serving path identified
 (quantized pipeline-parallel). 2026-06-17.*
 

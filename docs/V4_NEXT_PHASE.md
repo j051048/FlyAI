@@ -1,7 +1,8 @@
 # V4 runtime and service hardening
 
-The five requested areas are implemented in this checkout. Real four/six RTX 5090
-acceptance is deferred until the operator supplies a rented cluster. Local CPU,
+Current runtime/service entrypoints below are aligned to `c2ab623` (2026-10-08).
+The requested runtime paths are implemented, while real four/six RTX 5090 acceptance
+is still pending an explicitly provisioned actual cluster (owned or rented). Local CPU,
 real-socket and reference-model regressions are not GPU throughput measurements.
 Use a complete repository checkout for the new deployment/gateway workflow.
 
@@ -17,7 +18,8 @@ lifecycle management. See [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md)
 | KV working set | Stage keeps windows/Compressor recurrences resident, archives compressed histories in pinned RAM, and reuses one bounded per-layer GPU workspace | Each layer still reads its entire valid compressed prefix; quotas limit supported context and add PCIe traffic |
 | Prefill queries | Attention and Indexer queries are chunked while projection, Compressor, HC and MoE shapes remain unchanged | First real shape runs a reference-shadow output/state byte gate and still needs reference scratch; mismatch refuses the request |
 | Hardware evidence | Frozen speed suite plus sustained same-prompt greedy controls, raw signatures, monotonic campaign intervals and declared SLOs | Timing and physical inventory are coordinator/operator provenance, not remote attestation |
-| Online service | Bearer authentication, tenant-fair bounded serial queue, quotas, idempotency, deadlines, cancellation, SSE and replay recovery | One job per ring; memory-only history; no continuous batching, durable coordinator HA or external billing |
+| Online service | Shared authenticated HTTP, global tenant limits/idempotency, one serial worker per READY ring, version-sticky routing, cancellation/SSE and replay recovery | Rings execute concurrently; history is memory-only; no continuous batching, durable coordinator HA or external billing |
+| Connection ownership | Signed challenge HELLO pins both identities, role/index/spans/cohort, purpose and execution plan; signed head grant binds forward/return and fences old owners | Compatible stage/controller keys and actual reachable tail endpoint are required; strict mode refuses the old return relay |
 | Miner admission | Distinct GPUs may share a host; real shared RAM/pin budgets, simultaneous H2D measurements and calibrated launch settings are checked | Measurements expire and must be rechecked at load; no automatic rental or remote provisioning |
 
 The local dispute helpers bind logical tensor bytes, both snapshots, deadline and
@@ -98,13 +100,15 @@ components, including peaks and reserves, as specified in [RESOURCE_CONTRACT.md]
 The report now exports `runtime_config_payload` to bind that calibration to its settings.
 
 The `shard-deployment/1` bundle contains `model_id`, `layer_count`, `checkpoint_id`,
-`trust_mode`, `stages` and `host_io` keyed by host ID. Every stage contains `node_id`,
+`registration_policy`, `token_privacy`, `stages` and `host_io` keyed by host ID.
+Legacy `trust_mode` values are accepted through the compatibility resolver; open registration
+and plain/sealed token privacy are separate choices. Every stage contains `node_id`,
 `host_id`, physical `gpu_uuid`, `signer_pubkey`, `lo`, `hi`, unique host-local `port`,
 `dspark`, public `env`, full `runtime_config`, measured `requirements`, `capacity`
 (`available_vram_bytes`, `available_ram_bytes`, `pinnable_ram_bytes`,
 `available_disk_bytes`) and `capacity_measured_at`. `requirements` uses the existing
 placement schema and matching node/checkpoint/config provenance. `host_io` embeds the
-complete raw concurrent report above. Optional `coordinator_env` binds coordinator flags.
+complete raw concurrent report above. Optional `coord_env` binds coordinator flags.
 
 ```bash
 python -m shard.deployment deployment.json --out deployment-check.json
@@ -114,6 +118,22 @@ The check rejects duplicated physical GPUs/ports, changed runtime flags, stale r
 incomplete layers or shared host overcommit. Every field is in bytes. Distinct IPs or
 self-declared VM labels do not create extra RAM or independently trusted hardware.
 
+## Strict plan, identity and resident leases
+
+Current stage CLI requires `--deployment-plan` with full `model_cohort`, or the same plan in
+its node-local `SHARD_STAGE_LEASE_CONFIG` assignment. Every stage signer and the coordinator's
+signer are pinned. Manual coordinators require `--coordinator-key` or `SHARD_COORDINATOR_KEY`;
+these reference an existing Python receipt-format key file and never upload its private bytes.
+A plan/key mismatch or occupied head is an explicit rejection, not a delayed read or GPU fallback.
+Legacy bare-op listeners require `--legacy-protocol` and are not the managed production path.
+
+Node-local SQLite leases prepare/commit resources and enforce fencing/expiry. The resident
+process handle stays occupied until the actual child exits. Multiple GPUs on one host use
+one shared RAM/pin reservation domain. DRAINING stops new requests but renews leases until
+admitted work finishes; only acknowledged cleanup permits reuse. New joins do not rewrite a
+live ring. See [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md) for the reference
+controller, local approved templates and independent per-ring renewal.
+
 ## Authenticated serving
 
 Create a private auth JSON file with two mappings: `keys` maps long random API keys to
@@ -122,15 +142,17 @@ tenant IDs; `tenants` maps those IDs to `max_active`, `requests_per_minute` and
 it is a resource limit, not a bill. Do not commit API keys.
 
 ```bash
-python engines/deepseek_v4/v4_gateway.py --dir /data/v4 \
-  --head 127.0.0.1:29610 --tail 127.0.0.1:29612 \
-  --deployment deployment.json --auth-file service-auth.json \
-  --mode pipelined --max-context <verified-context-limit>
+python engines/deepseek_v4/v4_network_service.py --config network.json \
+  --auth-file service-auth.json --host 127.0.0.1 --port 8000
 ```
 
-The entrypoint validates deployment and signer assignments, then performs a signed
-warmup before announcing readiness. Non-loopback HTTP requires TLS or an explicit
-trusted TLS proxy setting. `/health` is process liveness; `/ready` reflects verified
+This `shard-open-network/1` entrypoint connects signed offers, exact calibrations, approved
+stage templates, leases and strict pipeline identity, then performs signed warmup before READY.
+The older `v4_gateway.py --deployment/--ring-pool` CLI loaders retain compatibility but do not
+inject strict plan/controller keys at this snapshot; use them only with explicitly legacy
+listeners, as documented in [V4_GATEWAY.md](V4_GATEWAY.md). The managed entrypoint requires TLS
+for non-loopback HTTP; the old adapter has a separate explicit trusted-proxy override.
+`/health` is process liveness; `/ready` reflects verified
 service readiness. Authenticated endpoints include `/v1/chat/completions`, `/v1/models`,
 `/v1/jobs/<id>`, `/v1/jobs/<id>/cancel`, `/v1/jobs/<id>/receipts` and `/metrics`.
 
@@ -153,11 +175,12 @@ context, rollback and cold/warm requests, retaining every raw report.
 Then run sustained verification on the existing warmed ring:
 
 ```bash
-python phase0/v4_soak.py run --protocol protocol.json --dir /data/v4 \
+python -m phase0.v4_soak run --protocol protocol.json --dir /data/v4 \
   --head 127.0.0.1:29610 --tail 127.0.0.1:29612 \
+  --deployment-plan pipeline-plan.json --coordinator-key controller-receipt.key \
   --cycles 25 --duration-s 3600 --ttft-p95-s 30 --token-gap-p95-s 0.25 \
   --max-idle-gap-s 10 --out soak.json
-python phase0/v4_soak.py verify soak.json --protocol protocol.json --contract soak-contract.json
+python -m phase0.v4_soak verify soak.json --protocol protocol.json --contract soak-contract.json
 ```
 
 Freeze the independent contract before running: `cycles`, `duration_s`, `ttft_p95_s`,
@@ -171,9 +194,9 @@ GPU CI uses an idle dedicated sm120 runner, requires real CUDA and retains JUnit
 It refuses busy runners and does not kill other GPU workloads. A single-runner kernel
 regression is separate from the four/six-card speed and sustained-service acceptance.
 
-## Local validation on 2026-10-08
+## Validation history and current evidence scope
 
-The combined V4/runtime/placement/proof/service regression completed with **1243 passed,
+An earlier 2026-10-08 runtime-hardening selected regression recorded **1243 passed,
 28 skipped**. A subsequent check of the final gateway readiness, strict benchmark
 identity binding, allocator interval and related contracts completed with **101 passed**.
 These overlapping suites must not be added together. Full-stack cross-configuration
@@ -186,3 +209,9 @@ M25 first-ack watchdog test records repeated stubbed exits. Those files are unch
 This is not a claim that the complete repository suite passes on Windows. GPU tests are
 skipped in the local CPU-only torch environment, and real Vast speed/soak/failure testing
 is explicitly deferred by the operator.
+
+The subsequent strict-plan/session/GPT-OSS integration at `c2ab623` records **985 passed,
+3 skipped** in its selected CPU/socket suite. It includes authenticated ownership, tail churn,
+real tiny V4 reference token/receipt comparisons, shared serving and planner/contracts. It is
+not a complete repository CI result, and skipped CUDA cases are unverified hardware evidence.
+No new four-card >=40 or six-card >=30 pass is implied by any of these test counts.

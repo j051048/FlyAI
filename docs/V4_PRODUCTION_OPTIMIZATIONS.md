@@ -4,6 +4,15 @@ This change composes with the existing V4 engine, speculation protocol, receipt 
 local expert placement. CPU parity and control-flow tests verify the implementation. They
 do not certify CUDA numerical gates, throughput or the four/six RTX 5090 benchmark targets.
 
+## Current deployment and scope
+
+At `c2ab623`, these numerical/runtime optimizations run beneath the shared strict session and
+node-lease contracts. Production startup uses a complete checkout and the managed V4 reference
+entrypoint in [V4_CLUSTER_DEPLOY_GUIDE.md](V4_CLUSTER_DEPLOY_GUIDE.md), with a full cohort,
+pinned stage/controller keys and exact calibrated configuration. Changing flags invalidates the
+old calibration. The strict return route reaches the actual tail; old `--ret-relay` remains an
+explicit legacy experiment, not a production fallback.
+
 ## What runs in the service path
 
 | Area | Implementation | Observation / fallback |
@@ -50,9 +59,10 @@ All new environment settings are forwarded by the single/multi-GPU launch builde
 profiling, prediction and compiled-wire switches default off. Fixed-slot scratch reuse and
 DSpark pair chunking apply when their existing runtime paths run. `V4_FP8_WIRE` retains its
 existing default: fused code does not silently enable lossy wire quantization.
-Flat-file deployments must ship `shard/runtime_profile.py` alongside the existing
-`runtime_metrics.py`, plus the engine's new `v4_wire_codec.py` and prefetch module. A repository
-checkout resolves the shared profiling module from `shard` automatically.
+Use a complete checkout/installed `shard` package for managed deployment: it also needs
+pipeline session/plan, leases, leased runtime, profiling, controller and HTTP modules.
+The old flat-file numerical experiments required the profiling/metrics/codec/prefetch files;
+shipping only those files does not provide the new strict managed service.
 
 GPU-resident deployments using `V4_DSPARK_MOE=1` may keep their existing block-width recipe;
 the old `pairs > 32` decline has been removed. Other declines (unsupported routing/backend,
@@ -119,8 +129,8 @@ The original local PyTorch 2.14.1 CPU check reproduced a pre-existing offline se
 failure on clean HEAD: reference/ring/spec/DSpark/pipeline emitted `[388] * 6`, failing
 the nontrivial fingerprint gate. The next-phase fix explicitly depth-scales only the
 synthetic selftest model's residual-output initialization; real checkpoints and the
-token diversity/parity gates are unchanged. The full-stack CPU regression now passes
-27 tests. NOQAT remains approximate and outside the recipe: independent fixed-input
+token diversity/parity gates are unchanged. The earlier full-stack CPU regression recorded
+27 passing tests; that count is a dated focused result, not current full-repository CI. NOQAT remains approximate and outside the recipe: independent fixed-input
 logit byte checks detect its arithmetic change even when a short token stream matches.
 Random drafter hits are checked against actual accepted-depth accounting rather than
 assumed to be zero. Hardware acceptance remains deferred to a real RTX 5090 cluster.
@@ -130,3 +140,7 @@ prediction, stage/graph composition, DSpark/FP8 paths, codec control flow, real 
 resource accounting, planning and signed observations. Skips include unavailable CUDA hardware
 and environment-specific conditions. Python compilation and `git diff --check` also passed.
 See [V4_NEXT_PHASE.md](V4_NEXT_PHASE.md) for subsequent integration and verification.
+
+For the later `c2ab623` strict session/service integration, the selected local CPU/socket run
+records 985 passed, 3 skipped. Do not sum it with the earlier 821/23 or other overlapping runs.
+All four/six RTX 5090 performance and sustained hardware acceptance remains pending.

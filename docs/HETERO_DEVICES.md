@@ -1,16 +1,25 @@
 # Heterogeneous devices — which hardware can join a swarm
 
+Code audit: **2026-10-08, `c2ab623`**. The July rows below are historical M2.5
+measurements/estimates, not universal device eligibility or speed guarantees.
+Registration accepts any valid identity; execution needs a compatible backend,
+cohort, fresh fitting templates and effective routes. Signed operator reports are
+not hardware attestation. See [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md).
+
+
 The north star is torrent-like: **any device joins a swarm**, not an NVIDIA allow-list. This doc
 records what it actually takes for a non-5090 card — and, further out, an Apple Silicon Mac or an
 AMD GPU — to serve a layer shard in the scattered pipeline ring, plus a device tier table against
 the usable-speed bar. The planner already does the easy half (`assign_layers`/`select_ring` size
 each node's block by VRAM + measured per-layer time, so a slower card just holds fewer layers); the
-work is (a) running the shard on a non-Blackwell backend and (b) admission tiers + a compute probe.
+work remains model/backend-specific execution and measurement. The planner now
+also supports local-first expansion, bounded discovery, exact span/role/index
+templates and finite-window pipeline predictions; it cannot supply a missing backend.
 
 ## The gating question, answered: NVFP4 portability off Blackwell
 
 The checkpoint is `nvidia/MiniMax-M2.5-NVFP4` (4-bit experts, Blackwell-native sm_120). The MoE
-backend is selectable — `M25_MOE_BACKEND = cutlass | marlin | emulation` (`phase0/m25_stage.py`),
+backend is selectable — `M25_MOE_BACKEND = cutlass | marlin | emulation` (`engines/minimax_m25/m25_stage.py`),
 now defaulting to **`auto`** (cutlass on sm_120+, marlin below; a stage's arch is a node fact, not a
 ring-wide env). Probed on a live rented card:
 
@@ -48,17 +57,21 @@ is not.)
 > common cards today — NOT an allowlist. Admission is by measured VRAM/compute/bandwidth, not model name.
 
 Usable-speed frame: `tok/s = g / T_traversal`; a stage holding K layers adds `K × layer_ms` to the
-ring, and the ring is only as fast as its slowest stage + WAN hop (~15-40 ms). Single-stream WITH
+serial traversal. Finite-window pipelines also depend on feedback, serialization,
+acceptance and shared resources, rather than only the slowest stage. In the July regime, single-stream WITH
 graph-aux (`M25_CUDA_GRAPH` + `M25_STATIC_KV`, PR #25) does **~24 decode-weighted / 30-32 reasoning-heavy**
 on a good EU ring; draftable-verbatim and batched-aggregate go higher still. So the 20 tok/s bar is
 comfortably above what a heterogeneous ring must protect — heterogeneity must not be what drops a
-ring below it, and every perf ring MUST launch with graph-aux on (a no-graph run under-measures ~2×). Layers-held ≈ (VRAM − reserve) / (per-layer weights + KV). NEVER
-co-locate to manufacture the number — every verdict below is for scattered WAN placement.
+ring below it. Those measurements pin graph-aux; they do not require every future
+backend to use that flag. Layers-held ≈ (VRAM − reserve) / (weights + KV) is a scalar
+estimate; actual load/graph/workspace/roles need calibration. These scattered labels
+must not be relabeled as local results. Co-location is permitted in production,
+but needs separately labeled measurements.
 
 | Device | BW GB/s | Mem GB | ~layers @ arch footprint | est layer_ms | Verdict |
 |---|---|---|---|---|---|
 | **RTX PRO 6000 (WS/S)** | 1792 | 96 | **35** (2.33 GB, density-scaled cap; MEASURED 2026-07-12) | **0.24 (measured, graph)** | **ring ANCHOR — proven live**: held 31 L + coordinator in a 4-hop hetero ring the c0mpute loop placed |
-| RTX 5090 | 1792 | 32 | ~13 (1.7 GB) | 0.65-1.5 · **0.20 (measured, graph)** | **ring — proven** |
+| RTX 5090 | 1792 | 32 | ~12 at July full-layer ~2.33 GB plus KV/reserves | 0.65-1.5 · **0.20 (measured, graph)** | **ring — proven** |
 | **H100 NVL (MEASURED)** | 3900 | 93 | ~20 (4057 MB/L marlin) | **0.184 (measured, graph)** | **ring — proven live 2026-07-12** (fleet sw2 tail [42:62]); the 80-95GB marlin tier now measured, transient +4824 |
 | RTX 4090 | 1008 | 24 | ~4-5 (4.08 GB marlin) | 1.2-2.5 · **0.263 (measured, graph)** | **ring** — fewer layers, marlin (fleet-measured) |
 | RTX 3090 | 936 | 24 | ~4-5 | 1.3-2.9 | **ring** (probe pending) |
@@ -73,9 +86,9 @@ co-locate to manufacture the number — every verdict below is for scattered WAN
 | AMD 7900 XTX | 960 | 24 | ~9 | 0.45-0.65 (Vulkan) | **ring-worthy silicon** — gated on a llama.cpp backend |
 | CPU box (DDR5) | ~90 | 64-192 | many (host RAM) | ~2-6 (unproven) | off-ring: **seeder** (`-seed`), torch-free sketch judge, coordinator/gateway |
 
-Key inversion: a big Mac (0.30 ms/layer) is a *better* ring stage than a mid NVIDIA card, and the
-M3 Ultra 512 GB is the only consumer device that holds the whole 140 GB model — the natural
-format-matched spot-check auditor and instant-heal standby. A CPU box can't decode fast but is a
+The Mac projections motivate format-matched auditing; this table does not rank
+every Mac above a NVIDIA stage or prove instant-heal full replicas. Artifact,
+context, kernel, wire and role costs need a compatible recipe. A CPU box can be a
 first-class **seeder** and a torch-free challenge judge (`shard/challenge.py` already runs on CPU).
 
 ## Build list (ranked by effort)
@@ -87,13 +100,14 @@ first-class **seeder** and a torch-free challenge judge (`shard/challenge.py` al
 2. **[S] ✅ SHIPPED — per-node backend + per-node `layer_vram_mb`** — `M25_MOE_BACKEND=auto` picks
    cutlass/marlin per arch; `select_ring`'s `layer_vram_mb` now accepts a per-node dict (scalar path
    byte-identical, goldens green), and `ring_up` detects each node's GPU name → per-arch footprint
-   (5090 cutlass 1.7 GB, 4090/3090 marlin ~4.1 GB) + a marlin compute penalty, so a marlin card is
+   (1.7 GB was experts-only; July full-layer cutlass ~2.33 GB, marlin ~4.1 GB) + a marlin compute penalty, so a marlin card is
    placed as a thin stage automatically.
 3. **[S] CPU-side fp8 wire unpack fallback** — for Mac/AMD safety on the fp8 codec path.
-4. **[M] `MlxRuntime`** — a `ModelRuntime` (`shard/node.py`) over `mlx_lm.models.minimax`: load only
+4. **[M] `MlxRuntime` — implemented, with a dated slice gate ([MLX_RUNTIME.md](MLX_RUNTIME.md)).** — a `ModelRuntime` (`shard/node.py`) over `mlx_lm.models.minimax`: load only
    layers `[lo, hi)` from the MLX-4bit artifact, drive `layers[i](h, mask, cache)`, crop KV to
    `start_pos`, bf16 at the boundary. The model file, the conversion (`mlx-community/MiniMax-M2.5-4bit`),
-   and native bf16 all already exist — days, not weeks.
+   and native bf16 were exercised by that gate. Full-model/mixed-ring acceptance and
+   shared-service adapters remain separate work, not implied by the interface.
 5. **[M] Manifest v2: per-format shard sets** under one model_id (nvfp4 / mlx4 / gguf-Q4_K), each
    file content-addressed exactly as now; the publisher converts + signs, anyone re-derives the
    hashes. Stage receipts name the artifact CID they computed with.
@@ -115,16 +129,16 @@ it is a GPU-model-independent function of *measured* capability, evaluated when 
 the most decentralized form of joining: anyone brings any hardware, and the function judges it. A
 card is never on or off an allowlist by name; it is admitted or rejected by what it can measurably do.
 
-**Collected on join** (measured, never self-reported — a liar just makes a slow ring and gets
-relegated by the receipts): free VRAM, compute speed (`layer_ms` from a probe forward — captures the
+**Collected as capability evidence** (public reports are operator statements;
+receipts do not independently prove truthful hardware): free VRAM, compute speed (`layer_ms` from a probe forward — captures the
 CPU kernel-launch factor too), uplink Mbps, region/RTT to existing pools.
 
 **The function** (`allow-ring` / `relegate-off-ring` / `reject`):
 1. **VRAM feasibility** — can it hold ≥1 layer at its per-arch footprint? (else seeder/verifier only.)
 2. **Usable-speed + hop viability** — would including this node in a *coverable* swarm keep that swarm
-   ≥ the bar (20 tok/s), or does accommodating its minimum contribution force too many hops? A node
-   that can hold only ~2 layers forces a 62-layer model into ~31 stages ≈ 31 WAN hops — far over the
-   traversal budget — so it is rejected *for the ring* even if its per-layer compute is fine. The
+   ≥ the chosen workload bar after combining selected capacities? A homogeneous pool
+   of ~2-layer cards needs ~31 stages for 62 layers; one such card beside strong
+   GPUs does not force every other stage to be that small. The
    criterion is a property of the **swarm shape the node forces (coverage-per-hop)**, not the node's
    speed alone. This is why a "bad" card is excluded: not because of its name, but because the minimal
    swarm that could use it isn't viable.
@@ -137,12 +151,12 @@ owns the **admission decision** (the same measured inputs run through allow/rele
 placement). The compute/uplink probe (build item 1) is the shared front door; see
 `admission-is-capability-function-not-allowlist` in memory.
 
-## Prior art (why nobody has shipped a *verified* heterogeneous ring)
+## Numerical compatibility and research references
 
-exo (MLX + tinygrad) hit un-root-caused mixed-engine drift and **retreated to homogeneous MLX** in
-1.0 — because it had no per-stage verification to catch a misbehaving backend. Petals shipped an
-open swarm with int8 activations and *zero* output verification (hash-committed I/O was future
-work). llama.cpp RPC mixes Metal + CUDA hosts with "no quality degradation" but is explicit LAN PoC
-code ("never on an open network"). The pieces they all lacked — signed activation receipts, a cosine
-spot-check, content-addressed per-format manifests — are the ones this repo already has, which is
-what makes a heterogeneous ring trustable rather than just possible.
+Historical ecosystem comparisons are not evidence of current universal support.
+FlyAI receipts bind reported roots/participants; approximate spot-check tolerances
+and cross-quantization drift are separate from bit parity. Incompatible numerical
+policies need distinct cohorts. Routing references include
+[Petals](https://github.com/bigscience-workshop/petals/blob/main/src/petals/client/routing/sequence_manager.py)
+and [Parallax](https://arxiv.org/html/2509.26182v1); neither validates this table's
+hardware projections or FlyAI's runtime recipes.

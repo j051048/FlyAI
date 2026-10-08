@@ -1,5 +1,14 @@
 # V4 full stack — the composed ring launch
 
+Historical record: the original August 2026 full-stack composition/measurement. Original numbers, dates, branch names and reasoning below
+are retained as that snapshot's evidence, not measurements of `c2ab623`. Current strict deployment,
+RAM/KV/HTTP/lease contracts are in [V4_CLUSTER_DEPLOY_GUIDE.md](V4_CLUSTER_DEPLOY_GUIDE.md),
+[V4_NEXT_PHASE.md](V4_NEXT_PHASE.md) and [V4_BENCHMARK.md](V4_BENCHMARK.md).
+Four RTX 5090 >=40 / six >=30 committed-decode acceptance on the current recipe remains pending.
+Historical launch snippets are not today's production commands: any intentionally reproduced
+old raw-op listener needs explicit `--legacy-protocol`; current production pins a complete signed
+plan/controller key and reaches the real tail endpoint, with no silent `ret_relay` downgrade.
+
 Every DeepSeek-V4-Flash perf lever built so far, on one branch, over the one that actually moved a
 live ring: **pipelined speculation**. This is the branch the headline 6-box measurement runs from.
 
@@ -16,7 +25,9 @@ out-of-process, reproducible to 0.4%. The accept histogram shows rounds committi
 — impossible serially, where a round is capped at `block_size + 1 = 6` — so the pipeline genuinely
 fills. **That build carried no compute levers at all.** This branch adds them.
 
-Every lever is opt-in and default OFF, and two separate things follow from that, verified separately:
+The added recipe levers in that snapshot were opt-in. This is not a statement that every
+current V4 flag defaults off: `V4_MOE_DECODE` is on by default, and current live state must be read
+from the lever registry. Two historical composition checks followed, verified separately:
 
 - **The recipe serves what the default serves** — asserted every run, in
   `tests/test_v4_full_stack.py::test_the_ring_recipe_serves_exactly_what_the_default_serves`.
@@ -28,9 +39,11 @@ Every lever is opt-in and default OFF, and two separate things follow from that,
 
 ## THE ENV RECIPE
 
-### Stage-side, per box
+### Historical all-resident stage recipe, per box
 
-Through the launcher (preferred — the mode is an argument, so it cannot be lost in a string):
+The historical lower-level launcher used this mode argument. At `c2ab623` it remains a
+compatibility builder, not the leased strict production launcher. The RAM/layer-KV paths have
+different graph exclusions and calibrated budgets; do not copy `whole` onto layer-KV:
 
 ```python
 stage_launch_cmd(..., cuda_graph="whole",
@@ -72,13 +85,13 @@ the job. If you tune it, tune it on every box in the ring.
 | `V4_DSPARK_CONF_GATE` | Two reasons. (1) `conf` is a raw logit, not a probability — the threshold has to be calibrated against the real model first (`conf_probe`). (2) It gates the tail's OFFERED BLOCK LENGTH, and the pipelined coordinator never sends a block. Setting both now **raises** rather than being ignored. |
 | `V4_MOE_DECODE=0` | Never set this. It is the fallback the grouped kernel hands every shape it declines (s>1, world_size>1, hash-routed layers). |
 
-### The A/B to run
+### The historical A/B ladder
 
 Three arms, one variable each, all on the same warm ring:
 
 ```
-1. serial baseline    (nothing set)                    -> expect ~1.43
-2. pipelining only    V4_PIPELINED_SPEC=1              -> expect ~3.81   (the known-good anchor)
+1. serial baseline    (historical configuration)       -> recorded ~1.43
+2. pipelining only    V4_PIPELINED_SPEC=1              -> recorded ~3.81   (the known-good anchor)
 3. full stack         the recipe above                 -> the headline
 ```
 
@@ -128,7 +141,7 @@ source. Setting a coordinator lever on the stages does nothing at all — that c
 | `V4_PIPELINED_SPEC` | **coordinator** | `_coord_cli` picks the coordinator loop |
 | `V4_LAZY_DRAFT` | **coordinator** | `coordinate_dspark_pipelined`; the tail reacts to frame hints, not to its own env |
 | `V4_DSPARK_CONF_GATE` (+`_MIN`/`_THRESH`) | **coordinator** | `coordinate_dspark` (serial path only) |
-| `V4_TOPK_STABLE` | **NOT IMPLEMENTED** | nothing. Written up as an acceptance fix; no phase0 module reads it. Setting it is reported UNKNOWN |
+| `V4_TOPK_STABLE` | **NOT IMPLEMENTED** | nothing. Written up as an acceptance fix; no current engine module reads it. Setting it is reported UNKNOWN |
 
 ---
 
@@ -342,7 +355,7 @@ determinism. That is a separate change and is not on this branch.
 
 ---
 
-## Test matrix
+## Historical test matrix (not current CI)
 
 CPU-only, `OMP_NUM_THREADS=1`.
 
@@ -352,7 +365,7 @@ CPU-only, `OMP_NUM_THREADS=1`.
 | lever reachability + losslessness (`tests/test_v4_full_stack.py`) | **23 passed** |
 | whole-layer Tier-1 / Tier-2 / freshness | passing (CUDA arms skip on this box) |
 
-Both pipe selftests, every config, ALL PASS (14/14 assertions each):
+At that snapshot, both pipe selftests, every listed config, ALL PASS (14/14 assertions each):
 
 | config | env | tokens |
 |---|---|---|
@@ -372,7 +385,7 @@ Both pipe selftests, every config, ALL PASS (14/14 assertions each):
 24/24 runs `ALL PASS`; 22/24 also token-identical to the pre-merge base on all five paths (`ring`,
 `ref`, `spec`, `dspark`, `pipe`). The 2 exceptions are the NOQAT config, by design and asserted.
 
-## Reproduce
+## Current CPU entrypoints; historical counts above are not predictions
 
 ```
 OMP_NUM_THREADS=1 python3 -m pytest tests/ -q -k v4

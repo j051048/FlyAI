@@ -1,12 +1,22 @@
-# 🚀 ROAD TO LAUNCH — the single source of truth
+# Launch acceptance and historical upstream record
 
-> **The rule:** when every **P0** and **P1** below is checked, it's good to launch. Everything else is post-launch.
-> **Launch = "no wizard":** a stranger runs *one command*, their GPU joins the network on its own, their dot
-> lights up on a live map, and it works — with nobody (no operator, no SSH, no hand-holding) in the loop.
->
-> This file is THE list. If it's not here, it's not a launch blocker — stop carrying it in your head.
-> _Last synced: 2026-08-08._
->
+Current guidance aligned with `c2ab623` on 2026-10-08. The July–August notes below are an upstream operational archive, not the current single source of truth. References to external c0mpute PRs, worker/npm releases, live websites, prices, payout flags or account infrastructure describe that period; this repository review did not recheck their present deployment.
+
+## Current release gates
+
+- Follow [deployment readiness](DEPLOY_READINESS.md), [GPT-OSS production](GPT_OSS_PRODUCTION.md), [V4 current phase](V4_NEXT_PHASE.md) and [open-network control contract](OPEN_INFERENCE_NETWORK.md). M2.5 compatibility remains documented separately in [DEPLOY_M25.md](../phase0/DEPLOY_M25.md).
+- Bind verified checkpoint/config bytes, the actually supported cohort, exact deployment/source/runtime configuration, signing identities and actual route endpoints. Strict GPT-OSS/V4 sessions do not make every historical launcher strict.
+- Require measured GPU/host/pin budgets and calibrated layer/frame/context roles. Commit node-local leases before loading; keep them through idle residency and confirmed process cleanup. Manual launch reservations protect owned processes but do not replace resource leases.
+- Validate end-to-end warmup and final signed receipts before reporting READY or success. Unknown hardware/measurement fields cannot be promoted to measured zeros or passed off as remote attestation.
+- Keep public participation open while authenticating node RPC, assigned ring neighbors and tenant HTTP requests. Public V4/GPT-OSS HTTP listeners require TLS. Secrets remain in protected files; deployment environment goes through SSH stdin.
+- Gate release claims on real GPU numerical, state/rollback, kernel and sustained service tests for the actual build. Record novel/copy/code/long-context separately and include retries/proof collection in service timing. V4's new-path four/six-card goals remain 40/30 tok/s, not completed hardware acceptance.
+
+The selected local non-GPU regression set for this change reported **985 passed, 3 skipped**. It is not full-repository CI, a production fleet rehearsal, a new speed result or an external payment verification. Per-ring work remains serial; job history/idempotency is in memory; durable coordinator HA and automatic on-chain slashing are not implemented.
+
+## Historical July–August 2026 archive
+
+The archive preserves dates, numbers and reported operator findings. Words such as “today”, “done”, “remaining” and “live” below refer to that dated upstream session, not the current code. Existing unresolved hardware observations require new acceptance on the chosen runtime; reported tests and external PR status are not this fork's test total. Signed records also have the evidence limits in [PROOF.md](PROOF.md).
+
 > **2026-08-09 REHEARSAL VERDICT (receipt `stranger-suite-final-20260809.json` + companion
 > `stranger-hetero-suite-20260808.json` — the two-day live-ring arc):**
 > - **✅ THE STRANGER PATH SERVES CORRECTLY — 12/12 coherent suite, first ever** (all-sm120 4-stage EU
@@ -101,8 +111,9 @@
 
 ---
 
-## ✅ DONE — the mountain you already climbed (do NOT re-litigate these)
-The **physics is proven, with receipts, repeatedly.** These are settled:
+## Historical capability summary (July–August 2026)
+
+The upstream launch notes recorded the following observations. Each claim is scoped to its original build, operator and receipt; this is not current fork acceptance:
 - **Interactive speed** — 20–30 tok/s solo (graph-aux) *on operator-provisioned rings with the EAGLE
   head placed by hand; the stranger-daemon path is ~4–5 tok/s warm until the drafter ships — see the
   08-08 audit block above.*
@@ -286,6 +297,7 @@ You have a working decentralized inference network. What's left is turning "I ca
 ---
 
 ## 🟡 P2 — POST-LAUNCH POLISH (real, not blocking — ship without them)
+
 - Perf levers: batched-prefill pipelining (PR #100), cross-request prefix-KV cache (PR #101),
   tree-frame CUDA graphs (the last prose-bar + g lever, plan `tree-graph-capture.md`).
 - Prose per-stream bar on 5090-*only* rings (already met on fat/hetero rings).
@@ -295,6 +307,7 @@ You have a working decentralized inference network. What's left is turning "I ca
 ---
 
 ## ⚪ NOT ENGINEERING — your call, decouple from the tech launch
+
 - **Market / economics (Leg 8 the-money-part).** ✅ **DECIDED + BUILT 2026-07-20** (leyten): USDC payouts
   ride the EXISTING credits/revenue-share economy — no new token mechanics, no points ledger; farming is
   unprofitable BY CONSTRUCTION because the platform keeps its 30%/20%-by-staking cut. Per-worker cut after
@@ -305,5 +318,5 @@ You have a working decentralized inference network. What's left is turning "I ca
 
 ---
 
-**Definition of launch, one line:** *all P0 ✅ + all P1 ✅ → flip the switch.* A stranger joins in one
+**Historical upstream definition of launch:** *all P0 ✅ + all P1 ✅ → flip the switch.* A stranger joins in one
 command, their dot appears on the map, tokens stream, and none of it needs you. That's the finish line.

@@ -1,11 +1,14 @@
 # V4 foundation validation — 2026-10-06
 
-This change implements the first three items of the local expert-cache plan:
+This is the historical validation snapshot of the 2026-10-06 foundation change,
+not the current feature inventory. That change implemented the first three items of the local expert-cache plan:
 the frozen benchmark/evidence contract, optional signed runtime observations,
 and measured GPU/RAM/pinned-memory resource contracts and probes.
 
-The V4 loader remains fully GPU resident. Local expert offloading, GPU expert
-cache replacement, KV paging and memory-aware layer allocation are later work.
+At that foundation snapshot the V4 loader remained fully GPU resident, and local
+expert offloading/cache replacement, KV paging and memory-aware placement were later work.
+They subsequently gained opt-in implementations; current contracts and limits are in
+[V4_HYBRID_RUNTIME.md](V4_HYBRID_RUNTIME.md) and [V4_NEXT_PHASE.md](V4_NEXT_PHASE.md).
 Neither four-card 40 tok/s nor six-card 30 tok/s has been measured in this run.
 
 ## Environment
@@ -51,15 +54,20 @@ instead of treating a previously queued packet as a post-stop write. Independent
 test rings now get separate node-key directories, while jobs on one ring retain
 their signing identities. Production key permission checks were not relaxed.
 
-## Existing full-stack limitation
+## Historical full-stack limitation and subsequent resolution
 
-The broader `tests/test_v4_full_stack.py` check is not green on this environment:
+The broader `tests/test_v4_full_stack.py` check was not green at the foundation snapshot:
 its offline selftest rejects the fixed toy prompt because the reference returns
 `[388, 388, 388, 388, 388, 388]` rather than the required diverse fingerprint.
 Loading the original `HEAD` version of `v4_pipe.py` in the same environment and
 running its selftest reproduces this failure and the same token stream.
 The selftest's ring/reference, speculative decoding, DSpark, rollback and receipt
 checks pass, but its fingerprint gate was not weakened or reported as passed.
+The subsequent fix depth-scaled only synthetic oracle residual-output initialization;
+real checkpoint parameters and the diversity/parity gates were not weakened. The current
+CPU full-stack check passes as described in [V4_NEXT_PHASE.md](V4_NEXT_PHASE.md).
+The 2026-10-08 `c2ab623` selected CPU/socket regression records 985 passed, 3 skipped;
+that is neither a complete repository CI run nor GPU hardware acceptance.
 Before a GPU deployment, run the existing full-stack checks in the deployment's
 intended environment as well as the benchmark's hardware/evidence gates.
 

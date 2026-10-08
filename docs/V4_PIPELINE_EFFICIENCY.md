@@ -1,5 +1,14 @@
 # V4 pipelined speculation — where the throughput goes
 
+Historical record: the original early-ring simulator calibration. Original numbers, dates, branch names and reasoning below
+are retained as that snapshot's evidence, not measurements of `c2ab623`. Current strict deployment,
+RAM/KV/HTTP/lease contracts are in [V4_CLUSTER_DEPLOY_GUIDE.md](V4_CLUSTER_DEPLOY_GUIDE.md),
+[V4_NEXT_PHASE.md](V4_NEXT_PHASE.md) and [V4_BENCHMARK.md](V4_BENCHMARK.md).
+Four RTX 5090 >=40 / six >=30 committed-decode acceptance on the current recipe remains pending.
+Historical launch snippets are not today's production commands: any intentionally reproduced
+old raw-op listener needs explicit `--legacy-protocol`; current production pins a complete signed
+plan/controller key and reaches the real tail endpoint, with no silent `ret_relay` downgrade.
+
 **The premise this investigation started from was wrong, and the ring proved it wrong.** The brief was
 "the pipeline is 85–89% bubble, find the bubbles." The coordinator's own instrumentation says the
 opposite: on a six-stage ring it reported `max_inflight 7, mean_inflight 5.5, unsent_frames 0`. The
@@ -9,9 +18,9 @@ What the pipe is full of is speculation the ring computes and then throws away �
 against `accepted 33`, i.e. **46–54% of every frame the ring computes is discarded**. And the fix is
 not simply "speculate less", because depth is *simultaneously* what keeps the bottleneck fed and what
 a rejection destroys. That tension is the whole problem, it has an interior optimum, and finding it
-is what `phase0/v4_pipe_sim.py` is for.
+is what `engines/deepseek_v4/v4_pipe_sim.py` is for.
 
-Everything below is produced by that simulator. Run it: `python3 phase0/v4_pipe_sim.py --validate`.
+Everything below is produced by that simulator. Run it: `python3 engines/deepseek_v4/v4_pipe_sim.py --validate`.
 
 ---
 
@@ -182,9 +191,11 @@ greedy run: `tau_max` is the slowest stage's `on_box` for `s=1` frames, `RTT` is
 **Are we over-speculating today? Yes, and it is a free win.** `V4_SPEC_DEPTH=16` measured 2.755 and
 depth 4 measured 3.257 — **+18% on the ring, for an environment variable.** The sim puts the same
 change at +9% (it favours 6 over 4 inside the plateau). Either way the shipped default is off the
-plateau and costs 8–18%. **Set `V4_SPEC_DEPTH=4` on the 6-box ring today.**
+plateau and costs 8–18%. **That early six-box experiment favored depth 4; it is not a current default.** Later
+width-8 measurements had a different operating point. Recalibrate depth/block/frame geometry,
+GPU working set and measured routes together; set the stage rollback budget consistently.
 
-**Why depth saturates at 7.** The coordinator streams `[correction] + block`, and `_feed` breaks at
+**Why the historical simulator fitted saturation at 7.** The coordinator streams `[correction] + block`, and `_feed` breaks at
 `p - c >= W`, so in-flight is capped at `min(W, B+2) = 7` for `dspark_block_size = 5`. That is why
 depth 8 and depth 16 are the *same configuration* and measured identically. It also means **`W`
 (=`V4_SPEC_DEPTH`) is not the knob above 7 — the block size is.**
@@ -329,8 +340,10 @@ is 96% of the round trip; nothing else is in a position to matter.
   because RTT grows with legs while `tau_max` shrinks, the BDP hits 25.9, and the block cap leaves the
   ring fill-limited.
 
-**The order to do things in:** raise `dspark_block_size` (it is free and it is the cap that stops
-every other lever), tune `V4_SPEC_DEPTH` off `RTT/tau_max`, balance the tiling and drop the 5.6 MB/s
+**Historical extrapolation order (not a deployment prescription):** raise `dspark_block_size`
+(the model assumed it was free, but later work measured extra draft/verification and acceptance
+costs). The extrapolation treated that cap as blocking other levers, then proposed tuning
+`V4_SPEC_DEPTH` off `RTT/tau_max`, balancing the tiling and dropping the 5.6 MB/s
 box, take the 10-box ring for its +16% — and then spend everything else on `tau`.
 
 ---
@@ -361,3 +374,11 @@ Two loose ends worth closing on the next ring run, both cheap:
    uses the depth the ring showed, but the extra frame is unexplained by the code as written, and the
    `B+2` cap is now the binding constraint on every fast or wide ring — so it is worth knowing exactly
    what sets it.
+
+The fitted `hop_ms`/RTT split and `B+2` discussion above are retained as historical calibration,
+including its explicitly unexplained seventh frame. The current DSpark serving frontier and
+real-ring CPU tests enforce a `block_size + 1` cap; the simulator's `B+2` is not the runtime contract.
+Do not present fitted wait time as a newly
+measured network RTT or use this table to select today's four/six-GPU RAM plan. Current independent
+control probes measure the actual route; stage/queue/GPU intervals and speculative gain remain
+separate. The committed-token speed/SLO gates are defined in V4_BENCHMARK, not this simulator.

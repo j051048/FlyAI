@@ -1,5 +1,12 @@
 # M2.5 warm-ring validation — 2026-07-07
 
+> Historical run report — reviewed 2026-10-08. Original results, failures, identifiers and
+> commands retain their recorded date and configuration; this update does not rerun or recertify them.
+> Signatures bind the recorded activation commitments, freshness and layer coverage, rather than
+> proving every participant computed honestly or that an external payment completed.
+> Current interpretation: [proof scope](../PROOF.md), [documentation index](../DOCUMENTATION_INDEX.md).
+> Current GPT-OSS/V4 deployment and numerical/measurement gates differ from these M2.5 runs.
+
 Production validation of this session's hardening work (PRs #34/#36/#38) on a **live 5-stage scattered
 EU ring** over libp2p. Provisioned via `rent_pool → ring_up`; all commits' changes ran on
 the boxes (launcher `m25_scatter_pipe` pushes the current master engine code to every stage).

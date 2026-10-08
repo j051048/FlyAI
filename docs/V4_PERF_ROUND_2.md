@@ -1,5 +1,14 @@
 # V4 perf round 2 — the composed launch recipe
 
+Historical record: the original round-2 composition and per-lever measurements. Original numbers, dates, branch names and reasoning below
+are retained as that snapshot's evidence, not measurements of `c2ab623`. Current strict deployment,
+RAM/KV/HTTP/lease contracts are in [V4_CLUSTER_DEPLOY_GUIDE.md](V4_CLUSTER_DEPLOY_GUIDE.md),
+[V4_NEXT_PHASE.md](V4_NEXT_PHASE.md) and [V4_BENCHMARK.md](V4_BENCHMARK.md).
+Four RTX 5090 >=40 / six >=30 committed-decode acceptance on the current recipe remains pending.
+Historical launch snippets are not today's production commands: any intentionally reproduced
+old raw-op listener needs explicit `--legacy-protocol`; current production pins a complete signed
+plan/controller key and reaches the real tail endpoint, with no silent `ret_relay` downgrade.
+
 > **SUPERSEDED for the ring launch by [`V4_FULL_STACK.md`](V4_FULL_STACK.md).** That branch composes
 > these levers onto PIPELINED speculation, adds whole-layer CUDA graphs, and fixes the grouped-MoE
 > bank layout — which changes two conclusions below (marked CORRECTED). This file is kept because the
@@ -9,7 +18,9 @@ Four independently-built, independently-measured levers for the DeepSeek-V4-Flas
 onto one branch and proven together on CPU. Each was verified ALONE in its own worktree; this file is
 what the composition actually costs and how to drive it on the ring.
 
-Every lever is opt-in and default OFF. With no `V4_*` set, this branch is byte-identical to master.
+Those added levers were opt-in on the historical branch. Current defaults and import-time
+bindings are defined by the live registry; `V4_MOE_DECODE` remains on by default. Byte identity
+against the old master is a historical branch check, not a current no-environment guarantee.
 
 ---
 
@@ -80,7 +91,7 @@ a CUDA graph, and the serve path does not deliver that — `_BlockGraphs` leaves
 CONSTRUCTION, and whole-layer mode leaves the *real routed* MoE eager between two graphs for the same
 reason (the reference's expert dispatch drains the device and branches in Python).
 
-## Recipe — what to launch the GPU ring with
+## Historical recipe — not a current strict deployment command
 
 Stage-side (per box). `stage_launch_cmd`'s `extra_env` is placed AFTER its own `V4_CUDA_GRAPH=1`
 default, so anything set here wins:
@@ -109,7 +120,8 @@ additive (all live on the `s == 1` path); step 5 is the competing arm, run LAST 
 5. **separately**: step 1 `+ V4_FAST_VERIFY=1`, with the levers of 2-4 OFF, compared against step 4
 
 Steps 1-4 must stay token-identical to step 1 on the same prompt, with the one caveat in "numerics"
-below. Step 5 is the one where a token may legitimately move.
+below. Step 5 historically investigated a numerical change. It is not permitted to bypass today's
+chosen numerical/parity contract merely because the experiment is labeled fast verify.
 
 ### Precedence, and why the order is load-bearing
 
@@ -148,7 +160,7 @@ against the reference. `V4_REF_SLIM` (item 1) is gated separately and is the los
 off for the lossless measurement; it is a separate, later, quality-gated experiment, and it must stay
 off permanently for any deployment that really does store an fp8 KV cache.
 
-**`V4_MOE_DECODE=0`** — never. It is the grouped kernel's fallback for every shape grouped declines.
+**`V4_MOE_DECODE=0`** — excluded from this historical lossless recipe. It is the grouped kernel's fallback for every shape grouped declines.
 
 ## Numerics — what "lossless" does and does not cover
 

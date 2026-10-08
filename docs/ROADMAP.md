@@ -1,5 +1,27 @@
 # Shard roadmap
 
+## Current implementation status (2026-10-08, `c2ab623`)
+
+The dated phases below retain the original experiment/design history; their week
+estimates, spend decisions and historical tok/s values are not current launch
+authorization or universal hardware guarantees.
+
+| Area | Current status and remaining gate |
+|---|---|
+| Open registration/lifecycle | Signed exact cohorts, resource templates, GPU/RAM/pin leases and shared HTTP/SSE exist; reports are not hardware attestation and readiness requires signed warmup |
+| Placement | Local/region or measured low-latency frontier before expansion; directed actual routes, explicit RTT semantics/external coordinator, exact spans/roles/index/width and bounded finite-window predictions |
+| V4 memory mechanisms | Opt-in local RAM experts/cache/prefetch, layer KV working set and gated query/index-score chunks are wired; CPU fixtures do not establish CUDA parity, large pin pools or speed targets |
+| GPT-OSS service | Verified downloads/native packing, approved templates, authenticated sessions, shared service and committed-token metrics; see [GPT_OSS_PRODUCTION.md](GPT_OSS_PRODUCTION.md) for real recipe acceptance |
+| Numerical/privacy/economics | Backend-specific numerical gates remain; receipts do not prove computation/privacy/hardware; payment/decentralized governance is external integration/research |
+
+The V4 **4x5090 >=40 / 6x5090 >=30 committed decode tok/s** targets remain pending
+independent real-cluster evidence under [V4_BENCHMARK.md](V4_BENCHMARK.md). Historical
+M2.5/GPT-OSS/GLM runs do not satisfy them. Future models need real adapters and
+separate compatible recipes. Start with [ARCHITECTURE.md](ARCHITECTURE.md) and
+[OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md) for current architecture.
+
+## Original June betanet phases
+
 **North star:** Shard is the engine for a permissionless worldwide compute fabric — *BitTorrent for
 VRAM/compute* — where GPUs of any kind swarm to run many models, ever bigger, and eventually training and
 general compute. **MiniMax-M2.5 sharded inference is the betanet: the first rung, the proof-of-concept, not
@@ -87,68 +109,30 @@ The privacy pillar earns its word here, phase by phase, never overclaimed earlie
 - **Security pass** on the rendezvous + transport.
 - Full detail and the privacy threat model live in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## DeepSeek-V4 Hybrid Runtime & Dual-Resource Swarm Roadmap (11-Step Phased Execution)
+## DeepSeek-V4 memory execution: code status versus acceptance
 
-For DeepSeek-V4-Flash and large MoE architectures, we transition from all-resident GPU allocation to a verified dual-resource (GPU + host RAM) placement and local expert cache. The progression strictly follows an 11-step execution order to respect engineering dependencies and manage risk: **complete verifiable local expert caching first, followed by prefetch and KV paging.**
+The original eleven-step order remains useful, but implemented tooling, connected
+runtime paths and hardware acceptance are different milestones:
 
-1. **Step 1: Baseline Correctness & Performance Acceptance Targets** *(Completed)*
-   - Freeze the benchmark harness ([V4_BENCHMARK.md](V4_BENCHMARK.md)): lock checkpoint, quant formats, kernel knobs, prompt suite, context/generation lengths, warm/cold rules.
-   - Record committed tokens, per-stage wall clock times, speculative acceptance rates, and verified hardware topology.
-   - Acceptance target preserved: 4×5090 short-context ≥ 40 tok/s, 6×5090 ≥ 30 tok/s. Throughput accounts only for committed tokens; bit-identical parity and receipt checks remain mandatory.
+| Step | Actual status at this audit |
+|---|---|
+| 1. Frozen baseline/evidence | Benchmark protocol and validators exist; CPU/code validation does not mean the GPU baseline or speed gate passed |
+| 2. Runtime observations | Optional route/DMA/KV/allocator/profile fields are validated and signed in [receipt.py](../shard/receipt.py); signed observations are not independent hardware proof |
+| 3. Resource contract | Explicit GPU/host/pinned bytes, source/configuration binding, [probes](../shard/probe.py) and V4 profiles exist; scalar defaults are estimates, exact requirements need real measurement |
+| 4. Separate weight tiers | Opt-in RAM canonical expert banks and GPU resident attention/router/shared/norm/boundary weights are constructed without a transient full GPU expert bank |
+| 5. Fixed GPU cache | Local slot/lease/epoch guards, host budgets and conversation heat are implemented; real CUDA concurrency/pressure acceptance remains required |
+| 6. Demand DMA/graph seam | Misses copy from pinned local RAM and use existing GPU arithmetic; hybrid MoE stays outside capture with supported graph islands; production CPU fallback stays off |
+| 7. Placement | GPU/RAM estimates and fresh exact executable templates, role/index/width constraints and shared-memory budgets are wired; predictions are not acceptance |
+| 8. Four/six-card acceptance | **Pending hardware evidence**; tooling in `phase0/v4_acceptance.py` cannot turn simulated/CPU results into 40/30 tok/s proof |
+| 9. Prefetch/prefill | Controlled known-hot prefetch is wired before attention; query/index-score chunks are gated in Stage. Full projections, Compressor recurrence and MoE keep original shapes. The generic chunk executor's existence is not proof of whole-prompt activation/expert-streaming bounds |
+| 10. KV tiers | `v4_kv_runtime.py` connects a shared layer working set, pinned histories and rollback snapshots. Reference valid-prefix reads remain context-dependent and add PCIe traffic; no generic sliding-window approximation |
+| 11. Expansion | CPU expert math/cross-node expert replicas are not enabled production paths; broader numerical/hardware recipes have separate gates |
 
-2. **Step 2: Runtime Telemetry Instrumentation & Signed Receipts** *(Completed)*
-   - Make bottlenecks measurable before execution path changes ([RUNTIME_METRICS.md](RUNTIME_METRICS.md)).
-   - Instrument expert routing totals, cache hits, DMA counts / bytes / wait latencies, CPU fallback count, and GPU/RAM KV footprints (current & peak).
-   - Wire telemetry collection into [shard/receipt.py](shard/receipt.py) before signing; express hit rate over total route operations across prefill, decode, and speculative replay.
-
-3. **Step 3: Dual-Resource GPU + RAM Placement Contract** *(Completed)*
-   - Expand `ModelRuntime` capabilities ([RESOURCE_CONTRACT.md](RESOURCE_CONTRACT.md)) to report resident weights, expert pools, KV, cache slots, graph pools, workspace, and loading peaks.
-   - Extend [shard/probe.py](shard/probe.py) to measure available host RAM, pinned memory limits, and H2D bandwidth; supply V4 profile.
-   - Budget head, tail, and intermediate stages separately, accounting for tail's 3 MTP blocks and constraining layers 40–42 to the tail node.
-
-4. **Step 4: Refactor V4 Stage Loader with Dual Weight Pools** *(Completed)*
-   - Refactor `engines/deepseek_v4/v4_stage.py` initialization and loading:
-     - Place attention, routers, shared experts, normalization/HC parameters, and boundary embedding/head in GPU VRAM.
-     - Store routed experts in native FP4 weights and scales in host RAM, pinned under explicit memory budgets.
-     - Allocate GPU expert cache slots to store active copies.
-   - Separate allocation pools at construction time rather than allocating to GPU and offloading. Preserve all-resident mode as a baseline comparison and rollback path.
-
-5. **Step 5: Implement Fixed-Slot Local GPU Expert Cache** *(Completed)*
-   - Implement expert cache manager with fixed-address weight slots, expert-ID-to-slot mapping, and slot lease state tracking.
-   - Guarantee slot loading, hit detection, eviction, and slot reuse correctness first; follow with per-layer quotas, frequency decay, and conversation heat adjustments.
-   - Compute cache capacity strictly within total runtime budget, reserving space for graph pools, prefill buffers, and network transport.
-
-6. **Step 6: On-Demand H2D DMA & CUDA Graph Adaptation** *(Completed)*
-   - Stream missed experts from pinned RAM into fixed GPU slots via DMA, executing with existing GPU kernels.
-   - Adjust `v4_moe_grouped.py` and `v4_whole_layer_graph.py` address bindings, capture boundaries, and stream sync events.
-   - Overlap H2D transfer with shared expert / resident expert compute; keep attention-overlapping prefetch separate.
-   - Preserve logical expert accumulation order, hash-routed duplicate semantics, and speculative rollback. Keep CPU fallback disabled by default.
-
-7. **Step 7: Wire Scheduler to Enforce Dual-Resource Placement** *(Completed)*
-   - Update `scheduler.py`, `plan.py`, and `topology.py` to consume measured host RAM, H2D bandwidth, and GPU constraints.
-   - Placements must satisfy RAM, GPU, and loading peak limits, factoring stage compute time, DMA miss overhead, tail workload, and WAN RTT.
-   - Validate against explicit 4-node and 6-node tiered configurations before automated placement (`tests/test_v4_scheduler_plan.py`).
-
-8. **Step 8: First-Round 4-Node / 6-Node Hardware Acceptance** *(Completed)*
-   - Validate complete execution path: compare 6-node all-resident vs. 6-node cache mode, then evaluate 4-node configurations.
-   - Test across cold cache, warm cache, frequent eviction, multi-turn dialogues, speculative rejection, and rollback.
-   - Measure whether reduced WAN hops offset DMA latency costs; adjust cache budgets and layer assignments accordingly (`phase0/v4_acceptance.py`, `tests/test_v4_acceptance.py`).
-
-9. **Step 9: Chunked Prefill & Controlled Prefetching** *(Completed)*
-   - Introduce chunked prefill state management to reduce peak activation and temporary buffer memory.
-   - Stream large chunk prefills sequentially through non-resident experts; fetch small chunks on demand based on actual routing.
-   - Implement speculative decode prefetching using historical heat or prediction heuristics, falling back gracefully to on-demand misses upon misprediction (`engines/deepseek_v4/v4_chunked_prefill.py`, `tests/test_v4_chunked_prefill.py`).
-   - Verify numerical parity, TTFT, and cache pollution across diverse chunk sizes.
-
-10. **Step 10: V4-Dedicated KV Bounds & Paging** *(Completed)*
-    - Manage sliding-window state, compressed KV, indexer read sets, compressor states, and rollback checkpoints.
-    - Pinned host RAM retains full conversation history; GPU VRAM holds active working set (`engines/deepseek_v4/v4_kv_paging.py`, `tests/test_v4_kv_paging.py`).
-    - Verify lossless storage migration, long-context integrity, and speculative rollback. Re-balance GPU budget between expert cache and KV slots based on empirical data.
-
-11. **Step 11: Post-Speedline Capability Expansion** *(Completed)*
-    - CPU expert computation must pass separate numerical parity and performance acceptance before enablement (`engines/deepseek_v4/v4_expansion.py`, `tests/test_v4_expansion.py`).
-    - Secondary models, cross-node expert replication, and broader runtime generalizations proceed only after passing 4-node/6-node speed gates.
-    - Activation privacy and decentralized coordination remain dedicated independent tracks.
+Use [RUNTIME_METRICS.md](RUNTIME_METRICS.md),
+[RESOURCE_CONTRACT.md](RESOURCE_CONTRACT.md) and
+[V4_HYBRID_RUNTIME.md](V4_HYBRID_RUNTIME.md) for concrete controls/scopes. The
+inherited V4 reference is not replaced by Strata's C++ engine. The separately
+requested GPT-OSS integration does not waive V4's benchmark or numerical criteria.
 
 ## Beyond the betanet — where the fabric goes
 

@@ -1,9 +1,13 @@
 # Open inference network implementation
 
+Code audit: **2026-10-08, `c2ab623`**. Control/service contracts are distinct from
+GPU throughput acceptance and remote hardware attestation.
+
 FlyAI accepts GPU contributors without an operator allowlist. Registration,
 model execution eligibility, transport authentication and request privacy are
-separate contracts. Distinct colocated GPUs are permitted. Same public IP and
-region labels guide discovery; measured links decide placement.
+separate contracts. Distinct colocated GPUs are permitted. Public IP is
+informational; region labels guide search and measured effective data channels
+constrain placement.
 
 ## Implemented components
 
@@ -15,7 +19,7 @@ for immutable downloads, exact executable templates, measured chunk geometry and
 |---|---|---|
 | Signed open offers | `shard/offers.py` | Reuse Ed25519 libp2p identity, sequence/TTL, model cohorts, optional exact stage calibrations |
 | Durable node reservations | `shard/leases.py` | SQLite prepare/commit/renew/release, GPU fencing, aggregate host RAM/pin budgets |
-| Local resident lifetime | `shard/leased_runtime.py` | Hold resources until the actual engine process exits; check leases at V4 frame boundaries |
+| Local resident lifetime | `shard/leased_runtime.py` | Hold resources through process cleanup; V4/GPT-OSS frames check leases |
 | Locality discovery frontier | `shard/locality.py` | Expiring sparse links, bounded candidate selection, local/region/global expansion |
 | Joint placement | `shard/plan.py`, `shard/topology.py` | Joint head/tail/layer assignment and distinct serial/pipeline objectives |
 | Finite-window cost prediction | `shard/planning_cost.py` | Compute/link/shared-resource calendars, feedback, acceptance and replay assumptions |
@@ -23,6 +27,8 @@ for immutable downloads, exact executable templates, measured chunk geometry and
 | Multiple-ring request queue | `shard/ring_router.py` | Shared tenant limits and idempotency, one serial worker per ring, model/version routing |
 | Reference control service | `shard/control_plane.py` | Open offer HTTP registry, signed lease RPC, formation and independent renewal |
 | V4 serving entrypoint | `engines/deepseek_v4/v4_gateway.py` | Single-ring compatibility and `--ring-pool` serving |
+| Generic open service | `shard/network_service.py` | Discover agents, select exact templates, pin actual routes and launch approved local processes |
+| GPT-OSS service | `engines/gpt_oss/network_service.py` | Shared lifecycle/HTTP/SSE with native MXFP4 partial-layer execution |
 
 The engine remains independent of c0mpute accounts, reputation and payment.
 The reference controller is replaceable. Its node adapters and registry contracts
@@ -68,7 +74,10 @@ python -m shard.control_plane registry --db registry.sqlite --host 127.0.0.1 --p
 
 POST the signed JSON to `/offers`. POST `{"cohort_id":"..."}` to `/snapshot`
 to obtain currently eligible measured candidates. Any valid identity can register.
-Node IDs are `PeerId/GPU-UUID`; several GPUs may reuse the host's sidecar identity.
+Node IDs are `PeerId/GPU-UUID`. Registration may represent several GPUs under one
+host key, but a selected V4/GPT-OSS ring currently needs distinct stage receipt
+signers: use stable per-GPU identities for those stages. One operator may own them
+all; different keys do not attest different hardware or owners.
 The signing key is never uploaded. Sequence values must increase for updates;
 expired bodies release active registration capacity, while a bounded recent
 sequence history protects against replay across restart.
@@ -83,7 +92,12 @@ signature. Unknown resource byte counts are JSON null. `resources` contains
 Each model entry contains `cohort`, `profile`, `measured_at`, and optionally
 `calibrations`. A calibration is `{"requirements": PlacementRequirements,
 "runtime_config": measured_config}`. Node identity, model/checkpoint identity,
-layer bounds, role and configuration digest must match. Do not publish commands,
+layer bounds, roles and configuration digest must match. Declared stage/index/
+nstages fields constrain execution geometry too. Different runtime hashes for one
+span are distinct templates; exact duplicates fail. Snapshot exports fresh fitting
+`allowed_spans` with actual GPU/host/pinned byte budgets. Missing calibration may
+stay registered without becoming executable; production formation requires exact
+templates. Do not publish commands,
 private token keys or `SHARD_*` provisioning in this record.
 
 Node-local lease service:
@@ -137,10 +151,11 @@ plan = plan_ring(
 )
 ```
 
-An edge carries `src`, `dst`, `rtt_ms`, `measured_at`, `ttl_s` and optional
+An edge in version 1 carries `src`, `dst`, `rtt_ms`, `measured_at`, `ttl_s` and optional
 `bandwidth_mbps`. The existing measurement/orchestration layer supplies these
 observations. Missing and expired links do not become zero-latency edges.
-Local candidates are tried first. A remote complete regional ring is considered
+Dense/v1 RTT remains conservative RTT-as-hop pricing; it is not measured one-way
+delay. Local candidates are tried first. A complete regional ring is considered
 before a mixed-region ring. Expansion reasons and candidate attempts are returned.
 Unknown region labels can still participate through measured proximity.
 
@@ -153,15 +168,43 @@ region. Legacy callers supplying their own dense mesh retain compatibility.
 Serial objectives retain summed traversal cost. Pipeline objectives simulate
 finite windows and resource calendars, including propagation, serialization,
 shared PCIe service, acceptance assumptions and replay. This version supports
-single-token frames; `frame_tokens > 1` is rejected until independently measured
-chunk geometry is available. This does not restrict the existing engine's
-supported execution modes.
+single-token estimates and genuinely bound K+1 chunks. A chunk workload declares
+`frame_tokens=K+1`, `draft_tokens=K`, context, cold/warm state, finite depth,
+acceptance gain, cancel rate and stale frames per valid round. It requires fresh
+`shard-stage-trace/2` matching node/GPU/cohort/runtime hash and that geometry;
+missing, expired or differently shaped observations cannot become a fast scalar
+chunk estimate. Stale/replay work is conservatively priced without inventing
+early-abort savings. Same-K adaptive depth may lower the window; automatic GPT-OSS
+formation rejects mixed-K adaptive execution against a fixed chunk calibration.
 
 A usable `shard-stage-trace/1` observation binds node ID, GPU UUID, cohort ID,
 runtime configuration hash, single-token frame geometry, layer range and TTL.
 Range scaling, missing context/warmness and scalar estimates are labeled as
 uncertain. `planning.prediction_only` is always true. These estimates cannot
-certify a GPU performance target or manufacture speculative acceptance.
+certify a GPU performance target or manufacture speculative acceptance. Invalid
+or mismatched traces fail offer admission; unbound capabilities remain registered
+but ineligible, and stale/invalid persisted traces cannot poison healthy candidates.
+
+Version 2 (`shard-link-measurements/2`) records `src`, `dst`, `route_id`, `channel`,
+`src_endpoint`, `dst_endpoint`, `dialer_id`, `reachable`, `latency_ms`,
+`latency_kind`, `hop_policy`, timestamp/TTL and optional bandwidth. Measured one-way
+uses `measured_one_way`; RTT uses `conservative_rtt` or explicit
+`half_rtt_assumption`. Distinct effective channels between the same nodes can
+coexist; `route_ids` pins a selection. Missing routes stay unreachable. A directed
+chain does not require a bidirectional star around its head.
+
+Production v2 additionally requires the actual `dial_endpoint` and explicit
+`coordinator_id`. `route_endpoints[route_id]` must equal that measured connect
+address and the correct engine dialer. The coordinator opens the tail's return
+listener even though reply data logically flows tail -> coordinator. Entry and
+return measurements account for an external coordinator; no in-region placement
+is inferred from a small latency value alone.
+
+Exact templates constrain span/head/tail and optional stage-index/nstages. Their
+actual peaks replace coarse reservation arithmetic without double subtraction.
+GPU UUIDs remain unique and shared memory domains aggregate actual RAM/pinned
+requirements. Truncated template searches report uncertainty rather than global
+optimality or hardware availability proof.
 
 ## Formation and serving
 
@@ -184,8 +227,9 @@ python engines/deepseek_v4/v4_network_service.py --config network.json --auth-fi
 `controller_sidecar_key`, `formations`, optional `aliases` and `default_model`.
 Each formation contains `ring_id`, exact `cohort`, calibrated `profile`,
 `measurements` or its JSON path, coordinator `dir`, current launcher `head`/`tail`
-routes, and optional locality/workload/mode/lease timing. Non-tail stage forwarding
-uses the existing local sidecar route or `stage_next` overrides. Configure the
+routes, locality/workload/mode/lease timing and, for v2, `coordinator_id`, selected
+`route_ids` and `route_endpoints`. Legacy v1 uses configured sidecar/`stage_next`
+routes; v2 may not silently fall back to their default ports. Configure the
 inference sidecars through the existing launcher before serving. The registry
 can discover arbitrary signed GPU offers with compatible calibrations and usable
 lease endpoints; it does not require an operator roster in this config.
@@ -251,8 +295,8 @@ do not by themselves prove honest model computation. Existing local challenges
 remain available; payments/anti-Sybil policy belong to the consuming network.
 Open contribution does not conceal activations from computing participants.
 
-Actual four/six RTX 5090 capacity, PCIe overlap and sustained throughput are still
-awaiting the user's Vast cluster. Preserve the 4-card >=40 and 6-card >=30 valid
+Actual four/six RTX 5090 capacity, PCIe overlap and sustained throughput require
+separate real-cluster evidence. Preserve the 4-card >=40 and 6-card >=30 valid
 output tok/s acceptance targets and raw signed benchmark evidence. Future model
 families require their own real backend and resource measurements.
 

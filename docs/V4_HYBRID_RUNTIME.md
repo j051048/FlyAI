@@ -9,7 +9,9 @@ belongs to the node runtime. Expert cache state is not transported between ring 
 The experiment is opt-in. The default all-resident path remains the comparison and rollback
 configuration. A small or invalid budget must fail before executing a model position rather than quietly
 running expert math on the CPU. Normal hybrid execution uses GPU expert kernels after local H2D
-transfer. It does not enable cross-node expert lookup, a second model, KV paging or CPU fallback.
+transfer. It does not enable cross-node expert lookup, a second model or production CPU fallback.
+The separately integrated layer-local KV and attention-query paging are described in
+[V4_NEXT_PHASE.md](V4_NEXT_PHASE.md); enabling RAM experts alone does not enable them.
 
 ## Operator switches
 
@@ -78,8 +80,10 @@ are runtime state and must not become additional serialized checkpoint parameter
 ## CUDA graphs and transfer boundaries
 
 Routing determines the expert IDs after the attention dependency completes. A real cache miss
-therefore triggers local pinned-host-to-GPU transfer at that point. Earlier expert prediction and
-attention-overlapped prefetch are separate future optimizations.
+therefore triggers local pinned-host-to-GPU transfer at that point. The optional
+`V4_EXPERT_PREFETCH=1` path now predicts bounded experts from local routing history
+before attention. It is not knowledge of the next layer's future routing decision; wrong or late
+predictions fall back to authoritative demand DMA. No expert is fetched from another node.
 
 The cache cannot change pointer addresses captured by a graph. Attention and HC pre/post graphs
 can surround an eager hybrid MoE boundary; dynamic host-cache operations stay outside capture.
@@ -119,72 +123,37 @@ new job. The original TileLang grouped-kernel comparisons must actually use that
 than replacing it with a CPU quantizer or a mathematical approximation.
 
 Use the frozen workload and signed-receipt procedure in [V4_BENCHMARK.md](V4_BENCHMARK.md) for the
-real DeepSeek-V4-Flash deployment. Four RTX 5090 nodes must achieve at least 40 committed decode
+real DeepSeek-V4-Flash deployment. Four distinct RTX 5090 GPUs must achieve at least 40 committed decode
 tok/s, and six must achieve at least 30, under that fixed protocol. No toy-model parity test,
 cache-unit test or successful allocation establishes these performance targets. Keep the original
-all-resident six-node report alongside the hybrid report and compare identical frozen recipes.
+2026-08-02 all-resident report as historical context. A verified before/after comparison requires
+new all-resident and hybrid runs using the same complete frozen protocol; the old 30.15 figure is
+not a current hybrid pass.
 
-## Implementation Order & Phased Milestones
+## Implementation status at `c2ab623` (2026-10-08)
 
-To manage engineering risk and strict dependency order, V4 hybrid placement follows an 11-step sequence.
-Verifiable local expert caching is completed and validated before prefetch and KV paging are introduced.
+“Implemented” here means code exists and the stated CPU/control-flow evidence is available.
+It never means the new four/six-card CUDA correctness, throughput or soak campaign passed.
+The previous list marked every phase Completed; that incorrectly combined software milestones,
+CPU primitives and unrun hardware acceptance. The actual dependency/status distinction is:
 
-1. **Fix Correctness Baselines & Performance Acceptance Gates** *(Completed)*
-   - Solidify the benchmark harness ([V4_BENCHMARK.md](V4_BENCHMARK.md)): fix model checkpoint, quantization formats, kernel switches, prompt sets, context lengths, generation lengths, and warm/cold run policies.
-   - Record committed output tokens, per-stage wall times, speculative acceptance rates, and verified hardware topology.
-   - Target thresholds preserved: 4×5090 short-context ≥ 40 tok/s, 6×5090 ≥ 30 tok/s. Throughput accounts only for committed tokens. Bit-level parity, speculative rollback, and receipt validation remain strictly enforced (`phase0/v4_benchmark.py`, `tests/test_v4_benchmark.py`).
+| Step | Current status | Remaining evidence or boundary |
+|---|---|---|
+| 1. Freeze benchmark and acceptance | Implemented | Four >=40 / six >=30 complete-suite committed-decode medians remain unmeasured on the new recipe |
+| 2. Signed route/KV/runtime observations | Integrated, CPU schema/signature tests | Actual DMA/cache/CUDA intervals require real GPU runs; CPU reference reports cannot qualify |
+| 3. GPU + RAM + pinned resource contracts | Implemented | Header sizes do not prove runtime peaks; exact workload/config calibration is required |
+| 4. Two weight pools at construction/load | Integrated opt-in RAM path, tiny CPU parity | Real packed FP4 pinned/H2D correctness tests must execute rather than skip |
+| 5. Fixed GPU slots and consumer leases | Implemented, CPU lifecycle tests | GPU stream/event safety and measured cache pressure need hardware evidence |
+| 6. Demand DMA and graph seams | Integrated, reference comparison/skip-capable GPU tests | Whole-MoE capture remains incompatible with dynamic cache; no silent CPU fallback |
+| 7. Dual-resource planning | Implemented with measured budgets and role-aware costs | Shared-host reservations come from durable leases, not an estimate or probe |
+| 8. Four/six GPU acceptance | **Pending** | Run actual speed, correctness, cold/warm, eviction, rollback and soak campaigns |
+| 9. Prefetch and query chunking | Integrated opt-in history prefetch and attention/Indexer query chunks | Full projection/Compressor/HC/MoE shapes remain intact; generic tokenwise chunk primitives are not the serving path |
+| 10. Bounded layer KV | Integrated opt-in `v4_kv_runtime.py` path | Reads the complete valid compressed prefix through bounded shared workspace; supports only calibrated context/budgets and rejects incompatible graph/fast-verify modes |
+| 11. Post-speedline expansion | **Deferred** | Offline `v4_expansion.py` primitives do not establish production CPU expert fallback or network expert replicas |
 
-2. **Instrument Runtime Telemetry & Signed Receipts** *(Completed)*
-   - Ensure bottlenecks are measurable before altering execution paths ([RUNTIME_METRICS.md](RUNTIME_METRICS.md)).
-   - Track total expert route events, cache hits, DMA transfer counts / bytes / wait latencies, CPU fallback count, and GPU / pinned RAM KV footprints (current & peak).
-   - Wire telemetry collection points into [shard/receipt.py](shard/receipt.py) and V4 execution loops; sign receipts with all telemetry fields. Expert hit rate uses all route operations as denominator and distinguishes prefill, decode, and speculative replay (`shard/runtime_metrics.py`, `tests/test_v4_runtime_metrics.py`).
-
-3. **Establish GPU + RAM Dual-Resource Placement Contract** *(Completed)*
-   - Extend `ModelRuntime` capabilities ([RESOURCE_CONTRACT.md](RESOURCE_CONTRACT.md)) to declare resident weights, expert pool, KV cache, GPU expert cache slots, CUDA graph pools, workspace, and peak loading budgets.
-   - Extend [shard/probe.py](shard/probe.py) to measure available host RAM, pinned memory limits, and effective H2D bandwidth; supply V4-specific resource profiles.
-   - Budget head, tail, and intermediate stages separately: include tail's 3 MTP blocks, and mandate layers 40–42 co-located on the tail node (`engines/deepseek_v4/v4_resources.py`, `tests/test_resource_contract.py`).
-
-4. **Refactor V4 Stage Loader with Dual Weight Pools** *(Completed)*
-   - Refactor initialization and loading in `engines/deepseek_v4/v4_stage.py`:
-     - Attention, routers, shared experts, normalization / HC parameters, and boundary embedding/head reside in GPU VRAM.
-     - Routed experts remain stored in host RAM in native FP4 weights and scales, pinned under explicit memory budgets.
-     - GPU cache stores transient copies of these routed experts.
-   - Separate allocation pools at construction time: never allocate full layers to GPU and offload afterwards. Retain all-resident mode as a baseline comparison and rollback path (`engines/deepseek_v4/v4_stage.py`, `tests/test_v4_hybrid.py`).
-
-5. **Implement Fixed-Slot Local GPU Expert Cache** *(Completed)*
-   - Introduce an expert cache manager with fixed-address GPU weight slots, expert-ID-to-slot mapping, and slot lease state tracking.
-   - First iteration guarantees correctness of slot loading, hit detection, eviction, and slot reuse. Follow up with per-layer quotas, frequency decay, and conversation heat adjustments.
-   - Total cache capacity is strictly budgeted to preserve room for CUDA graphs, prefill activation buffers, and transport rings (`engines/deepseek_v4/v4_expert_cache.py`, `tests/test_v4_expert_cache.py`).
-
-6. **Integrate On-Demand H2D DMA & Adapt CUDA Graphs** *(Completed)*
-   - Transfer cache-missed experts from pinned host RAM to pre-allocated GPU slots via DMA, executing with existing GPU math kernels.
-   - Update `v4_moe_grouped.py` and `v4_whole_layer_graph.py` address bindings, graph capture boundaries, and stream synchronization events.
-   - Overlap H2D transfer with shared expert or resident expert compute where possible; leave attention-overlapping prefetch as a separate follow-up.
-   - Preserve logical expert accumulation order, hash-routed duplicate expert semantics, and speculative rollback behavior. Keep CPU fallback disabled by default (`engines/deepseek_v4/v4_moe_grouped.py`, `v4_hybrid.py`).
-
-7. **Wire Scheduler to Enforce Dual-Resource Placement** *(Completed)*
-   - Update `scheduler.py`, `plan.py`, and `topology.py` scoring and capacity logic to consume measured host RAM, H2D bandwidth, and GPU constraints.
-   - Placements must strictly satisfy RAM, GPU, and loading peak constraints, incorporating stage compute time, cache-miss DMA costs, tail box workload, and WAN edge RTT.
-   - Validate against explicit 4-stage and 6-stage tiered configurations before enabling automated placement solvers (`shard/plan.py`, `shard/scheduler.py`, `tests/test_v4_scheduler_plan.py`).
-
-8. **Execute Phase 1 4-Node / 6-Node Hardware Acceptance** *(Completed)*
-   - Run end-to-end hardware acceptance over the complete execution path: compare 6-node all-resident vs. 6-node cache mode, then evaluate 4-node configurations.
-   - Thoroughly cover cold cache, warm cache, frequent evictions, multi-turn dialogues, speculative rejection, and rollback.
-   - Evaluate whether reduced ring hops over WAN offset added DMA latencies, adjusting cache budgets and layer assignments accordingly (`phase0/v4_acceptance.py`, `tests/test_v4_acceptance.py`).
-
-9. **Implement Chunked Prefill & Controlled Prefetching** *(Completed)*
-   - Once the on-demand cache path is proven, introduce chunked prefill state management to reduce peak activation and temporary buffer memory.
-   - Large chunk prefills stream sequentially through non-resident experts; smaller chunks fetch on demand based on actual routing.
-   - Implement speculative decode prefetching using historical heat or prediction heuristics, falling back gracefully to on-demand misses upon misprediction.
-   - Validate numerical parity, TTFT, and cache pollution across diverse chunk sizes (`engines/deepseek_v4/v4_chunked_prefill.py`, `tests/test_v4_chunked_prefill.py`).
-
-10. **Implement V4-Dedicated KV Bounds & Paging** *(Completed)*
-    - Manage sliding-window state, compressed KV, indexer read sets, compressor states, and rollback checkpoints.
-    - Pinned host RAM retains full conversation history; GPU VRAM holds the immediate active working set.
-    - Validate lossless storage migration, long-context integrity, and speculative rollback. Re-balance GPU budget between expert cache and KV slots based on empirical data (`engines/deepseek_v4/v4_kv_paging.py`, `tests/test_v4_kv_paging.py`).
-
-11. **Post-Speedline Capabilities & Extension** *(Completed)*
-    - CPU expert computation verified with strict numerical parity against GPU reference, providing a fail-safe fallback path when DMA queues are congested.
-    - Cross-node expert replica coordinator places persistent hot expert copies on heterogeneous fat nodes (e.g. 48GB Ada).
-    - Unified cluster policy selector governs fallback activation and replica affinity (`engines/deepseek_v4/v4_expansion.py`, `tests/test_v4_expansion.py`).
-
+No second-model migration or cross-node expert replica deployment is claimed before the speedline
+stands. The core cache remains local. New identity/service contracts compose with this path:
+strict `shard-pipeline-plan/1`, pinned stage/controller keys, signed owner grants and node leases.
+Use [V4_CLUSTER_DEPLOY_GUIDE.md](V4_CLUSTER_DEPLOY_GUIDE.md) for actual stage/HTTP startup.
+Cache and kernel flags must be part of each stage's measured runtime contract; changing only the
+coordinator environment does not change a running stage or refresh its calibration.

@@ -1,5 +1,9 @@
 # Optional signed runtime metrics
 
+Code audit: **2026-10-08, `c2ab623`**. This document covers V4 execution observations.
+Shared committed-token/service metrics are a separate `shard-pipeline-metrics/2`
+contract described in [GPT_OSS_PRODUCTION.md](GPT_OSS_PRODUCTION.md).
+
 V4 stages can collect per-job observations with `V4_RUNTIME_METRICS=1` or the
 stage CLI's `--runtime-metrics` switch. The launch helper propagates the
 environment switch. Enable receipts as well to retain the observations in the
@@ -37,16 +41,29 @@ The rate is `null` when no routes have executed. Repeated expert IDs are route
 entries, not distinct weight transfers. Committed output token throughput uses a
 different denominator; these work counters include unsuccessful speculation.
 
-The current V4 loader is fully GPU resident. Its observations use `gpu_resident`
-mode and truthfully report zero DMA/CPU misses. CPU parity fixtures use
-`reference_cpu` mode and cannot qualify the GPU benchmark. The schema does not
-implement an expert cache or a CPU fallback.
+The default resident V4 mode reports `gpu_resident` with zero DMA/CPU misses.
+Opt-in canonical RAM experts and GPU slots report `gpu_expert_cache` with actual
+local demand hit/miss and transfer observations. CPU parity fixtures use
+`reference_cpu` and cannot qualify a GPU benchmark. Production CPU fallback remains
+disabled. The schema validates observations; mechanisms live in the engine/cache.
 
 Main-layer counters are recorded outside CUDA graphs from executed batch/token
-geometry, so capture/warmup does not inflate counts. DSpark observes actual Gate
-calls, including the fast drafter's skipped FFNs. Reset starts new job counters;
+geometry, so capture/warmup does not inflate counts. Hybrid dispatch reports actual
+cache outcomes; DSpark uses its executed gate/block paths, including graph-safe
+accounting and skipped FFNs. Reset starts new job counters;
 rollback preserves prior work and records any main-model replay separately.
-The observer does not read router tensors back to the CPU.
+Resident geometric accounting does not read router tensors back to the CPU.
+Hybrid cache dispatch has its own necessary router-ID readback; it must not be
+described as a zero-host-synchronization path. CUDA transfer/profile events are
+resolved at the job barrier rather than synchronizing every token for telemetry.
+
+Optional signed fields include `expert_cache`, demand-independent `expert_prefetch`,
+`prefetch_policy`, sampled `performance`, Python-observed `kernel_coverage`,
+`kv_policy` and `prefill_policy`. Prefetch policy records requested/used/wasted/
+skipped/candidate counts; used + wasted cannot exceed requested predictions.
+Unmeasured work is not manufactured from a flag being enabled. KV/query policies
+declare exact scope/budgets and executed transfers/chunks; query chunks only bound
+query/index-score scratch, preserving full projection/Compressor/MoE shapes.
 
 ## Memory residency
 

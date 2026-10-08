@@ -1,5 +1,31 @@
 # M2.5 Admission Spec — capability function, not an allowlist
 
+## Current scope (2026-10-08, `c2ab623`)
+
+The July tables/receipts below describe the legacy M2.5 probe and experiments,
+not universal admission thresholds. Open registration accepts any valid identity
+and zero or more capabilities. Execution additionally requires an exact cohort,
+fresh usable observations, effective directed routes, fitting templates, committed
+resources and verified warmup. Unsupported/unmeasured devices stay registered
+without becoming serving stages.
+
+Offers and probe reports are signed operator statements, **not remote hardware
+attestation**. Schema, identity, freshness and receipt checks do not make an
+operator incapable of lying about speed or hardware. Actual loading checks,
+independent challenges and live measurements are separate evidence. Registration
+has no vendor allowlist; a native backend may refuse unsupported devices/formats.
+
+Local/region or measured low-latency pools are searched first, then expanded when
+examined local choices cannot serve. Known distinct GPUs may share hosts/subnets.
+Exact spans bind roles and optional stage-index/nstages; memory domains aggregate
+RAM/pin reservations. Serial sums differ from finite-window pipeline predictions;
+K+1 chunks need bound trace-v2 observations. See
+[OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md) and
+[RESOURCE_CONTRACT.md](RESOURCE_CONTRACT.md). V4/GPT-OSS do not inherit the M2.5
+20 tok/s role tag or footprint table.
+
+## Historical M2.5 v0 derivation
+
 > **LIVING SPEC — v0 (2026-07-09). The FRAMEWORK is settled; the NUMBERS are not.** What's decided is the
 > *shape*: admission is a GPU-model-independent capability function over `{peak-VRAM, fast-kernel, layer_ms,
 > RTT-to-neighbors, uplink, dialable} → role`, and the physics `tok/s = g/(N·RTT + C)` with
@@ -21,11 +47,13 @@ they REPRODUCE both, which is why the framework is trusted; the exact thresholds
 An allowlist needs a maintainer deciding "5090 in, 4090 out" — a central gatekeeper, the exact thing a
 permissionless network removes. A capability function is self-executing (the node proves what it can do,
 the function decides), future-proof (admits hardware that doesn't exist yet), and **model-parameterized**
-(the same function, fed a model's layer size + count, works for M2.5 today and any model tomorrow).
+(profiles are model-parameterized; another model still needs its own backend,
+resource calibration and numerical contract).
 
-The cost the choice creates: you now need a **trustless capability probe** — a measurement a node can't
-spoof (self-reported specs are worthless; a liar just makes a slow ring). That probe is the real
-engineering the design choice buys decentralization with. It is not free, but it is right.
+The historical design called for a **trustless capability probe**. Current local
+GPU/probe execution and signed reports do not provide remote hardware attestation;
+a false report can still cause a failed or slow formation. Keep that distinction
+when applying the measurement-oriented role function below.
 
 **IMPLEMENTED: `shard/probe.py`** — the pure role function (`python3 -m shard.probe`, `{cap, model?,
 spec?}` JSON in → verdict out, the seam c0mpute drives), the `--measure` GPU one-block probe, the
@@ -40,8 +68,9 @@ ejects. Signed probe transcripts + pool-run GPU spot-probes are the hardening th
 
 Single decode token: `tok/s = g / T`, `T = N·RTT_eff + C`.
 - `g` = tokens accepted per ring traversal (EAGLE+n-gram spec-decode; measured 3.3-4.5).
-- `N` = number of ring stages = **`ceil(62 / layers_per_node)`** — the token visits all 62 layers once,
-  serially, no matter how the ring is cut, so **the weakest node's layer count sets the hop count**.
+- `N` = ring stages. **`ceil(62 / layers_per_node)`** is a homogeneous capacity
+  example. Heterogeneous selected capacities jointly cover 62 layers; one weak
+  stage does not force every other GPU to use that small block.
 - `RTT_eff` = per-hop transport. Measured: **~30 ms wide EU scatter, ~19 ms tight regional**.
 - `C` = total compute over 62 layers, partition-independent: ~46 ms all-5090, ~56 ms mixed.
 
@@ -69,8 +98,9 @@ The model reproduces both live receipts: 6-stage scatter @ g≈4 → predicted m
    single-TCP-stream numbers — measured 2026-07-09: a vast box LISTED at 1316 Mbps up delivered
    **210 Mbps** receiver-timed cross-WAN. Listings and speed-test numbers do not qualify a node.
 
-Compute is NOT a number — it's a **binary "has a graph-safe fast kernel."** No modern GPU is
-compute-bound at its VRAM-limited layer count (5090 0.75 ms/layer, 4090 marlin+graph 1.6 ms/layer). The
+The legacy role function includes a **binary "has a graph-safe fast kernel"** gate.
+Placement also uses measured service; compute is not universally negligible.
+Under the historical rows (5090 0.75 ms/layer, 4090 marlin+graph 1.6 ms/layer), the
 gate only bites the fallback paths: no CUDA-graph (3-10× launch overhead), no native NVFP4/marlin path
 (fp16 dequant 10-50 ms/layer), or CPU (seconds/layer).
 
@@ -106,7 +136,7 @@ instead of flat-clamping — a flat cap made 48 GB indistinguishable from 32 GB.
 
 ## The honest anchor verdict
 
-- **A consumer 24 GB non-Blackwell card (4090/3090) can NEVER anchor fast single-stream M2.5.** 5 layers
+- **The historical homogeneous 24 GB non-Blackwell M2.5 scenario missed the fast single-stream bar.** 5 layers
   → 13 stages → needs g≥5.9 even at tight RTT; real g is 3.3-4.5. The 4.25 GB/layer marlin footprint is
   the killer. This is physics, not policy.
 - **Even a 32 GB 5090 is a MARGINAL anchor** — 12 layers, N=6; it clears 20 only on a **tight ≤24 ms
@@ -116,7 +146,8 @@ instead of flat-clamping — a flat cap made 48 GB indistinguishable from 32 GB.
   "12 layers/5090 → N=5" admitter comes **2 layers short and OOMs**. So the reproducible single-stream
   20-32 claim is **tight-regional-ring-only**.
 - **The comfortable fast-M2.5 anchor is a 48 GB fast-kernel card (N≤4)**, or a tight regional ring of
-  32 GB 5090s. M2.5's 140 GB size makes interactive M2.5 **Blackwell/pro-anchored** — full stop.
+  32 GB 5090s. This was the M2.5 footprint/kernel regime, not a rule for every
+  backend or heterogeneous strong/weak combination.
 - **A 96 GB fast-kernel card is the PROVEN anchor class (2026-07-12):** 35-layer capacity → a 4-hop
   ring with three 32 GB fillers (wire ×0.67 vs all-5090), placed by the loop itself. Fat cards
   joining doesn't just add supply — it removes hops from everyone else's ring.
@@ -154,7 +185,8 @@ opposite of the torrent thesis. So admission emits a **role**, and the market pr
 
 ## The admission function (implementable)
 
-On join, the probe MEASURES (never self-report):
+The legacy local probe measures these inputs. Public offers remain operator
+reports unless independent evidence is supplied:
 ```
 cap = {
   peak_vram_mb,        # a 1-block load probe: measures the swizzle/context PEAK, gives arch + footprint

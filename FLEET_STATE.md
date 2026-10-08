@@ -1,4 +1,13 @@
-# Shard fleet — 2026-06-24
+# Shard fleet — historical record, 2026-06-24
+> Reviewed 2026-10-08: this is the June rental/experiment log, not a live inventory.
+> The recorded fleets were torn down later in the journal. Historical `LIVE` headings,
+> IPs, rental IDs, package versions and shell commands retain their original context.
+> Current cluster status comes from operator inventory. For new deployment use
+> [GPT-OSS production](docs/GPT_OSS_PRODUCTION.md), [V4 deployment](docs/V4_CLUSTER_DEPLOY_GUIDE.md)
+> and [the documentation index](docs/DOCUMENTATION_INDEX.md).
+> Current cleanup is owned-process/lease based; the historical GPU-wide cleanup advice
+> below is superseded. Old recv/round and throughput values are original measurements,
+> not the current accounting or GPU acceptance result.
 
 ## Session 4 (the REAL warm libp2p number + full stack over libp2p) — TORN DOWN
 Goal: kill the libp2p OPEN THREAD — warm, realistic libp2p tok/s (the 2.86 cold floor was meaningless),
@@ -25,7 +34,7 @@ receipts silently skipped). (2) **transport-switch relaunch can OOM** — clean-
 (sidecar-repoint, not `.shard_next`). (4) WAN RTT drifts 171-340ms/round — use recv/round + multiple samples,
 not a single A/B pair.
 
-## Session 3 (batched verify + async inter-stage send) — LIVE
+## Session 3 (batched verify + async inter-stage send) — historical LIVE snapshot; later torn down
 Goal: #1 concurrent/continuous request batching (batched fast-verify CUDA graph) + #2 async
 inter-stage send to cash in pipelined-prefill TTFT at 100k. Rented 6 distinct-host scattered US
 4090s (cuda-13.2.1-auto, ALL with `--env '-p 29600:29600'`), genuinely scattered states:
@@ -47,7 +56,7 @@ MoE token-count non-invariance isolated). #2 async-send A/B on the N=4 ring (IL�
 30k 153.3→60.8s (2.52×), 110k 245.9→210.0s (1.17×, compute-bound). N=6 (MI+WA) and #3 hot-standby
 NOT run (budget; documented as next levers). Fleet TORN DOWN after the commit (no idle spend).
 
-## Session 3b (re-spin: N=6/5 TTFT + hot-standby + libp2p re-validation) — LIVE
+## Session 3b (re-spin: N=6/5 TTFT + hot-standby + libp2p re-validation) — historical LIVE snapshot; later torn down
 User asked to re-spin for the 3 deferred levers. Rented 6 scattered US 4090s; NJ (42259379) had a
 persistent SSH publickey failure (known bad-host pattern) → destroyed. **5 working boxes:**
 | role | id | geo | ip | ssh | :29600 |
