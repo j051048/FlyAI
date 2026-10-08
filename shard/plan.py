@@ -340,7 +340,7 @@ def ram_dma_overhead_ms(node, model):
 
 def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=None,
                     head_choice=None, joint_roles=False, objective="serial", cost_model=None,
-                    hard_max_stages=None):
+                    hard_max_stages=None, coordinator_costs=None, coordinator_on_head=True):
     """Place a deployable sharded ring from announced capabilities + a measured RTT mesh.
 
     nodes: [{"id": <hashable>, "free_vram_mb": float, "subnet": str,
@@ -425,6 +425,18 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
                   else host_map[i] or ("node", i) for i, nd in enumerate(nodes)}
     devices = {i: nd.get("gpu_uuids") or nd.get("gpu_uuid") or nd.get("device_id")
                for i, nd in enumerate(nodes)}
+    exact_templates = any("allowed_spans" in node for node in nodes)
+    allowed_spans, template_resources = None, None
+    if exact_templates:
+        from .topology import prepare_allowed_spans
+        template_resources = {}
+        for i, node in enumerate(nodes):
+            template_resources[i] = node.get("resource_capacity") or {
+                key: None if node.get(source) is None else int(float(node[source]) * 1024**2)
+                for key, source in (("available_vram_bytes", "free_vram_mb"),
+                    ("available_ram_bytes", "free_ram_mb"), ("pinnable_ram_bytes", "pinnable_ram_mb"))}
+        allowed_spans = prepare_allowed_spans({i: node.get("allowed_spans", []) for i, node in enumerate(nodes)},
+                                             int(m["n_layers"]), template_resources)
     layer_vram, kv = float(m["layer_vram_mb"]), float(m["kv_mb_per_layer"])
     cap_layers = int(m["cap_layers"])
 
@@ -437,6 +449,9 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
     per_layer = {i: lv[i] + kv for i in range(n)}
 
     def _node_cap(i):
+        if exact_templates:
+            measured = max((row["hi"] - row["lo"] for row in allowed_spans[i]), default=0)
+            return min(measured, int(nodes[i]["cap_layers"])) if nodes[i].get("cap_layers") is not None else measured
         if nodes[i].get("cap_layers") is not None:
             vram_cap = int(nodes[i]["cap_layers"])
         else:
@@ -462,13 +477,13 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
                 return min(vram_cap, ram_cap)
         return vram_cap
 
-    raw_free = {i: max(nodes[i]["free_vram_mb"] - float(m["reserve_mb"])
+    raw_free = {i: max(nodes[i]["free_vram_mb"] if exact_templates else nodes[i]["free_vram_mb"] - float(m["reserve_mb"])
                        - float(nodes[i].get("load_peak_extra_mb")
                                or m.get("load_peak_extra_mb") or 0.0), 0.0) for i in range(n)}
     node_caps = {i: _node_cap(i) for i in range(n)}
-    free = (dict(raw_free) if joint_roles else
+    free = (dict(raw_free) if joint_roles or exact_templates else
             {i: min(raw_free[i], node_caps[i] * per_layer[i]) for i in range(n)})
-    cap_ok = [i for i in range(n) if free[i] >= per_layer[i] and node_caps[i] > 0]
+    cap_ok = [i for i in range(n) if node_caps[i] > 0 and (exact_templates or free[i] >= per_layer[i])]
     if isolation == "subnet":
         cap_ok = [i for i in cap_ok if nodes[i].get("subnet") not in (None, "")]
     elif isolation in ("host", "adjacent_host"):
@@ -478,7 +493,7 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
 
     host_caps, tail_host_caps = {}, {}
     host_ram_per_layer = float(m.get("layer_host_ram_mb") or 0.0)
-    if m.get("placement") == "ram" and host_ram_per_layer > 0:
+    if not exact_templates and m.get("placement") == "ram" and host_ram_per_layer > 0:
         budgets = {}
         for i in cap_ok:
             nd = nodes[i]
@@ -507,6 +522,8 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
     # fail OPEN — the one way a stranger could reach a boundary while the plan claims to be pinned).
     trusted = {i for i in range(n) if nodes[i].get("trusted") is True or nodes[i].get("staked") is True} if pin else None
     head_pool = [i for i in cap_ok if i in trusted] if pin else cap_ok
+    if exact_templates:
+        head_pool = [i for i in head_pool if any(row["head"] for row in allowed_spans[i])]
     if not head_pool:
         return None                                          # pinning on, but no trusted node can hold a block
 
@@ -516,13 +533,21 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
         return sum(min(float(rtt[i][j]), _UNREACHABLE) for j in range(n) if j != i)
 
     def _connected_cap(i):
-        # layers reachable from i: its own budget + every capable peer with a finite path BOTH ways
-        reachable = [j for j in cap_ok if j == i or
-                     (rtt[i][j] < _UNREACHABLE and rtt[j][i] < _UNREACHABLE)]
+        # This is only a capacity upper bound, not the route solve. A legal
+        # directed chain need not be a bidirectional star around its head.
+        # The solver still checks every actual forward and return channel.
+        reachable, pending = {i}, [i]
+        while pending:
+            source = pending.pop()
+            for destination in cap_ok:
+                if destination not in reachable and rtt[source][destination] < _UNREACHABLE:
+                    reachable.add(destination)
+                    pending.append(destination)
         capacity = {}
         for j in reachable:
             group = memory_map[j]
-            capacity[group] = capacity.get(group, 0) + min(node_caps[j], int(free[j] // per_layer[j]))
+            count = node_caps[j] if exact_templates else min(node_caps[j], int(free[j] // per_layer[j]))
+            capacity[group] = capacity.get(group, 0) + count
         return sum(min(count, host_caps.get(group, count)) for group, count in capacity.items())
     head_pool = [i for i in head_pool if _connected_cap(i) >= int(m["n_layers"])]
     if not head_pool:
@@ -533,7 +558,8 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
         head = head_choice
     else:
         head = min(head_pool, key=centrality)
-    free[head] = max(free[head] - float(m["head_reserve_mb"]), 0.0)
+    if not exact_templates:
+        free[head] = max(free[head] - float(m["head_reserve_mb"]), 0.0)
 
     # 3) launch-bound per-layer time: base * the node's cpu_factor; the head pays a coordinator
     #    penalty. A node announcing a MEASURED layer_ms (the probe's graph-replayed decode number)
@@ -544,14 +570,15 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
                 for i in range(n)}
     if any(not math.isfinite(value) or value < 0 for value in layer_ms.values()):
         raise ValueError("layer timings must be finite nonnegative milliseconds")
-    layer_ms[head] *= float(m["head_layer_ms_mult"])
-    if m.get("placement") == "ram":
+    if coordinator_on_head:
+        layer_ms[head] *= float(m["head_layer_ms_mult"])
+    if not exact_templates and m.get("placement") == "ram":
         for i in range(n):
             layer_ms[i] += ram_dma_overhead_ms(nodes[i], m)
 
     # 4) coordinator entry/return hops are measured relative to the chosen head.
-    c_out = [rtt[head][i] if i != head else 1.0 for i in range(n)]
-    c_in = [rtt[i][head] if i != head else 1.0 for i in range(n)]
+    c_out = ([rtt[head][i] if i != head else 1.0 for i in range(n)] if coordinator_costs is None else coordinator_costs[0])
+    c_in = ([rtt[i][head] if i != head else 1.0 for i in range(n)] if coordinator_costs is None else coordinator_costs[1])
     subnet = {i: nodes[i].get("subnet") for i in range(n)}
 
     # 5) upload-aware placement iff EVERY node announced an uplink (residential lever); else decode-only.
@@ -560,6 +587,10 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
     extra = {"isolation": isolation, "host_id": host_map, "device_id": devices,
              "host_layer_caps": host_caps, "host_memory_domain": memory_map,
              "tail_host_layer_caps": tail_host_caps}
+    if exact_templates:
+        extra.update(allowed_spans=allowed_spans, template_resources=template_resources, node_layer_caps=node_caps)
+        if cost_model is not None:
+            extra["template_cost_model"] = lambda order, alloc, rows: cost_model(order, alloc, layer_ms, c_out, c_in, rows)
     if joint_roles:
         extra.update(node_layer_caps=node_caps, tail_reserve_mb=float(m["tail_reserve_mb"]),
                      objective=objective, cost_model=(lambda order, alloc: cost_model(
@@ -611,7 +642,7 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
             return None
         tail_i = spec["order"][-1]
         lo, hi = spec["blocks"][tail_i]
-        if joint_roles or tail_reserve == 0.0 or base_free[tail_i] >= (hi - lo) * per_layer[tail_i] + tail_reserve:
+        if exact_templates or joint_roles or tail_reserve == 0.0 or base_free[tail_i] >= (hi - lo) * per_layer[tail_i] + tail_reserve:
             break                                # the landed tail fits block + reserve in its budget
         if tail_i in docked:
             return None                          # reserve already modeled and it STILL can't fit
@@ -625,12 +656,16 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
     # one in, there IS no usable ring, so say so instead of shipping a dead hop
     _o = spec["order"]
     if (any(rtt[a][b] >= _UNREACHABLE for a, b in zip(_o, _o[1:]))
-            or (_o[-1] != head and rtt[_o[-1]][head] >= _UNREACHABLE)):
+            or c_out[_o[0]] >= _UNREACHABLE or c_in[_o[-1]] >= _UNREACHABLE):
         return None
     # belt-and-braces: every stage's block must fit the node's ORIGINAL budget (the tail
     # including its reserve) — a violation here is a planner bug, never a deployable answer
     for i in spec["order"]:
         lo, hi = spec["blocks"][i]
+        if exact_templates:
+            if spec["calibrations"][i]["gpu_bytes"] > template_resources[i]["available_vram_bytes"]:
+                raise RuntimeError("calibrated stage exceeds actual available GPU bytes")
+            continue
         need = (hi - lo) * per_layer[i] + (tail_reserve if i == spec["order"][-1] else 0.0)
         if need > base_free[i] + 1e-6:
             raise RuntimeError(f"planned block [{lo}:{hi}) needs {need:.0f} MB on node {ids[i]!r} "
@@ -644,6 +679,10 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
         lo, hi = spec["blocks"][i]
         st = {"id": ids[i], "index": k, "lo": lo, "hi": hi,
               "head": k == 0, "tail": k == last, "layers": hi - lo}
+        if exact_templates:
+            row = spec["calibrations"][i]
+            st.update(runtime_config_sha256=row["runtime_config_sha256"],
+                      calibrated_resources={key: row[key] for key in ("gpu_bytes", "host_bytes", "pinned_bytes")})
         if m.get("placement") == "ram":
             st["layer_ms"] = layer_ms[i]
             st["latency_source"] = ("measured_layer" if nodes[i].get("layer_ms") is not None else
@@ -668,6 +707,8 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
         out["request_ms"] = spec.get("request_ms")
         out["prefill_ms"] = spec.get("prefill_ms")
         out["roles"] = {ids[int(i)]: r for i, r in spec.get("roles", {}).items()}
+    if exact_templates:
+        out["calibration_search"] = spec["calibration_search"]
     if pin:
         out["privacy"] = {"boundary_in": extra["boundary_in"], "boundary_out": extra["boundary_out"],
                           "boundary_stages": [ids[i] for i in spec["order"] if i in boundary]}
@@ -734,7 +775,7 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
 
 def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolation=None,
               locality=None, objective="serial", workload=None, measurements=None, now=None,
-              diagnostics=None):
+              diagnostics=None, coordinator_id=None, route_ids=None):
     """Backward-compatible entrypoint with locality tiers and prediction-only costs.
 
     A legacy metadata-free call retains its historical successful solve. New
@@ -763,7 +804,41 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
     if not nodes:
         return None
     all_nodes = nodes
-    legacy_dense = (rtt is not None and measurements is None and locality is None and workload is None
+    work = workload_spec(workload)
+    require_exact = (resolved or {}).get("require_exact_calibrations", False)
+    if type(require_exact) is not bool:
+        raise ValueError("require_exact_calibrations must be a boolean")
+    floor = (resolved or {}).get("gpu_weight_storage_floor")
+    if floor is not None:
+        if (not isinstance(floor, dict) or set(floor) != {"version", "layer_bytes", "head_bytes", "tail_bytes"}
+                or type(floor["version"]) is not int or floor["version"] != 1 or not isinstance(floor["layer_bytes"], list)
+                or len(floor["layer_bytes"]) != int((resolved or {})["n_layers"])
+                or any(type(v) is not int or v < 0 for v in [*floor["layer_bytes"], floor["head_bytes"], floor["tail_bytes"]])):
+            raise ValueError("invalid native GPU weight storage floor")
+    if require_exact or any("allowed_spans" in node for node in nodes):
+        eligible = []
+        for i, original in enumerate(nodes):
+            node = dict(original)
+            spans = list(node.get("allowed_spans", []))
+            if floor is not None:
+                spans = [row for row in spans if row["gpu_bytes"] >= sum(floor["layer_bytes"][row["lo"]:row["hi"]])
+                         + (floor["head_bytes"] if row["head"] else 0) + (floor["tail_bytes"] if row["tail"] else 0)]
+            if work["frame_tokens"] > 1:
+                trace = node.get("stage_trace", {})
+                spans = [row for row in spans if row.get("runtime_config_sha256") == node.get("runtime_config_sha256")
+                         and (row.get("lo"), row.get("hi")) == (trace.get("layer_start"), trace.get("layer_end"))]
+            if spans:
+                node["allowed_spans"] = spans
+                eligible.append((i, node))
+        if not eligible:
+            if diagnostics is not None:
+                diagnostics.update(reason="no fresh fitting exact stage calibrations are available")
+            return None
+        if rtt is not None:
+            rtt = [[rtt[i][j] for j, _ in eligible] for i, _ in eligible]
+        nodes = [node for _, node in eligible]
+    legacy_dense = (not require_exact and not any("allowed_spans" in node for node in nodes) and
+                    coordinator_id is None and rtt is not None and measurements is None and locality is None and workload is None
                     and objective == "serial" and not any(node.get("region") or node.get("region_id")
                     or node.get("stage_trace") for node in nodes))
     if legacy_dense:
@@ -777,7 +852,7 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
     nodes = [nodes[i] for i in selected]
     if rtt is not None and not legacy_dense:
         rtt = [[rtt[i][j] for j in selected] for i in selected]
-    snapshot = link_snapshot(nodes, rtt, measurements, now=now)
+    snapshot = link_snapshot(nodes, rtt, measurements, now=now, route_ids=route_ids)
     # A fresh measured frame already includes expert transfers. Its per-layer
     # average provides the heterogeneous allocation seed; the full stage trace
     # is still re-scored and labeled when reused for another layer range.
@@ -785,10 +860,15 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
     nodes = [dict(node) for node in nodes]
     for node in nodes:
         if node.get("stage_trace") is not None:
-            observed = stage_observation(node, 1, 1.0, now=snapshot["now"])
+            observed = stage_observation(node, 1, 1.0, now=snapshot["now"], workload=work)
             if observed["source"] != "scalar_estimate":
                 node["layer_ms"] = observed["service_ms"]
     matrix = snapshot["rtt"]
+    def hop(source, destination):
+        if source == destination:
+            return 0.0
+        edge = snapshot["edges"].get((source, destination), {})
+        return edge.get("hop_ms", edge.get("rtt_ms", _UNREACHABLE))
     tiers = candidate_tiers(nodes, snapshot, locality)
     by_id = {node["id"]: i for i, node in enumerate(nodes)}
     attempts = []
@@ -810,7 +890,7 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
             mesh = [[matrix[i][j] for j in indices] for i in indices]
             if not subset:
                 continue
-            legacy = tier.get("legacy", False) and not use_cost and measurements is None
+            legacy = tier.get("legacy", False) and not use_cost and measurements is None and coordinator_id is None
             if legacy:
                 found = _plan_ring_core(subset, mesh, resolved, slack=slack, privacy=privacy, isolation=isolation)
                 if found is not None:
@@ -825,6 +905,14 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
             budget_profile = resolved or M25_PROFILE
             def head_capable(i):
                 node = subset[i]
+                if "allowed_spans" in node:
+                    if not any(row.get("head") is True for row in node["allowed_spans"]):
+                        return False
+                    if privacy is not None and not (node.get("trusted") is True or node.get("staked") is True):
+                        return False
+                    effective_isolation = isolation or budget_profile.get("isolation", "none")
+                    return not (effective_isolation in ("host", "adjacent_host") and not node.get("host_id") or
+                                effective_isolation == "subnet" and not node.get("subnet"))
                 per = float(node.get("layer_vram_mb") or budget_profile.get("layer_vram_mb", 1)) + float(budget_profile.get("kv_mb_per_layer", 0))
                 need = per + float(budget_profile.get("reserve_mb", 0)) + float(budget_profile.get("head_reserve_mb", 0)) + float(node.get("load_peak_extra_mb") or budget_profile.get("load_peak_extra_mb") or 0)
                 if float(node["free_vram_mb"]) < need or node.get("cap_layers") == 0:
@@ -849,14 +937,26 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
             hard_max = policy.get("max_stages", (resolved or {}).get("max_stages", 6))
             for head in heads:
                 context = {}
-                def score(order, allocation, timing, outgoing, incoming):
+                def score(order, allocation, timing, outgoing, incoming, templates=None):
                     context.update(timing=timing, outgoing=outgoing, incoming=incoming)
+                    scored_nodes = dict(enumerate(subset))
+                    if templates is not None:
+                        scored_nodes = {i: dict(node) for i, node in enumerate(subset)}
+                        for i, row in templates.items():
+                            node = scored_nodes[i]
+                            node["runtime_config_sha256"] = row["runtime_config_sha256"]
+                            trace = node.get("stage_trace")
+                            if trace and trace.get("runtime_config_sha256") != row["runtime_config_sha256"] and work["frame_tokens"] == 1:
+                                node.pop("stage_trace")
                     return estimate(order, allocation, timing, mesh, outgoing, incoming,
-                                    dict(enumerate(subset)), resolved or M25_PROFILE, workload,
+                                    scored_nodes, resolved or M25_PROFILE, workload,
                                     edges=snapshot["edges"], now=snapshot["now"], objective=objective)
                 found = _plan_ring_core(subset, mesh, resolved, slack=slack, privacy=privacy,
                     isolation=isolation, head_choice=head, joint_roles=True, objective=objective,
-                    cost_model=score if use_cost else None, hard_max_stages=hard_max)
+                    cost_model=score if use_cost else None, hard_max_stages=hard_max,
+                    coordinator_on_head=coordinator_id is None or subset[head]["id"] == coordinator_id,
+                    coordinator_costs=([hop(coordinator_id, node["id"]) for node in subset],
+                                       [hop(node["id"], coordinator_id) for node in subset]) if coordinator_id is not None else None)
                 if found is None:
                     continue
                 prediction = None
@@ -864,7 +964,13 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
                     order = [next(i for i, node in enumerate(subset) if node["id"] == nid) for nid in found["order"]]
                     allocation = {next(i for i, node in enumerate(subset) if node["id"] == stage["id"]): stage["layers"]
                                   for stage in found["stages"]}
-                    prediction = score(order, allocation, context["timing"], context["outgoing"], context["incoming"])
+                    templates = None
+                    if "calibration_search" in found:
+                        templates = {next(i for i, node in enumerate(subset) if node["id"] == stage["id"]):
+                            next(row for row in next(node for node in subset if node["id"] == stage["id"])["allowed_spans"]
+                                 if row["runtime_config_sha256"] == stage["runtime_config_sha256"] and (row["lo"], row["hi"]) == (stage["lo"], stage["hi"]))
+                            for stage in found["stages"]}
+                    prediction = score(order, allocation, context["timing"], context["outgoing"], context["incoming"], templates)
                 candidate_rank = prediction["predicted_request_ms"] if prediction else found.get("request_ms", found["step_ms"])
                 if policy.get("min_predicted_tok_s") is not None and (
                         not prediction or prediction["predicted_committed_tok_s"] < float(policy["min_predicted_tok_s"])):
@@ -898,6 +1004,18 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
                                   "attempts": attempts, "regions": sorted({
             node.get("region") or node.get("region_id") for node in nodes
             if node["id"] in best["order"] and (node.get("region") or node.get("region_id"))})}
+        prediction["routes"] = [{"src": a, "dst": b, **snapshot["edges"].get((a, b), {})}
+                                for a, b in zip(best["order"], best["order"][1:])]
+        actual_coordinator = coordinator_id if coordinator_id is not None else best["head"]
+        prediction["coordinator_id"] = actual_coordinator
+        for a, b in ((actual_coordinator, best["order"][0]), (best["order"][-1], actual_coordinator)):
+            if a != b:
+                prediction["routes"].append({"src": a, "dst": b, **snapshot["edges"].get((a, b), {})})
+        if coordinator_id is not None:
+            total_hop = hop(actual_coordinator, best["order"][0]) + hop(best["order"][-1], actual_coordinator)
+            best["coordinator_placement"].update(preferred_host=coordinator_id,
+                min_roundtrip_ms=round(total_hop, 2), in_region=None, low_latency=total_hop < 35,
+                latency_scope="entry and return normalized route delays; not a geography assertion")
         if tier["name"] == "expanded" and (frontier["truncated"] or heads_truncated):
             prediction["locality"]["expansion_reason"] = "bounded_local_search_exhausted"
         prediction["search"] = {"head_roles": "joint" if best_used_joint else "legacy",
@@ -905,6 +1023,11 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
             "allocation": "serial and integer water-fill candidates" if objective == "pipeline" else "min-sum",
             **frontier}
         prediction["search"]["heads_truncated"] = heads_truncated
+        if "calibration_search" in best:
+            prediction["search"]["calibrated_templates"] = best["calibration_search"]
+            prediction["search"]["allocation"] = "exact measured span templates"
+            if best["calibration_search"]["truncated"]:
+                prediction["uncertainty"].append("exact-template search exhausted its bounded state budget")
         if heads_truncated:
             prediction["uncertainty"].append("joint head search limited to a heuristic shortlist")
         best["dropped"] = [node["id"] for node in all_nodes if node["id"] not in best["order"]]
@@ -932,7 +1055,8 @@ def _main() -> int:
         plan = plan_ring(req["nodes"], req.get("rtt"), req.get("model"), slack=req.get("slack"),
                          privacy=req.get("privacy"), isolation=req.get("isolation"),
                          locality=req.get("locality"), objective=req.get("objective", "serial"),
-                         workload=req.get("workload"), measurements=req.get("measurements"), now=req.get("now"))
+                         workload=req.get("workload"), measurements=req.get("measurements"), now=req.get("now"),
+                         coordinator_id=req.get("coordinator_id"), route_ids=req.get("route_ids"))
     except KeyError as e:
         json.dump({"error": f"missing field: {e}"}, sys.stdout)
         return 2

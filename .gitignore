@@ -10,6 +10,8 @@ build/
 *.log
 models/
 weights/
+.shard-processes/
+.shard-deployments/
 .DS_Store
 
 # Personal/ops control + deploy scratch — NOT part of the Shard protocol

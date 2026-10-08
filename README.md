@@ -151,6 +151,7 @@ docs/        ARCHITECTURE、ROADMAP、MODEL_RUNTIME、NETWORK、INTEGRATION、PR
   5. 同机多 GPU 准入检查共享 RAM/锁页预算与同时 H2D 带宽。历史跑分不能认证新增路径；4×5090 ≥40、6×5090 ≥30 tok/s 仍为待验证目标。
   部署与限制见 [docs/V4_NEXT_PHASE.md](docs/V4_NEXT_PHASE.md)，固定速度验收见 [docs/V4_BENCHMARK.md](docs/V4_BENCHMARK.md)。跨节点专家副本与 CPU 主推理路径不在当前 V4 服务范围。
 - **开放推理网络控制面（代码与本地验证已接入）：** 任意身份可登记带签名的节点能力；优先搜索近邻和同区域环，资源不足再扩区。联合分配异构层段，持久租约防止 GPU 与共享 RAM 重复占用；多环公平队列支持并行服务和模型版本切换。性能预测与实际验收分开，部署流程及边界见 [docs/OPEN_INFERENCE_NETWORK.md](docs/OPEN_INFERENCE_NETWORK.md)。
+- **GPT-OSS 部署与生产入口：** 已接入统一部署清单、签名会话、资源租约和多环服务；下载完整性、实际 MXFP4 布局、提交吞吐计量及固定 K 自适应 depth 有独立校验。部署、协议迁移与重测命令见 [docs/GPT_OSS_PRODUCTION.md](docs/GPT_OSS_PRODUCTION.md)。
 - **统一引擎架构（进行中）：** 将所有服务路径抽象收敛于统一的 `ModelRuntime` 接口（[`shard/node.py`](shard/node.py)），使网络能运行*任意*开源模型；模型层接入生态标准，核心壁垒（环拓扑、高效传输、投机验证）保持自研。规划见 [docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md)。
 - **远景目标 —— 超越推理：** 利用相同的无许可基础底座（节点身份、安全传输、内容寻址权重分发、去中心化验证与结算通道）承载通用算力与分布式大模型训练。
 

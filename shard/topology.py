@@ -19,9 +19,68 @@ both take L (L[i][j] = ms from node i to node j, asymmetric ok), c_out (coordina
 c_in (i->coordinator). pure python, no deps; run `python -m shard.topology` for a demo.
 """
 from itertools import combinations, permutations
+import re
 
 INF = float("inf")
 _TRIM = 12          # max candidates fed to exhaustive Held-Karp; the network layer funnels bigger pools first
+
+
+def prepare_allowed_spans(allowed_spans, n_layers, template_resources):
+    """Validate measured discrete templates and filter their actual byte budgets.
+
+    Template GPU peaks already include boundary, workspace and load transients;
+    scalar per-layer estimates must not subtract those same components again.
+    Identity/freshness is established by the offer registry, then checked again
+    by formation before a lease. This pure helper does not attest measurements.
+    """
+    if not isinstance(allowed_spans, dict) or not isinstance(template_resources, dict):
+        raise ValueError("calibrated spans require node maps and measured resource capacities")
+    required = {"lo", "hi", "head", "tail", "gpu_bytes", "host_bytes", "pinned_bytes", "runtime_config_sha256"}
+    permitted = required | {"stage_index", "nstages"}
+    result = {}
+    for node, rows in allowed_spans.items():
+        if not isinstance(rows, list) or len(rows) > 64:
+            raise ValueError("allowed_spans must be a bounded list of measured templates")
+        capacities = template_resources.get(node, {})
+        for key in ("available_vram_bytes", "available_ram_bytes", "pinnable_ram_bytes"):
+            value = capacities.get(key)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError("template capacity must be nonnegative integer bytes or unknown")
+        valid, seen = [], set()
+        for row in rows:
+            if not isinstance(row, dict) or not required <= set(row) or set(row) - permitted:
+                raise ValueError("exact calibrated span fields required")
+            lo, hi = row["lo"], row["hi"]
+            if type(lo) is not int or type(hi) is not int or not 0 <= lo < hi <= n_layers:
+                raise ValueError("calibrated span lies outside model")
+            if type(row["head"]) is not bool or type(row["tail"]) is not bool or row["head"] != (lo == 0) or row["tail"] != (hi == n_layers):
+                raise ValueError("calibrated span roles differ from layer boundaries")
+            for key in ("gpu_bytes", "host_bytes", "pinned_bytes"):
+                if type(row[key]) is not int or row[key] < 0:
+                    raise ValueError("calibrated template budgets must be integer bytes")
+            if row["gpu_bytes"] == 0 or row["pinned_bytes"] > row["host_bytes"]:
+                raise ValueError("calibrated template needs weights and valid pinned subset")
+            if not isinstance(row["runtime_config_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["runtime_config_sha256"]):
+                raise ValueError("calibrated template needs runtime configuration identity")
+            for key in ("stage_index", "nstages"):
+                if key in row and (type(row[key]) is not int or not (0 if key == "stage_index" else 1) <= row[key] <= 256):
+                    raise ValueError("invalid calibrated stage geometry")
+            if "stage_index" in row and "nstages" in row and row["stage_index"] >= row["nstages"]:
+                raise ValueError("calibrated stage index is outside ring")
+            if "stage_index" in row and "nstages" in row and (row["head"] != (row["stage_index"] == 0)
+                    or row["tail"] != (row["stage_index"] == row["nstages"] - 1)):
+                raise ValueError("calibrated boundary roles differ from stage geometry")
+            identity = lo, hi, row["runtime_config_sha256"]
+            if identity in seen:
+                raise ValueError("duplicate calibrated template")
+            seen.add(identity)
+            if any(need > 0 and (capacities.get(key) is None or need > capacities[key]) for key, need in (
+                    ("available_vram_bytes", row["gpu_bytes"]), ("available_ram_bytes", row["host_bytes"]),
+                    ("pinnable_ram_bytes", row["pinned_bytes"]))):
+                continue
+            valid.append(dict(row))
+        result[node] = valid
+    return result
 
 
 def _up(up_mbps, n):
@@ -442,7 +501,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 tail_floor=0, host_id=None, isolation="none", device_id=None,
                 host_layer_caps=None, host_memory_domain=None, tail_host_layer_caps=None,
                 node_layer_caps=None, tail_reserve_mb=0, objective="serial", cost_model=None,
-                hard_max_stages=None):
+                hard_max_stages=None, allowed_spans=None, template_resources=None, template_cost_model=None):
     """The self-optimizer's pure core. From a candidate POOL, choose the subset + ring order +
     per-node layer split that MINIMIZES predicted request time, subject to:
       * VRAM feasibility — the chosen nodes must hold the whole model (+ KV),
@@ -554,7 +613,11 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
     def _lv(n):
         return layer_vram_mb[n] if isinstance(layer_vram_mb, dict) else layer_vram_mb
     caps = {n: node_capacity(free_vram_mb[n], _lv(n), kv_mb_per_layer) for n in nodes}
-    if node_layer_caps is not None:
+    calibrated = None
+    if allowed_spans is not None:
+        calibrated = prepare_allowed_spans(allowed_spans, n_layers, template_resources)
+        caps = {n: max((row["hi"] - row["lo"] for row in calibrated.get(n, [])), default=0) for n in nodes}
+    elif node_layer_caps is not None:
         caps = {n: min(c, node_layer_caps[n]) for n, c in caps.items()}
     usable = [n for n in nodes if caps[n] > 0]
     if isolation == "subnet":
@@ -595,7 +658,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         if acc >= n_layers:
             break
 
-    if len(usable) > _TRIM:                                      # latency funnel, but never trim out nodes feasibility
+    if len(usable) > _TRIM and calibrated is None:               # exact spans have their own bounded state search
         keep = sorted(usable, key=lambda n: c_out[n] + c_in[n])[:_TRIM]   # or `require` need
         must, seen, cover = set(), set(), []                     # retain a cover under the selected isolation policy
         for m in by_cap:
@@ -645,7 +708,12 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 if a != b:
                     EL[a][b] = (1 + D) * L[a][b] + pf_a + D * dc_a
 
-    def _score(order, alloc):
+    def _score(order, alloc, templates=None):
+        if template_cost_model is not None and templates is not None:
+            predicted = template_cost_model(order, alloc, templates)
+            step = predict_step_ms(order, alloc, L, c_out, c_in, layer_ms,
+                                   up_mbps if aware else None, decode_bytes)
+            return predicted["predicted_request_ms"], step, 0.0
         if cost_model is not None:
             predicted = cost_model(order, alloc)
             step = predict_step_ms(order, alloc, L, c_out, c_in, layer_ms,
@@ -658,6 +726,94 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         pf = predict_prefill_ms(order, alloc, L, c_out, c_in, up_mbps, prefill_bytes,
                                 prefill_chunks, prefill_layer_ms)
         return pf + D * step, step, pf                          # rank by total request time
+
+    if calibrated is not None:
+        # Arbitrary greedy counts are not deployable when only measured exact
+        # templates exist. Jointly follow template endpoints and directed edges.
+        # The bounded search reports truncation; it is not an open-pool proof.
+        groups = memory_groups
+        budgets = {}
+        for node in usable:
+            group = groups[node]
+            capacity = template_resources.get(node, {})
+            entry = budgets.setdefault(group, {})
+            for key in ("available_ram_bytes", "pinnable_ram_bytes"):
+                value = capacity.get(key)
+                if value is not None:
+                    entry[key] = min(entry.get(key, value), value)
+        limit = min(len(usable), hard_max_stages if hard_max_stages is not None else int(max_stages or 6))
+        by_start = {}
+        for node in usable:
+            for row in calibrated[node]:
+                by_start.setdefault(row["lo"], {}).setdefault(node, []).append(row)
+        best, visited, truncated = None, 0, False
+        def visit(cursor, order, allocation, chosen, host_used, pin_used, width):
+            nonlocal best, visited, truncated
+            if visited >= 200_000:
+                truncated = True
+                return
+            visited += 1
+            if cursor == n_layers:
+                if any(row.get("nstages", len(order)) != len(order) for row in chosen.values()):
+                    return
+                if c_in[order[-1]] >= 9000 or (isolation == "adjacent_host" and _is_adjacent_same_host(order, host_id)):
+                    return
+                rank, step, pf = _score(order, allocation, chosen)
+                if best is None or rank < best[0]:
+                    best = rank, list(order), dict(allocation), dict(chosen), step, pf
+                return
+            if len(order) >= width:
+                return
+            for node, choices in by_start.get(cursor, {}).items():
+                if node in allocation or (not order and require is not None and node != require):
+                    continue
+                if not order and c_out[node] >= 9000:
+                    continue
+                if order and L[order[-1]][node] >= 9000:
+                    continue
+                trial = [*order, node]
+                if len({isolation_key(n) for n in trial}) != len(trial) or not unique_devices(trial):
+                    continue
+                if isolation == "adjacent_host" and order and host_id[order[-1]] == host_id[node]:
+                    continue
+                for row in choices:
+                    if row["lo"] != cursor or row.get("stage_index", len(order)) != len(order):
+                        continue
+                    required_widths = {r["nstages"] for r in chosen.values() if "nstages" in r}
+                    if row.get("nstages", 0) > width or ("nstages" in row and required_widths and row["nstages"] not in required_widths):
+                        continue
+                    if node_layer_caps is not None and row["hi"] - cursor > node_layer_caps[node]:
+                        continue
+                    if pin and (row["head"] or row["tail"] or cursor < b_in or row["hi"] > n_layers - b_out) and node not in trust:
+                        continue
+                    if row["tail"] and row["hi"] - cursor < tail_floor:
+                        continue
+                    group = groups[node]
+                    host = host_used.get(group, 0) + row["host_bytes"]
+                    pinned = pin_used.get(group, 0) + row["pinned_bytes"]
+                    cap = budgets.get(group, {})
+                    if host > cap.get("available_ram_bytes", 0) or pinned > cap.get("pinnable_ram_bytes", 0):
+                        continue
+                    allocation[node], chosen[node] = row["hi"] - cursor, row
+                    visit(row["hi"], trial, allocation, chosen, {**host_used, group: host}, {**pin_used, group: pinned}, width)
+                    del allocation[node], chosen[node]
+        initial_width = min(limit, k_min + slack)
+        visit(0, [], {}, {}, {}, {}, initial_width)
+        if best is None and not truncated and initial_width < limit:
+            visit(0, [], {}, {}, {}, {}, limit)
+        if best is None:
+            return None
+        rank, order, alloc, chosen, step, pf = best
+        spec = {"order": order, "blocks": {n: (chosen[n]["lo"], chosen[n]["hi"]) for n in order},
+            "layers": alloc, "calibrations": chosen, "step_ms": round(step, 1),
+            "tok_s_per_g": round(1000 / step, 2) if step > 0 else INF,
+            "dropped": [n for n in nodes if n not in order], "k": len(order),
+            "calibration_search": {"visited_states": visited, "max_states": 200_000, "truncated": truncated}}
+        if aware:
+            spec.update(request_ms=rank, prefill_ms=pf, roles={})
+        if pin:
+            spec["boundary"] = sorted(_boundary_nodes(order, alloc, n_layers, b_in, b_out))
+        return spec
 
     def memory_limits(order):
         limits = dict(host_layer_caps)

@@ -17,7 +17,7 @@ Teardown is manual (vastai destroy).
 """
 import argparse
 
-from launch_oss import ep, fire, instances, rssh, warm_stage, M120, PORT, PSK  # noqa: F401
+from launch_oss import ep, fire, instances, rssh, warm_stage, M120, PORT, PSK, managed_command, remote_config, process_command  # noqa: F401
 
 
 def launch_stage_uneven(inst, stage, nstages, nxt_ep, served_head, lo, hi, max_ctx, timeout, window=False, receipts=False, sync_send=False):
@@ -26,17 +26,16 @@ def launch_stage_uneven(inst, stage, nstages, nxt_ep, served_head, lo, hi, max_c
     layers read only their 128-key window at decode (O(window) not O(ctx)) — the long-context
     speed lever. sync_send=True sets SHARD_SYNC_SEND=1 (force the old synchronous forward send, the
     TTFT A/B baseline). NEVER pkill -f specpipe (self-match); kill by GPU pid + port."""
-    nextarg = f" --next {nxt_ep}" if nxt_ep else ""
-    head = " --served-head" if served_head else ""
-    env = (f"SHARD_PSK={PSK}" + (" FV_WINDOW=1" if window else "") + (" SHARD_RECEIPTS=1" if receipts else "")
-           + (" SHARD_SYNC_SEND=1" if sync_send else ""))
-    cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
-           f"fuser -k {PORT}/tcp 2>/dev/null; sleep 2; rm -f /root/stage.log /root/.shard_next_*; cd /root && "
-           f"{env} setsid bash -c 'python3 specpipe.py --stage {stage} --nstages {nstages} "
-           f"--model {M120} --listen-port {PORT}{nextarg}{head} --fast --direct-return "
-           f"--lo {lo} --hi {hi} --max-ctx {max_ctx} --timeout {timeout} > /root/stage.log 2>&1' "
-           f"</dev/null >/dev/null 2>&1 &")
-    fire(inst, cmd)
+    argv = ["python3", "phase0/specpipe.py", "--legacy-protocol", "--stage", str(stage), "--nstages", str(nstages),
+            "--model", M120, "--listen-port", str(PORT), "--fast", "--direct-return", "--lo", str(lo), "--hi", str(hi),
+            "--max-ctx", str(max_ctx), "--timeout", str(timeout)]
+    if nxt_ep: argv += ["--next", nxt_ep]
+    if served_head: argv.append("--served-head")
+    env = {"SHARD_PSK": PSK}
+    if window: env["FV_WINDOW"] = "1"
+    if receipts: env["SHARD_RECEIPTS"] = "1"
+    if sync_send: env["SHARD_SYNC_SEND"] = "1"
+    fire(inst, managed_command(f"specpipe.stage{stage}", argv, env))
 
 
 def main():
@@ -64,16 +63,9 @@ def main():
     nstages = len(stages)
     eps = [ep(s) for s in stages]
 
-    # per-stage [lo, hi): explicit (uneven) or even
-    if a.layers:
-        counts = [int(x) for x in a.layers.split(",")]
-        assert len(counts) == nstages, "layers count must match nstages"
-        bounds = [0]
-        for c in counts:
-            bounds.append(bounds[-1] + c)
-        ranges = [(bounds[k], bounds[k + 1]) for k in range(nstages)]
-    else:
-        ranges = [(-1, -1)] * nstages  # -1 => specpipe uses the even split
+    from shard.pipeline_plan import parse_split, model_layers
+    config = remote_config(stages[0], M120)
+    ranges = parse_split(a.layers, model_layers(config), nstages)
 
     head = stages[0]
     for k, s in enumerate(stages):
@@ -100,12 +92,17 @@ def main():
     tail_ep = f"{eps[nstages - 1][0]}:{eps[nstages - 1][1]}"
     print(f"\n[coord] n-gram coordinator on head {head['id']}: --next {head_ep} --tail {tail_ep}", flush=True)
     renv = " SHARD_RECEIPTS=1" if a.receipts else ""
-    cmd = (f"cd /root && SHARD_PSK={PSK}{renv} python3 specpipe.py --coordinator --nstages {nstages} "
-           f"--model {M120} --ngram-draft --ngram-n {a.ngram_n} --pipe --depth {a.depth} --K {a.K} "
-           f"--next {head_ep} --direct-return --tail {tail_ep} --prompt-file {a.prompt_file} "
-           f"--prefill-chunk {a.prefill_chunk} --max-ctx {a.max_ctx} --max-new {a.max_new} "
-           f"--reasoning {a.reasoning} --timeout {a.edge_timeout} --dump /root/run.json 2>&1 | grep -viE 'INFO|WARNING|warn'")
-    r = rssh(head, cmd, timeout=a.edge_timeout + 600)
+    argv = ["python3", "phase0/specpipe.py", "--legacy-protocol", "--coordinator", "--nstages", str(nstages),
+            "--model", M120, "--ngram-draft", "--ngram-n", str(a.ngram_n), "--pipe", "--depth", str(a.depth), "--K", str(a.K),
+            "--next", head_ep, "--direct-return",
+            "--tail", tail_ep, "--prompt-file", a.prompt_file,
+            "--prefill-chunk", str(a.prefill_chunk), "--max-ctx", str(a.max_ctx), "--max-new", str(a.max_new),
+            "--reasoning", a.reasoning, "--timeout", str(a.edge_timeout), "--dump", "/root/run.json"]
+    env = {"SHARD_PSK":PSK}
+    if a.receipts: env['SHARD_RECEIPTS']='1'
+    if a.sync_send: env['SHARD_SYNC_SEND']='1'
+    r = rssh(head, process_command(argv, env), timeout=a.edge_timeout + 600)
+    if r.returncode: raise SystemExit('coordinator failed')
     print(r.stdout[-3500:], flush=True)
     if r.stderr.strip():
         print("[stderr]", r.stderr[-1200:], flush=True)

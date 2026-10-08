@@ -419,6 +419,7 @@ def test_cli_requires_deployment_before_loading_model_or_starting_server():
 def test_flat_gateway_help_has_no_repo_or_model_import_dependency(tmp_path):
     shutil.copy2(GW.__file__, tmp_path / "v4_gateway.py")
     shutil.copy2(GW.ROOT / "shard" / "service_queue.py", tmp_path / "service_queue.py")
+    shutil.copy2(GW.ROOT / "shard" / "http_gateway.py", tmp_path / "http_gateway.py")
     env = dict(os.environ); env.pop("PYTHONPATH", None)
     result = subprocess.run([sys.executable, str(tmp_path / "v4_gateway.py"), "--help"],
         cwd=tmp_path, env=env, text=True, capture_output=True, timeout=10)

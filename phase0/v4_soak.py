@@ -204,6 +204,8 @@ def main(argv=None):
     live.add_argument("--max-idle-gap-s", type=float, default=10)
     live.add_argument("--timeout", type=float, default=600)
     live.add_argument("--connect-retry", type=float, default=30)
+    live.add_argument("--deployment-plan")
+    live.add_argument("--coordinator-key")
     live.add_argument("--out", required=True)
     check = sub.add_parser("verify")
     check.add_argument("report")
@@ -215,7 +217,9 @@ def main(argv=None):
     else:
         protocol = bench._read(args.protocol)
         adapter = bench.LiveRingAdapter(protocol, Path(args.dir), args.head, args.tail,
-                                        timeout=args.timeout, retry_s=args.connect_retry)
+                                        timeout=args.timeout, retry_s=args.connect_retry,
+                                        **({"deployment_plan": args.deployment_plan, "coordinator_key": args.coordinator_key}
+                                           if args.deployment_plan else {}))
         try:
             report = run_soak(adapter, protocol, cycles=args.cycles, duration_s=args.duration_s,
                               ttft_p95_s=args.ttft_p95_s, token_gap_p95_s=args.token_gap_p95_s,

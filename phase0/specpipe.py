@@ -26,31 +26,171 @@ piggybacked, so a round costs exactly one round-trip end to end.
       --next 127.0.0.1:29501 --draft DRAFT --device cuda:0 --draft-device cuda:1 --adaptive
 """
 
-import argparse, socket, time, threading, queue, os, json, hashlib
+import argparse, socket, time, threading, queue, os, json, hashlib, sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.path.isdir(os.path.join(_ROOT, "shard")) and _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 if os.environ.get("SHARD_TRANSPORT") == "libp2p":   # libp2p sidecar transport (no PSK; see node_kv)
-    import transport as wire
+    try:
+        import transport as wire
+    except ImportError:
+        from shard import transport as wire
 else:
     import wire
-from pipeline import load_stage, run_block
-from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
+from pipeline import load_stage, run_block as _run_block
+from node_kv import send_msg as _raw_send_msg, recv_msg as _raw_recv_msg, EDGE_ERRORS, TransportError
+try:
+    from shard.pipeline_session import (SessionConfig, SessionSocket, SessionAcceptor, SessionBusy,
+        ProtocolError, hello_client, send_message, recv_message, prepare_message)
+except ImportError:
+    from pipeline_session import (SessionConfig, SessionSocket, SessionAcceptor, SessionBusy,
+        ProtocolError, hello_client, send_message, recv_message, prepare_message)
+
+
+def send_msg(sock, payload):
+    return send_message(_raw_send_msg, sock, payload)
+
+
+def recv_msg(sock):
+    return recv_message(_raw_recv_msg, sock)
+
+
+def _address(endpoint):
+    from urllib.parse import urlsplit
+    parsed = urlsplit("//" + endpoint)
+    if not parsed.hostname or parsed.port is None:
+        raise ValueError("endpoint must be host:port, bracket IPv6 addresses")
+    return parsed.hostname, parsed.port
+
+
+def run_block(h, parts, *args, **kwargs):
+    guard = parts.get("_lease_guard")
+    if guard:
+        guard.assert_live()
+    telemetry = parts.get("_telemetry")
+    if telemetry:
+        with telemetry.measure("forward", device=h.device):
+            result = _run_block(h, parts, *args, **kwargs)
+    else:
+        result = _run_block(h, parts, *args, **kwargs)
+    if guard:
+        guard.assert_live()
+    return result
+
+
+def _guard_fast_verify(fv, parts):
+    guard = parts.get("_lease_guard")
+    if guard:
+        import functools
+        for name in ("reset", "prefill", "decode", "tree_decode", "tree_gather"):
+            original = getattr(fv, name)
+            def checked(*args, _original=original, **kwargs):
+                guard.assert_live()
+                result = _original(*args, **kwargs)
+                guard.assert_live()
+                return result
+            setattr(fv, name, functools.wraps(original)(checked))
+    telemetry = parts.get("_telemetry")
+    return telemetry.wrap(fv) if telemetry else fv
+
+
+def connect_ring(head, tail, *, session_config=None, timeout=600, retry_s=0):
+    """Strict managed entry; no-plan direct API remains explicit legacy-compatible."""
+    deadline, last = time.monotonic() + retry_s, None
+    while True:
+        pipe = ret = None
+        try:
+            pipe = socket.create_connection(_address(head), timeout=timeout)
+            if session_config is not None:
+                sid = __import__("secrets").token_hex(16)
+                pipe = hello_client(pipe, session_config, 0, "drive", _raw_send_msg, _raw_recv_msg, session_id=sid)
+            if tail:
+                ret = socket.create_connection(_address(tail), timeout=timeout)
+                if session_config is not None:
+                    ret = hello_client(ret, session_config, session_config.plan["nstages"] - 1, "return",
+                                       _raw_send_msg, _raw_recv_msg, grant=pipe.grant)
+                else:
+                    send_msg(ret, {"op": "hello_return"})
+            return pipe, ret
+        except Exception as error:
+            for channel in (pipe, ret):
+                if channel is not None:
+                    channel.close()
+            if isinstance(error, (SessionBusy, ProtocolError)) or time.monotonic() >= deadline:
+                raise
+            last = error
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+
+
+def ping_ring(pipe, ret=None):
+    """Idle-only head control ping; never reads/consumes the tail result stream."""
+    if not isinstance(pipe, SessionSocket):
+        raise ProtocolError("session ping requires strict managed channels")
+    send_msg(pipe, {"op": "session_ping"})
+    pong = recv_msg(pipe)
+    if not isinstance(pong, dict) or pong.get("op") != "session_pong" or pong.get("session_id") != pipe.grant["session_id"]:
+        raise ProtocolError("invalid owner session ping acknowledgement")
+    return pong
+
+
+def _forward_connect(parts, nxt, timeout):
+    host, port = _address(nxt)
+    cfg = parts.get("_session_config")
+    deadline = time.monotonic() + timeout
+    while True:
+        channel = None
+        try:
+            channel = socket.create_connection((host, int(port)), timeout=min(5, timeout))
+            wrapped = hello_client(channel, cfg, cfg.index + 1, "forward", _raw_send_msg, _raw_recv_msg) if cfg else channel
+            wrapped.settimeout(timeout)
+            return wrapped
+        except Exception as error:
+            if channel is not None:
+                channel.close()
+            if (isinstance(error, ProtocolError) and not isinstance(error, SessionBusy)) or time.monotonic() >= deadline:
+                raise
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+
+
+def _server(parts, port, timeout):
+    cfg = parts.get("_session_config")
+    endpoint = cfg.stage(cfg.index)["endpoint"] if cfg else None
+    ipv6 = endpoint is not None and ":" in _address(endpoint)[0]
+    srv = socket.socket(socket.AF_INET6 if ipv6 else socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("::" if ipv6 else "0.0.0.0", port)); srv.listen(32)
+    acceptor = (SessionAcceptor(srv, cfg, _raw_send_msg, _raw_recv_msg,
+        key=parts.get("_session_key"), timeout=timeout) if cfg else None)
+    return srv, acceptor
+
+
+def _accept_stage(srv, acceptor, parts, timeout):
+    if acceptor is not None:
+        cfg = parts["_session_config"]
+        return acceptor.get("drive" if cfg.index == 0 else "forward"), ("authenticated", 0)
+    conn, addr = srv.accept(); conn.settimeout(timeout)
+    return conn, addr
 from tree import accept_tree, gather_cache
 from fastverify import FastVerify
 from ngram_draft import NgramDrafter
 from specsample import Sampler
 import os
-try:                                                    # PROVE: opt-in signed per-stage receipts
+try:
     from receipt import ReceiptSigner, load_or_make_node_key, verify_receipt, verify_coverage
-except Exception:
-    ReceiptSigner = None
+except ImportError:
+    from shard.receipt import ReceiptSigner, load_or_make_node_key, verify_receipt, verify_coverage
 RECEIPTS = bool(os.environ.get("SHARD_RECEIPTS")) and ReceiptSigner is not None
 NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
 
 
 def _act_digest(t):
-    """A deterministic byte digest of an activation tensor for the receipt hash-chain (fp16 bytes)."""
-    return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
+    """Commit actual dtype/shape/bytes without a lossy float16 conversion."""
+    value = t.detach().contiguous().cpu()
+    metadata = json.dumps({"dtype": str(value.dtype), "shape": list(value.shape)},
+                          sort_keys=True, separators=(",", ":")).encode()
+    return len(metadata).to_bytes(4, "big") + metadata + value.view(torch.uint8).numpy().tobytes()
 
 
 # ---- fault-tolerance CHECKPOINT envelope (--ft-dump / --resume-file) ----
@@ -129,8 +269,9 @@ class _AsyncSender:
     results still return to the coordinator in send order. DIRECT-return only (the stage never reads
     back on this socket). A send error is captured and re-raised on the next put(), so the existing
     `except EDGE_ERRORS` edge supervision resets the link exactly as before."""
-    def __init__(self, sock):
+    def __init__(self, sock, telemetry=None):
         self.sock = sock
+        self.telemetry = telemetry
         self.q = queue.Queue(maxsize=64)
         self.error = None
         self.closed = threading.Event()
@@ -157,7 +298,10 @@ class _AsyncSender:
             raise RuntimeError("_AsyncSender closed")
         if self.error is not None:
             raise self.error
-        self.q.put(obj)
+        started = time.perf_counter()
+        self.q.put(prepare_message(self.sock, obj))
+        if self.telemetry:
+            self.telemetry.record("queue_wait_ms", (time.perf_counter() - started) * 1000)
 
     def close(self, timeout=5.0):
         """Idempotent shutdown. The EVENT stops the worker, not a droppable sentinel: the old
@@ -166,6 +310,10 @@ class _AsyncSender:
         close() only runs on edge teardown, where they're already dead. The join is BOUNDED so a
         send stalled inside the kernel can never wedge the serve loop's reset path."""
         self.closed.set()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass
         try: self.q.put_nowait(None)           # fast wake if there's room; the event is the guarantee
         except queue.Full: pass
         self.t.join(timeout)
@@ -181,14 +329,12 @@ def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=Fal
     is_tail = stage == nstages - 1
     nxt_sock = None
     if not is_tail:
-        host, port = nxt.split(":")
-        nxt_sock = socket.socket(); nxt_sock.settimeout(timeout); nxt_sock.connect((host, int(port)))
+        nxt_sock = _forward_connect(parts, nxt, timeout)
         print(f"[s{stage}] connected forward to stage {stage+1} at {nxt}", flush=True)
-    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", listen_port)); srv.listen(1)
+    srv, acceptor = _server(parts, listen_port, timeout)
     print(f"[s{stage}] listening on :{listen_port} (edge timeout {timeout:.0f}s)", flush=True)
     while True:
-        conn, addr = srv.accept(); conn.settimeout(timeout)
+        conn, addr = _accept_stage(srv, acceptor, parts, timeout)
         print(f"[s{stage}] stage {stage-1} connected from {addr}", flush=True)
         cache = DynamicCache(); verifies = 0
         with torch.no_grad():
@@ -244,24 +390,29 @@ def serve_tail_direct(parts, listen_port, timeout, dev):
     has a message waiting; the predecessor is idle until driven). each verify's
     result is sent on the return channel."""
     import select
-    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", listen_port)); srv.listen(2)
+    srv, acceptor = _server(parts, listen_port, timeout)
     print(f"[tail] listening on :{listen_port} (predecessor + coordinator return, edge timeout {timeout:.0f}s)", flush=True)
     while True:
-        c1, _ = srv.accept(); c2, _ = srv.accept()
-        ready, _, _ = select.select([c1, c2], [], [], timeout)
-        if not ready:
-            print("[tail] no return-channel handshake; resetting", flush=True)
-            c1.close(); c2.close(); continue
-        ret_conn = ready[0]
-        try:
-            hello = recv_msg(ret_conn)
-        except EDGE_ERRORS:
-            c1.close(); c2.close(); continue
-        if not (isinstance(hello, dict) and hello.get("op") == "hello_return"):
-            print("[tail] unexpected handshake; resetting", flush=True)
-            c1.close(); c2.close(); continue
-        pred_conn = c2 if ret_conn is c1 else c1
+        if acceptor is not None:
+            pred_conn = acceptor.get("drive" if parts["_session_config"].index == 0 else "forward")
+            ret_conn = acceptor.get("return")
+            c1, c2 = pred_conn, ret_conn
+        else:
+            c1, _ = srv.accept(); c2, _ = srv.accept()
+            c1.settimeout(min(timeout, 5)); c2.settimeout(min(timeout, 5))
+            ready, _, _ = select.select([c1, c2], [], [], timeout)
+            if not ready:
+                print("[tail] no return-channel handshake; resetting", flush=True)
+                c1.close(); c2.close(); continue
+            ret_conn = ready[0]
+            try:
+                hello = recv_msg(ret_conn)
+            except EDGE_ERRORS:
+                c1.close(); c2.close(); continue
+            if not (isinstance(hello, dict) and hello.get("op") == "hello_return"):
+                print("[tail] unexpected handshake; resetting", flush=True)
+                c1.close(); c2.close(); continue
+            pred_conn = c2 if ret_conn is c1 else c1
         pred_conn.settimeout(timeout)
         print("[tail] predecessor + coordinator-return connected", flush=True)
         cache = DynamicCache(); verifies = 0
@@ -297,7 +448,7 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
     nxt_sock = None; sender = None
     host = port = None
     if not is_tail:
-        host, port = nxt.split(":")
+        host, port = _address(nxt)
 
     def mk_fwd():                                            # (re)build the forward link (+ async sender in direct mode)
         nonlocal nxt_sock, sender, host, port
@@ -308,16 +459,16 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
         try:
             ov = open(f"/root/.shard_next_{stage}").read().strip()
             if ov:
-                host, port = ov.split(":")
+                host, port = _address(ov)
         except OSError:
             pass
-        s = socket.socket(); s.settimeout(timeout)
+        target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        s = _forward_connect(parts, target, timeout)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF)   # buffer a full ~24MB prefill chunk in-kernel
-        s.connect((host, int(port)))
         nxt_sock = s
         # async send: decoupled forward (no read-back in direct mode). SHARD_SYNC_SEND=1 forces the old
         # synchronous path -> the clean A/B baseline (reproduces last session's handoff-bound 193s@110k).
-        sender = _AsyncSender(s) if (direct and not SYNC_SEND) else None
+        sender = _AsyncSender(s, parts.get("_telemetry")) if (direct and not SYNC_SEND) else None
 
     def fwd_send(o):                                         # async in direct mode, synchronous otherwise
         if direct and sender is not None:
@@ -328,10 +479,9 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
     if not is_tail:
         mk_fwd()
         print(f"[s{stage}] connected forward to stage {stage+1} at {nxt}", flush=True)
-    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF)     # accepted conns inherit it: drain big chunks fast
-    srv.bind(("0.0.0.0", listen_port)); srv.listen(1)
-    fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
+    srv, acceptor = _server(parts, listen_port, timeout)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF)
+    fv = _guard_fast_verify(FastVerify(parts, maxlen=max_ctx, dev=dev), parts)
     sampler = Sampler(device=dev)                         # greedy until a reset sets temp>0 (tail-relay path)
     node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
     signer = None
@@ -344,7 +494,7 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     mk_fwd(); break
                 except OSError: time.sleep(0.5)
             print(f"[s{stage}] forward link rebuilt -> {nxt}" if nxt_sock else f"[s{stage}] relink FAILED", flush=True)
-        conn, addr = srv.accept(); conn.settimeout(timeout)
+        conn, addr = _accept_stage(srv, acceptor, parts, timeout)
         print(f"[s{stage}] stage {stage-1} connected from {addr}", flush=True)
         fv.reset(); first = True; verifies = 0
         with torch.no_grad():
@@ -359,7 +509,7 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                                           top_k=msg.get("top_k", 0), seed=msg.get("seed", 0), device=dev)
                         if RECEIPTS:                     # start this job's per-stage activation hash-chain
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
-                                                   msg.get("job_id", "job"), parts["lo"], parts["hi"])
+                                                   msg.get("job_id", "job"), parts["lo"], parts["hi"], nonce=msg.get("nonce"))
                         if nxt_sock:
                             fwd_send(msg)
                             if not direct: recv_msg(nxt_sock)
@@ -433,6 +583,8 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     print(f"[s{stage}] bad msg after {verifies} verifies ({type(e).__name__}: {str(e)[:80]} keys={k}); resetting", flush=True)
                     try: conn.close()
                     except OSError: pass
+                    if sender is not None:
+                        sender.close(); sender = None
                     if nxt_sock is not None:
                         try: nxt_sock.close()
                         except OSError: pass
@@ -450,9 +602,8 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
     its return channel; anything else is the predecessor (and its first message is queued).
     this is what lets the gateway connect, fail, retry, and restart without relaunching the
     swarm -- the c0mpute come-and-go property at the tail."""
-    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", listen_port)); srv.listen(8)
-    fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
+    srv, acceptor = _server(parts, listen_port, timeout)
+    fv = _guard_fast_verify(FastVerify(parts, maxlen=max_ctx, dev=dev), parts)
     sampler = Sampler(device=dev)                         # greedy until a reset sets temp>0
     node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
     signer = None
@@ -460,10 +611,44 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
           f"{', signed receipts ON' if RECEIPTS else ''})", flush=True)
     pred = ret = None; pending = None; first = True
 
+    class TailSessionFenced(ProtocolError):
+        pass
+    def same_owner(left, right):
+        return left is not None and right is not None and all(left.get(key) == right.get(key)
+            for key in ("owner", "session_id", "fence", "boot_id"))
+    def ret_send(payload):
+        nonlocal ret
+        if acceptor is None:
+            return send_msg(ret, payload)
+        desired = getattr(pred, "grant", None)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with acceptor.lock:
+                latest = acceptor.slots.get("return")
+            if latest is not None and not latest.closed:
+                if not same_owner(desired, latest.grant):
+                    raise TailSessionFenced("pending result belongs to a fenced coordinator owner")
+                ret = latest
+                try:
+                    return send_msg(ret, payload)
+                except OSError:
+                    # A same-owner reconnect may already be accepted. Retry the
+                    # SAME ack/result; never silently drop a reset barrier.
+                    ret.close(); ret = None
+            time.sleep(0.01)
+        raise TailSessionFenced("matching coordinator return channel did not recover before its deadline")
+
     def fill():                                            # block until BOTH channels are present
         nonlocal pred, ret, pending
         while pred is None or ret is None:
+            if acceptor is not None:
+                if pred is None:
+                    pred = acceptor.get("drive" if parts["_session_config"].index == 0 else "forward")
+                if ret is None:
+                    ret = acceptor.get("return")
+                continue
             c, _ = srv.accept()
+            c.settimeout(min(timeout, 5.0))
             try:
                 m = recv_msg(c)
             except EDGE_ERRORS:
@@ -474,7 +659,8 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                 if ret is not None:
                     try: ret.close()
                     except OSError: pass
-                ret = c; print("[tail] coordinator-return (re)connected", flush=True)
+                ret = c; ret.settimeout(timeout)
+                print("[tail] coordinator-return (re)connected", flush=True)
             else:                                          # predecessor: its first msg is real, queue it
                 if pred is not None:
                     try: pred.close()
@@ -490,37 +676,47 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                 pending = None
             except EDGE_ERRORS as e:                       # predecessor gone -> usually a coordinator churn, which
                 print(f"[tail] predecessor edge ({type(e).__name__}); re-accepting predecessor + return", flush=True)
+                old_grant = getattr(pred, "grant", None)
                 try: pred.close()
                 except OSError: pass
                 pred = None
-                if ret is not None:                        # ALSO drop the return channel: the new coordinator brings a
+                if ret is not None and (acceptor is None or same_owner(old_grant, getattr(ret, "grant", None))):
                     try: ret.close()                       # fresh return channel, so the reset's 'ok' must not be sent to
                     except OSError: pass                   # the dead old one (the race that made churn recovery flaky)
                     ret = None
                 continue
             try:
+                if msg.get("op") == "stop":
+                    if acceptor is not None:
+                        acceptor.close()
+                    else:
+                        srv.close()
+                    return
                 if msg["op"] == "reset":
                     fv.reset(); first = True
                     sampler = Sampler(temp=msg.get("temp", 0.0), top_p=msg.get("top_p", 1.0),
                                       top_k=msg.get("top_k", 0), seed=msg.get("seed", 0), device=dev)
                     if RECEIPTS:
                         signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
-                                               msg.get("job_id", "job"), parts["lo"], parts["hi"])
-                    send_msg(ret, "ok"); continue
+                                               msg.get("job_id", "job"), parts["lo"], parts["hi"], nonce=msg.get("nonce"))
+                    ret_send("ok"); continue
                 if msg.get("op") == "abort":
                     # P2-1 Early Abort: Tail skips computing LM Head for aborted round
                     continue
                 if msg["op"] == "receipt":                  # job done: sign + return the full ring's receipts
                     if RECEIPTS and signer is not None:
                         msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
-                    send_msg(ret, msg.get("receipts", []))
+                    ret_send(msg.get("receipts", []))
                     continue
                 g = msg.get("gather")
                 if g:
                     fv.tree_gather(g[0], g[1])
-                x = msg["h"].to(dev)
+                x = (parts["embed"](torch.tensor([msg["token_ids"]], device=dev))
+                     if "token_ids" in msg and "embed" in parts else msg["h"].to(dev))
                 is_pf = ("par" not in msg) and (first or msg.get("prefill"))
                 draft = msg.get("draft")                    # the K proposed tokens (for the sampler's accept)
+                if draft is None and "token_ids" in msg and not is_pf and "par" not in msg:
+                    draft = msg["token_ids"][1:]
                 if "par" in msg:                           # TREE verify
                     h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
                 else:
@@ -534,12 +730,19 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                         h = h[:, -1:]
                 logits = parts["lm_head"](parts["norm"](h))
                 if is_pf:                                  # prefill: the single first new token (greedy=argmax)
-                    send_msg(ret, [sampler.sample_logits(logits[0, -1])])
+                    ret_send([sampler.sample_logits(logits[0, -1])])
                 elif draft is None:                        # tree / no-draft decode: per-position (greedy=argmax)
-                    send_msg(ret, logits.argmax(-1)[0].tolist() if sampler.greedy
+                    ret_send(logits.argmax(-1)[0].tolist() if sampler.greedy
                              else [sampler.sample_logits(logits[0, i]) for i in range(logits.shape[1])])
                 else:                                      # lossless speculative SAMPLING over the K+1 logits
-                    send_msg(ret, sampler.accept(logits[0], draft))
+                    ret_send(sampler.accept(logits[0], draft))
+            except TailSessionFenced as error:
+                print("ERROR " + json.dumps({"code": "session_fenced", "stage": "tail",
+                    "session_id": getattr(pred, "grant", {}).get("session_id"), "message": str(error)}), flush=True)
+                signer = None; first = True
+                # Keep the static forward connection: the new owner's reset is
+                # already ordered behind old frames. Its return channel stays live.
+                continue
             except EDGE_ERRORS as e:                        # return channel gone -> re-accept it, keep pred + KV
                 print(f"[tail] return edge ({type(e).__name__}); dropping return channel, keeping predecessor+KV", flush=True)
                 try: ret.close()
@@ -731,152 +934,319 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
 def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, depth, ret_sock=None,
                     ignore_eos=False, prefill_chunk=0, draft_ctx=0, on_commit=None, reasoning=None, system=None,
                     max_ctx=0, local_draft=None, temp=0.0, top_p=1.0, top_k=0, seed=0, prefill_depth=8,
-                    resume_ids=None, resumable=False):
-    """PIPELINED coordinator: keep `depth` verify chunks in flight over the ring, so
-    throughput approaches the ring's per-chunk THROUGHPUT, not its full latency (the
-    GLM-pipe lever, on the gpt-oss fast-verify path). Same K+1-token chunk as the
-    synchronous coordinate() ([tail_tok]+K drafts) so the fixed-shape CUDA graph holds;
-    the StaticKV writes at each chunk's `start`, so after a divergence the fresh chunk
-    (sent next) overwrites the stale chunks' KV and the coordinator just discards the
-    stale RESULTS. Greedy => output identical to the synchronous path. Needs the swarm
-    in --direct-return mode (fire-forward stages, tail returns straight here).
+                    resume_ids=None, resumable=False, prompt_ids=None, cancel_check=None,
+                    swarm_id="swarm", job_id="job", nonce=None, expected_by_signer=None,
+                    strict_job_binding=False, adaptive_pipe=False, adaptive_depth=False):
+    """Committed-frontier pipeline; adaptive switching requires a live greedy pilot gate.
 
-    The draft source is pluggable: a vLLM draft over `draft_sock` (the request/fetch
-    socket protocol), or an in-process `local_draft` (model-free n-gram drafter) that
-    speaks the same request()/fetch() async shim. n-gram is the long-context path — it
-    raises g with no model and no KV, so spec-decode survives past 100k where the 20b
-    draft OOMs. Either way the swarm verifies every token, so output is identical."""
+    K=0 is a real one-token target path. Cross-K floating-point reassociation is
+    model-dependent: opt-in pilots compare actual greedy streams on THIS prompt,
+    and only passing buckets may run. This is a prefix gate, not a universal GPU
+    numerical proof. Every switch drains old frames before warming its shape.
+    """
+    clock = time.perf_counter
+    request_started = clock()
+    if type(K) is not int or not 0 <= K <= 64 or type(depth) is not int or not 1 <= depth <= 32:
+        raise ValueError("K must be in 0..64 and depth in 1..32")
+    if type(max_new) is not int or max_new < 0:
+        raise ValueError("max_new must be a nonnegative integer")
+    if strict_job_binding and (not nonce or not expected_by_signer or not RECEIPTS):
+        raise ValueError("strict jobs require a nonce, pinned assignments and SHARD_RECEIPTS=1")
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
-    use_local = local_draft is not None
-    def d_request(ids, k):                       # issue a draft request (one outstanding)
-        if use_local: local_draft.request(ids, k)
-        else: send_msg(draft_sock, {"ids": ids, "k": k})
-    def d_fetch():                               # collect the proposed k tokens
-        return local_draft.fetch() if use_local else recv_msg(draft_sock)
+    if hasattr(rx, "settimeout"):
+        rx.settimeout(timeout)
+    def check():
+        if cancel_check:
+            cancel_check()
+    recv_wait = draft_wait = drain_s = 0.0
+    def receive():
+        nonlocal recv_wait
+        check(); started = clock()
+        result = recv_msg(rx)
+        recv_wait += clock() - started
+        check()
+        return result
+    def transmit(payload):
+        check(); send_msg(pipe_sock, payload); check()
+    if prompt_ids is None:
+        options = {"reasoning_effort": reasoning} if reasoning else {}
+        messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+        prompt_ids = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt", return_dict=True,
+                                             **options)["input_ids"][0].tolist()
+    prompt_ids, resume_ids = list(prompt_ids), list(resume_ids or [])
+    if not prompt_ids or any(type(token) is not int or token < 0 for token in prompt_ids + resume_ids):
+        raise ValueError("valid nonempty tokenized prompt required")
     eos = tok.eos_token_id
-    ct_kw = {"reasoning_effort": reasoning} if reasoning else {}   # gpt-oss: 'low' -> terse analysis, more budget for the answer
-    msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
-    enc = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True, **ct_kw)
-    prompt_ids = enc["input_ids"][0].tolist()
-    # FAULT-TOLERANCE RESUME: re-prefill prompt + the already-committed tokens onto a freshly-healed
-    # ring, then continue decoding -- so a mid-request node death costs ONE re-prefill, not a restart,
-    # and the user's committed output is preserved (continuation, not regeneration). gen_ids is the
-    # full context to rebuild every stage's KV over; out is seeded with the recovered tokens.
-    resume_ids = list(resume_ids or [])
-    gen_ids = prompt_ids + resume_ids
-    if max_ctx:                                                   # never let prompt+generation exceed the window
-        max_new = max(len(resume_ids) + 16, min(max_new, max_ctx - len(gen_ids) - 16))
-    out = []
-    t_draft = t_recv = 0.0; prefill_s = 0.0
-    try:
-        send_msg(pipe_sock, {"op": "reset", "temp": temp, "top_p": top_p, "top_k": top_k, "seed": seed})
-        recv_msg(rx)
-        # prefill: one shot, or chunked (long prompts) with the prefill flag so stages run flex
-        t_pf = time.time()
-        if prefill_chunk and len(gen_ids) > prefill_chunk:
-            # PIPELINED prefill: keep prefill_depth chunks in flight so the stages OVERLAP -- stage 0
-            # prefills chunk c+1 while stage 1 prefills chunk c, etc. Each stage's chunk c+1 only needs
-            # that stage's OWN chunk-c KV (already local, causal), so prefill is embarrassingly
-            # pipelineable; the win is ~Nstage-fold over the old one-chunk-at-a-time path, which waited a
-            # full ring traversal per chunk (zero overlap = the ~10-min/100k TTFT). Results come back in
-            # FIFO order on rx; only the final chunk's last token (cur) is consumed. depth bounds how many
-            # big inter-stage activation messages are in flight (backpressure self-regulates the ring).
-            starts = list(range(0, len(gen_ids), prefill_chunk))
-            def _send_pf(i):
-                send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk],
-                                     "start": i, "prefill": True})
-            d = min(max(prefill_depth, 1), len(starts)); sent = 0; rr = None
-            while sent < d:
-                _send_pf(starts[sent]); sent += 1
-            for _ in range(len(starts)):
-                rr = recv_msg(rx)
-                if sent < len(starts):
-                    _send_pf(starts[sent]); sent += 1
-            cur = rr[-1]
+    if max_ctx:
+        max_new = min(max_new, max(0, max_ctx - len(prompt_ids) - max(1, K * depth + 1)))
+    resume_ids = resume_ids[:max_new]
+    out = list(resume_ids)
+    if adaptive_depth and temp != 0:
+        raise ValueError("adaptive depth requires greedy decoding")
+    gate = {"enabled": bool(adaptive_pipe or adaptive_depth), "mode": "mixed_K_full_control" if adaptive_pipe else "same_shape_depth",
+            "scope": "current_prompt_greedy_prefix", "verified_buckets": [], "changes": []}
+    gate_s = 0.0
+    eligible = [K]
+    golden = None
+    class ShapeMismatch(ValueError):
+        pass
+    if adaptive_pipe:
+        if temp != 0 or resume_ids:
+            raise ValueError("adaptive pipeline requires greedy decoding and original-request replay")
+        started = clock()
+        candidates = sorted(set([0, 1, 2, K]))
+        candidates = [value for value in candidates if value <= max(K, 1)]
+        # A full K=0 control is deliberately paid for before publication. Prefix
+        # pilots alone cannot prove future cross-K MoE numerics. Every actual
+        # publication is checked against this complete greedy stream.
+        control = coordinate_pipe(draft_sock, pipe_sock, tok, prompt, 0, max_new, timeout, 1,
+            ret_sock=ret_sock, prefill_chunk=prefill_chunk, local_draft=local_draft,
+            prompt_ids=prompt_ids, cancel_check=cancel_check, max_ctx=max_ctx, reasoning=reasoning,
+            ignore_eos=ignore_eos, swarm_id=swarm_id, job_id=job_id + "/greedy-control", nonce=nonce)
+        golden = control["output_ids"]
+        pilots = {0: golden[:min(16, max_new)]}
+        for bucket in candidates:
+            if bucket == 0:
+                continue
+            check()
+            pilots[bucket] = coordinate_pipe(draft_sock, pipe_sock, tok, prompt, bucket, min(16, max_new), timeout, 1,
+                ret_sock=ret_sock, prefill_chunk=prefill_chunk, local_draft=local_draft, prompt_ids=prompt_ids,
+                cancel_check=cancel_check, max_ctx=max_ctx, reasoning=reasoning, ignore_eos=ignore_eos,
+                swarm_id=swarm_id, job_id=job_id + "/shape-gate", nonce=nonce,
+                strict_job_binding=False, adaptive_pipe=False)["output_ids"]
+        eligible = [bucket for bucket in candidates if pilots[bucket] == pilots[0]]
+        gate.update(verified_buckets=eligible, pilot_tokens=len(pilots[0]),
+                    validation="full_request_greedy_control_before_publish", control_tokens=len(golden),
+                    declined_buckets=[bucket for bucket in candidates if bucket not in eligible])
+        gate_s = clock() - started
+        K = K if K in eligible else 0
+        depth = depth if K else 1
+    current_k, current_depth = K, depth if K else 1
+    use_local, pending_draft = local_draft is not None, False
+    def draft_request(ids):
+        nonlocal pending_draft
+        if current_k == 0:
+            return
+        check()
+        ids = ids[-draft_ctx:] if draft_ctx else ids
+        if use_local:
+            local_draft.request(ids, current_k)
         else:
-            send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0})   # prefill
-            cur = recv_msg(rx)[-1]
-        prefill_s = time.time() - t_pf
-        pos = len(gen_ids)
-        out = resume_ids + [cur]                    # preserve recovered tokens; cur = next after them
-        if on_commit: on_commit({"phase": "prefilled", "prompt_tokens": len(prompt_ids),
-                                 "resume_tokens": len(resume_ids), "prefill_s": prefill_s})
-        inflight = []                              # FIFO of (start_pos, drafts) sent but not yet read
-        discard = 0                                # stale post-divergence results still to drain
-        send_pos = pos                             # absolute pos where the next chunk writes
-        dprefix = gen_ids + [cur]                  # draft-server query prefix; dprefix[-1] == next tail_tok
-        valid = accepted = wasted = 0
-        t0 = time.time()
-        done = False
-        # ASYNC DRAFT: keep exactly one draft request outstanding so the draft server
-        # computes the next chunk WHILE the current verify chunks cross the WAN. Each fill
-        # collects the ready draft, sends the verify chunk, then issues the next draft request
-        # (which then runs concurrently with the verify read below). draft latency is hidden.
-        # the draft only needs RECENT context to predict the next tokens (next-token is dominated by
-        # recent tokens); the full swarm still verifies with the complete context. Windowing the draft
-        # query keeps the draft fast at long context (a full-95k draft is ~800ms/round and kills spec).
-        dq = lambda: (dprefix[-draft_ctx:] if draft_ctx else dprefix)
-        d_request(dq(), K)                                        # prime: one outstanding request
-        while not done:
-            while len(inflight) < depth and not done:                  # FILL the pipeline
-                td = time.time(); ds = d_fetch(); t_draft += time.time() - td  # ready (overlapped)
-                send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
-                inflight.append((send_pos, ds)); dprefix = dprefix + ds; send_pos += K
-                d_request(dq(), K)                                    # issue next -> runs during the read below
-            tr = time.time(); r = recv_msg(rx); t_recv += time.time() - tr   # READ one result
-            sp, ds = inflight.pop(0)
-            if discard > 0:                                            # stale (post-divergence) -> skip
-                discard -= 1; wasted += 1; continue
-            n = 0
-            for j in range(K):
-                if ds[j] == r[j]: n += 1
-                else: break
-            valid += 1; accepted += n
-            if hasattr(local_draft, "note_accepted"):
-                local_draft.note_accepted(n)
-            if n == K:
-                out.extend(ds); pos += K; cur = ds[-1]
-                committed = ds
-            else:                                                      # divergence -> correct + flush in-flight
-                committed = ds[:n] + [r[n]]
-                out.extend(committed); cur = r[n]; pos += n + 1
-                discard = len(inflight)                                # every chunk still in flight is stale
-                if discard > 0:
-                    try:
-                        # P2-1: Early abort signal to downstream stages
-                        send_msg(pipe_sock, {"op": "abort", "discard": discard})
-                    except Exception:
-                        pass
-                d_fetch()                                             # outstanding draft is stale -> drop it
-                dprefix = prompt_ids + out; send_pos = pos             # re-draft from the corrected prefix
-                d_request(dq(), K)                                    # re-prime from the corrected prefix
-            if on_commit: on_commit({"phase": "decode", "out": out, "dt": time.time() - t0})
-            if len(out) >= max_new or (not ignore_eos and (cur == eos or eos in committed)):
-                done = True
-        d_fetch()                                                     # drain the outstanding draft request
-        while inflight:                                               # drain unread results -> sockets clean for next gen
-            recv_msg(rx); inflight.pop(0)
-    except EDGE_ERRORS as e:
-        if resumable:                          # a node died: hand the committed tokens back so the control
-            committed = out if out else list(resume_ids)   # plane can heal the ring + resume (not restart)
-            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}",
-                    "output_ids": committed, "n_tokens": len(committed),
-                    "text": tok.decode(committed, skip_special_tokens=True)}
-        raise TransportError(f"pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
-    dt = time.time() - t0
-    if eos in out:
-        out = out[:out.index(eos)]
-    return {
-        "ok": True,
-        "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
-        "mean_accept": accepted / max(valid, 1),
-        "toks_per_traversal": (accepted + valid) / max(valid, 1),
-        "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "depth": depth, "K": K,
-        "draft_ms": t_draft / max(valid, 1) * 1000, "recv_ms": t_recv / max(valid, 1) * 1000,
-        "prefill_s": prefill_s, "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
-        "output_ids": out,
-    }
+            send_msg(draft_sock, {"ids": ids, "k": current_k})
+        pending_draft = True
+    def draft_fetch():
+        nonlocal pending_draft, draft_wait
+        if not pending_draft:
+            return []
+        check(); started = clock()
+        result = local_draft.fetch() if use_local else recv_msg(draft_sock)
+        draft_wait += clock() - started
+        pending_draft = False
+        check()
+        if not isinstance(result, list) or len(result) != current_k:
+            raise ValueError("drafter returned the wrong bucket length")
+        return result
+    first_commit = last_commit = None
+    new_count = committed_decode = valid = accepted = proposed_total = stale = sent = warmups = 0
+    recent_accepted = recent_proposed = 0
+    prefill_s = 0.0
+    inflight = []
+    def publish(tokens, phase):
+        nonlocal first_commit, last_commit, new_count
+        available = max(0, max_new - len(out))
+        tokens = list(tokens)[:available]
+        finished = len(tokens) >= available
+        if not ignore_eos and eos in tokens:
+            tokens = tokens[:tokens.index(eos)]; finished = True
+        if golden is not None and out + tokens != golden[:len(out) + len(tokens)]:
+            raise ShapeMismatch("cross-bucket execution changed the canonical greedy frontier")
+        if tokens:
+            out.extend(tokens)
+            now = clock()
+            first_commit = now if first_commit is None else first_commit
+            last_commit = now; new_count += len(tokens)
+        if on_commit:
+            on_commit({"phase": phase, "out": list(out), "dt": clock() - request_started,
+                       "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids), "prefill_s": prefill_s})
+        return len(tokens), finished
+    try:
+        if len(out) < max_new:
+            transmit({"op": "reset", "temp": temp, "top_p": top_p, "top_k": top_k, "seed": seed,
+                      "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce})
+            receive()
+            start_pf = clock(); context = prompt_ids + resume_ids
+            starts = list(range(0, len(context), prefill_chunk)) if prefill_chunk else [0]
+            def prefill(index):
+                stop = index + prefill_chunk if prefill_chunk else len(context)
+                transmit({"op": "verify", "token_ids": context[index:stop], "start": index, "prefill": True})
+            issued = min(max(1, prefill_depth), len(starts))
+            for index in starts[:issued]:
+                prefill(index)
+            reply = None
+            for _ in starts:
+                reply = receive()
+                if issued < len(starts):
+                    prefill(starts[issued]); issued += 1
+            prefill_s = clock() - start_pf
+            cur = int(reply[-1]); pos = len(context)
+            _, done = publish([cur], "prefilled")
+            dprefix, send_pos, inflight, discard = prompt_ids + out, pos, [], 0
+            if not done:
+                draft_request(dprefix)
+            while not done:
+                while len(inflight) < current_depth:
+                    proposed = draft_fetch()
+                    transmit({"op": "verify", "token_ids": [dprefix[-1]] + proposed, "start": send_pos})
+                    sent += 1
+                    inflight.append((send_pos, proposed, current_k))
+                    dprefix += proposed; send_pos += current_k
+                    draft_request(dprefix)
+                reply = receive(); _, proposed, bucket = inflight.pop(0)
+                if discard:
+                    discard -= 1; stale += 1; continue
+                matched = 0
+                for index in range(bucket):
+                    if proposed[index] != reply[index]:
+                        break
+                    matched += 1
+                valid += 1
+                proposed_total += bucket
+                # Full acceptance commits K draft tokens, never an invented K+1.
+                committed = proposed if bucket and matched == bucket else proposed[:matched] + [int(reply[matched])]
+                count, done = publish(committed, "decode")
+                committed_decode += count; accepted += min(matched, count)
+                recent_accepted += min(matched, count); recent_proposed += bucket
+                if hasattr(local_draft, "note_accepted"):
+                    local_draft.note_accepted(min(matched, count))
+                pos += len(committed); cur = committed[-1]
+                if matched != bucket or bucket == 0:
+                    discard = len(inflight)
+                    if discard:
+                        transmit({"op": "abort", "discard": discard})
+                    draft_fetch()
+                    dprefix, send_pos = prompt_ids + out, pos
+                    if not done:
+                        draft_request(dprefix)
+                if (adaptive_pipe or adaptive_depth) and valid % 6 == 0 and not done:
+                    ratio = recent_accepted / max(1, recent_proposed)
+                    recent_accepted = recent_proposed = 0
+                    if adaptive_pipe:
+                        target_k = 0 if ratio < .2 else max(eligible) if ratio > .65 else min(eligible, key=lambda k: abs(k - 1))
+                        target_depth = 1 if target_k <= 1 else min(depth, 4)
+                    else:
+                        target_k = current_k
+                        target_depth = 1 if ratio < .2 else depth if ratio >= .65 else current_depth
+                    if (target_k, target_depth) != (current_k, current_depth):
+                        began = clock()
+                        while inflight:
+                            receive(); inflight.pop(0); stale += 1
+                        draft_fetch(); drain_s += clock() - began
+                        gate["changes"].append({"round": valid, "K": target_k, "depth": target_depth,
+                                                "boundary": "empty_pipeline", "budget": valid * current_k})
+                        old_k = current_k
+                        current_k, current_depth = target_k, target_depth
+                        dprefix, send_pos, discard = prompt_ids + out, pos, 0
+                        # Real shape warmup at the committed boundary; no token is
+                        # published, and the same scratch KV is overwritten next.
+                        if old_k != current_k:
+                            padding = local_draft.propose(dprefix, current_k) if use_local and current_k else [cur] * current_k
+                            transmit({"op": "verify", "token_ids": [cur] + padding, "start": pos})
+                            receive(); warmups += 1
+                        draft_request(dprefix)
+            began = clock()
+            draft_fetch()
+            while inflight:
+                receive(); inflight.pop(0); stale += 1
+            drain_s += clock() - began
+    except ShapeMismatch:
+        # No mismatching token has reached a callback. Drain the already issued
+        # packets, reset the original request, and replay the canonical plain
+        # path while suppressing its already published prefix.
+        while inflight:
+            receive(); inflight.pop(0)
+        draft_fetch()
+        prefix = list(out)
+        replay_seen = len(prefix)
+        def replay(event):
+            nonlocal replay_seen, new_count, first_commit, last_commit, committed_decode
+            ids = event.get("out", [])
+            if ids[:min(len(ids), len(prefix))] != prefix[:min(len(ids), len(prefix))]:
+                raise ValueError("plain replay revised a published prefix")
+            if ids != golden[:len(ids)]:
+                raise ValueError("repeated plain path differs from the canonical greedy control")
+            if len(ids) > replay_seen:
+                new_count += len(ids) - replay_seen
+                committed_decode += len(ids) - replay_seen
+                last_commit = clock()
+                if first_commit is None:
+                    first_commit = last_commit
+                replay_seen = len(ids)
+            if on_commit and len(ids) >= len(prefix):
+                on_commit(event)
+        plain = coordinate_pipe(draft_sock, pipe_sock, tok, prompt, 0, max_new, timeout, 1,
+            ret_sock=ret_sock, prefill_chunk=prefill_chunk, local_draft=local_draft,
+            prompt_ids=prompt_ids, cancel_check=cancel_check, max_ctx=max_ctx, reasoning=reasoning,
+            ignore_eos=ignore_eos, on_commit=replay, swarm_id=swarm_id, job_id=job_id, nonce=nonce,
+            expected_by_signer=expected_by_signer, strict_job_binding=strict_job_binding)
+        if plain["output_ids"] != golden:
+            raise ValueError("repeated plain path changed the canonical greedy control")
+        gate["fallback"] = "original_request_plain_replay_before_mismatch_publication"
+        plain["adaptive"] = gate
+        actual_decode_s = max(0, last_commit - first_commit) if first_commit is not None else 0.0
+        plain["new_decode_tokens"] = max(0, new_count - 1)
+        plain["decode_s"] = actual_decode_s
+        plain["tok_s"] = plain["new_decode_tokens"] / actual_decode_s if actual_decode_s else 0.0
+        plain["ttft_s"] = first_commit - request_started if first_commit is not None else None
+        plain["request_s"] = clock() - request_started - plain["metrics"].get("receipt_sweep_s", 0.0)
+        for name in ("new_decode_tokens", "decode_s", "ttft_s"):
+            plain["metrics"][name] = plain[name]
+        plain["metrics"]["request_s"] = plain["request_s"]
+        plain["metrics"]["shape_gate_s"] = gate_s
+        return plain
+    except EDGE_ERRORS as error:
+        check()
+        if resumable:
+            return {"ok": False, "error": f"{type(error).__name__}: {str(error)[:160]}",
+                    "output_ids": list(out), "n_tokens": len(out), "text": tok.decode(out, skip_special_tokens=True)}
+        raise TransportError(f"pipeline edge failed at token {len(out)} ({type(error).__name__}: {error})") from error
+    request_s = clock() - request_started
+    decode_s = max(0.0, last_commit - first_commit) if first_commit is not None else 0.0
+    new_decode = max(0, new_count - 1)
+    metrics = {"schema": "shard-pipeline-metrics/2", "committed_tokens": len(out), "new_tokens": new_count,
+               "new_decode_tokens": new_decode, "decode_s": decode_s, "request_s": request_s,
+               "ttft_s": first_commit - request_started if first_commit is not None else None,
+               "prefill_s": prefill_s, "recv_wait_s": recv_wait, "draft_wait_s": draft_wait,
+               "drain_s": drain_s, "shape_gate_s": gate_s, "valid_rounds": valid,
+               "committed_decode_tokens": committed_decode, "stale_frames": stale,
+               "sent_verify_frames": sent, "shape_warmup_frames": warmups,
+               "mean_gain": committed_decode / max(valid, 1)}
+    result = {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out),
+              "output_ids": list(out), "rounds": valid, "mean_accept": accepted / max(valid, 1),
+              "toks_per_traversal": metrics["mean_gain"], "tok_s": new_decode / decode_s if decode_s else 0.0,
+              "wasted": stale, "depth": current_depth, "K": current_k,
+              "draft_ms": draft_wait / max(valid, 1) * 1000, "recv_ms": recv_wait / max(valid, 1) * 1000,
+              "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids), "adaptive": gate,
+              "metrics": metrics, **{k: metrics[k] for k in ("new_decode_tokens", "decode_s", "request_s", "ttft_s", "committed_tokens", "prefill_s")}}
+    if local_draft is not None:
+        result["effective_config"] = {"ngram_n": getattr(local_draft, "ng", None),
+            "margin_mode": "adaptive" if getattr(local_draft, "adaptive", False) else "fixed",
+            "margin_cap": getattr(local_draft, "margin_cap", None),
+            "effective_margin": local_draft.effective_margin(len(prompt_ids)) if hasattr(local_draft, "effective_margin") else None,
+            "K": current_k, "depth": current_depth}
+    if expected_by_signer is not None:
+        receipt_started = clock()
+        transmit({"op": "receipt", "receipts": []})
+        raw = receive()
+        from shard.receipt import wire_receipt, verify_coverage
+        receipts = [wire_receipt(row) for row in raw]
+        layers = max(span[1] for span in expected_by_signer.values())
+        verify_coverage(receipts, layers, expected_by_signer=expected_by_signer, expected_nonce=nonce, check_chain=True)
+        if any((row.get("swarm_id"), row.get("job_id"), row.get("nonce")) != (swarm_id, job_id, nonce) for row in receipts):
+            raise ValueError("receipt belongs to another job/session")
+        result.update(receipts=receipts, receipts_ok=True, proof_verified=True)
+        result["metrics"]["receipt_sweep_s"] = clock() - receipt_started
+    return result
 
 
 def sample_distribution_test(pipe_sock, tok, prompt, timeout, ret_sock, local_draft, K, n_draws=2000,
@@ -1060,77 +1430,10 @@ def coordinate_tree_fast(draft_sock, pipe_sock, tok, prompt, tree_cfg, max_new, 
             "draft_ms": t_draft / max(rounds, 1) * 1000, "verify_ms": t_verify / max(rounds, 1) * 1000}
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", type=int, default=0)
-    ap.add_argument("--nstages", type=int, required=True)
-    ap.add_argument("--lo", type=int, default=-1, help="explicit layer-block start (uneven VRAM-aware split; -1 = even)")
-    ap.add_argument("--hi", type=int, default=-1, help="explicit layer-block end (exclusive; -1 = even split)")
-    ap.add_argument("--coordinator", action="store_true", help="in-house entry node: draft + drive, no 120B layers")
-    ap.add_argument("--served-head", action="store_true", help="stage 0 runs as a swarm serve node (embeds token ids)")
-    ap.add_argument("--direct-return", action="store_true", help="tail sends results straight to the coordinator (1 hop, not relayed)")
-    ap.add_argument("--tail", default="", help="coordinator: host:port of the tail, for the direct return channel")
-    ap.add_argument("--tree", default="", help="coordinator: tree spec 'width,depth' (e.g. 3,6) -> tree speculation")
-    ap.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")        # target
-    ap.add_argument("--draft", default="Qwen/Qwen2.5-0.5B-Instruct")
-    ap.add_argument("--listen-port", type=int, default=29501)
-    ap.add_argument("--next", default="")
-    ap.add_argument("--device", default="cuda:0")           # this stage's block
-    ap.add_argument("--draft-device", default="cuda:1")     # draft (head only; its own GPU)
-    ap.add_argument("--draft-server", default="", help="host:port of the in-house vLLM draft service (else local draft)")
-    ap.add_argument("--ngram-draft", action="store_true", help="coordinator: model-free n-gram/prompt-lookup drafter "
-                    "(no draft server, no KV) — the long-context spec-decode path; survives past 100k where the 20b draft OOMs")
-    ap.add_argument("--ngram-n", type=int, default=3, help="n-gram suffix length for --ngram-draft (tune 2-4)")
-    ap.add_argument("--reasoning", default="", help="gpt-oss reasoning_effort (low|medium|high); low cuts the "
-                    "analysis channel so the answer starts sooner (key for copy/retrieval-heavy long-ctx tasks)")
-    ap.add_argument("--K", type=int, default=6)
-    ap.add_argument("--adaptive", action="store_true", help="tune K live from the running acceptance rate")
-    ap.add_argument("--fast", action="store_true", help="serve node: static-cache CUDA-graph verify (~5x, fixed-K linear)")
-    ap.add_argument("--attn", default="eager", help="attention impl for stages: eager | flex_attention "
-                    "(flex = O(n) prefill on Ada, needed for long context with gpt-oss sinks)")
-    ap.add_argument("--prompt-file", default="", help="read the prompt from this file (for 100k-token prompts)")
-    ap.add_argument("--draft-ctx", type=int, default=0, help="window the draft query to the last N tokens "
-                    "(0=full); keeps the draft fast at long context (a full-95k draft is ~800ms/round)")
-    ap.add_argument("--prefill-chunk", type=int, default=0, help="chunk the prefill into this many tokens "
-                    "(0=one shot); long prompts need chunking so per-chunk activations stay bounded")
-    ap.add_argument("--max-ctx", type=int, default=2048, help="fast-verify static cache size (prompt+gen ceiling); "
-                    "sized to the request, not a hardware limit — the KV cache is ~tens of KB/token, so a 4090 "
-                    "stage holds far more than the old 2048 default. overflow fails clean (ContextOverflow), never corrupts")
-    ap.add_argument("--sweep", default="", help="comma K list to measure on one load, 0=adaptive (e.g. 2,3,4,0)")
-    ap.add_argument("--pipe", action="store_true", help="coordinator: PIPELINED spec-decode (depth chunks in flight; needs --direct-return)")
-    ap.add_argument("--depth", type=int, default=4, help="pipelined coordinator: verify chunks in flight")
-    ap.add_argument("--prefill-depth", type=int, default=8, help="pipelined coordinator: PREFILL chunks in flight "
-                    "(overlap prefill across stages; >=nstages fills the pipe -> ~Nstage-fold faster TTFT)")
-    ap.add_argument("--temp", type=float, default=0.0, help="sampling temperature (0=greedy/argmax, exact legacy path); "
-                    ">0 enables LOSSLESS speculative sampling at the tail (temp/top-p/top-k)")
-    ap.add_argument("--top-p", type=float, default=1.0, help="nucleus sampling cutoff (with --temp>0)")
-    ap.add_argument("--top-k", type=int, default=0, help="top-k sampling cutoff (0=off; with --temp>0)")
-    ap.add_argument("--seed", type=int, default=0, help="tail sampler seed (reproducible sampled runs / receipts)")
-    ap.add_argument("--n-layers", type=int, default=0, help="coordinator: the model's TRUE layer count for the "
-                    "receipt coverage check (e.g. 36 for gpt-oss-120b); 0 derives it from the receipts "
-                    "themselves, which a layer-omitting ring can game (warned loudly)")
-    ap.add_argument("--sample-test", type=int, default=0, help="coordinator: draw N iid next-tokens via PLAIN vs "
-                    "SPECULATIVE sampling and report TV distance (on-swarm losslessness proof); needs --ngram-draft")
-    ap.add_argument("--resume-file", default="", help="coordinator: versioned checkpoint (as written by --ft-dump) "
-                    "to RESUME from (re-prefill prompt+committed on a healed ring, continue) — fault tolerance; "
-                    "a checkpoint from another prompt/model/settings is REFUSED (CheckpointError)")
-    ap.add_argument("--ft-dump", default="", help="coordinator: run resumable + atomically write the versioned "
-                    "checkpoint {schema,job,prompt_sha256,...,output_ids,ids_sha256} here on completion OR "
-                    "mid-request node death (exit 3 if a node died), so the control plane can heal+resume")
-    ap.add_argument("--compare", action="store_true", help="coordinator: SYNC then PIPE (cold+warm) in ONE process for a clean A/B")
-    ap.add_argument("--depths", default="2,4,8", help="--compare: pipe depths to sweep (one process)")
-    ap.add_argument("--ks", default="4", help="--compare: K values to sweep (one process; graph recaptures per K)")
-    ap.add_argument("--tree-fast", default="", help="coordinator: FAST graphed tree spec 'w,d' (cold+warm)")
-    ap.add_argument("--dump", default="", help="--pipe: write {prompt, output_ids, tok_s} JSON here (for the receipt)")
-    ap.add_argument("--prompt", default="Explain decentralized computing in two sentences.")
-    ap.add_argument("--max-new", type=int, default=128)
-    ap.add_argument("--timeout", type=float, default=120.0)
-    args = ap.parse_args()
-    wire.key_from_env()                 # shared swarm key (SHARD_PSK); fail fast before the model load
-    if args.prompt_file:                # long (100k) prompts can't fit on the CLI
-        args.prompt = open(args.prompt_file).read()
-
-    if args.coordinator:                                    # in-house entry node: no 120B, just tokenizer + draft + swarm
+def _run_coordinator(args, session_config, plan):
+    import json, hashlib
+    draft_sock = pipe_sock = ret_sock = None
+    try:
         tok = AutoTokenizer.from_pretrained(args.model)     # 20b tokenizer == 120b tokenizer
         local_draft = None
         if args.ngram_draft:                                # model-free drafter: no draft server/socket needed
@@ -1140,14 +1443,8 @@ def main():
         else:
             dh, dp = args.draft_server.split(":")
             draft_sock = socket.socket(); draft_sock.connect((dh, int(dp)))
-        host, port = args.next.split(":")
-        pipe_sock = socket.socket(); pipe_sock.settimeout(args.timeout); pipe_sock.connect((host, int(port)))
-        ret_sock = None
-        if args.direct_return:                              # open the return channel to the tail (once)
-            th, tp = args.tail.split(":")
-            ret_sock = socket.socket(); ret_sock.settimeout(args.timeout); ret_sock.connect((th, int(tp)))
-            send_msg(ret_sock, {"op": "hello_return"})
-            print(f"[coord] direct-return channel to tail at {args.tail}", flush=True)
+        pipe_sock, ret_sock = connect_ring(args.next, args.tail if args.direct_return else None,
+            session_config=session_config, timeout=args.timeout, retry_s=args.timeout)
         print(f"[coord] in-house draft {args.draft_server} + swarm stage 0 at {args.next}; generating ...", flush=True)
         if args.tree:                                       # TREE speculation
             w, d = (int(x) for x in args.tree.split(","))
@@ -1236,12 +1533,19 @@ def main():
                                 args.depth, ret_sock=ret_sock, prefill_chunk=args.prefill_chunk,
                                 draft_ctx=args.draft_ctx, local_draft=local_draft, reasoning=(args.reasoning or None),
                                 temp=args.temp, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
-                                prefill_depth=args.prefill_depth, resume_ids=resume_ids, resumable=True)
+                                prefill_depth=args.prefill_depth, resume_ids=resume_ids, resumable=True,
+                                adaptive_pipe=args.adaptive_pipe, adaptive_depth=args.adaptive_depth,
+                                swarm_id=plan["ring_id"] if plan else "swarm", job_id="cli-ft-" + __import__("secrets").token_hex(16),
+                                nonce=__import__("secrets").token_hex(32),
+                                expected_by_signer={row["signer_pubkey"]: (row["lo"], row["hi"]) for row in plan["stages"]} if plan and RECEIPTS else None,
+                                strict_job_binding=bool(plan and RECEIPTS))
             write_checkpoint(args.ft_dump, ck_env, r.get("output_ids", []),
                              ok=r.get("ok", False), n_tokens=r.get("n_tokens", 0), text=r.get("text", ""),
                              error=r.get("error"), tok_s=round(r.get("tok_s", 0.0), 2),
                              prefill_s=round(r.get("prefill_s", 0.0), 2),
                              resume_tokens=(len(resume_ids) if resume_ids else 0))
+            if args.json_result:
+                print("RESULT " + json.dumps(r, allow_nan=False), flush=True)
             status = "OK" if r.get("ok") else f"NODE-DEATH (committed {r.get('n_tokens', 0)} tok)"
             print(f"[coord] FT run {status} -> {args.ft_dump} | {r.get('n_tokens',0)} tok"
                   f"{' | '+r['error'] if r.get('error') else ''}", flush=True)
@@ -1254,11 +1558,17 @@ def main():
                                     args.timeout, args.depth, ret_sock=ret_sock, prefill_chunk=args.prefill_chunk,
                                     draft_ctx=args.draft_ctx, local_draft=local_draft,
                                     reasoning=(args.reasoning or None), temp=args.temp, top_p=args.top_p,
-                                    top_k=args.top_k, seed=args.seed, prefill_depth=args.prefill_depth)
+                                    top_k=args.top_k, seed=args.seed, prefill_depth=args.prefill_depth, adaptive_pipe=args.adaptive_pipe, adaptive_depth=args.adaptive_depth,
+                    swarm_id=plan["ring_id"] if plan else "swarm", job_id="cli-" + __import__("secrets").token_hex(16),
+                    nonce=__import__("secrets").token_hex(32),
+                    expected_by_signer={row["signer_pubkey"]: (row["lo"],row["hi"]) for row in plan["stages"]} if plan and RECEIPTS else None,
+                    strict_job_binding=bool(plan and RECEIPTS))
                 print(f"[PIPE K={kv} depth={args.depth} temp={args.temp}] {r['tok_s']:.2f} tok/s | "
                       f"{r['toks_per_traversal']:.2f} tok/traversal | "
                       f"accept {r['mean_accept']:.2f} | +{r['wasted']} stale | prefill {r['prefill_s']:.1f}s | "
                       f"draft {r['draft_ms']:.0f}ms recv {r['recv_ms']:.0f}ms/round", flush=True)
+            if args.json_result:
+                print("RESULT " + json.dumps(r, allow_nan=False), flush=True)
             if args.dump:
                 import json, hashlib
                 ids = r["output_ids"]
@@ -1273,7 +1583,7 @@ def main():
                        "output_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest()}
                 json.dump(rec, open(args.dump, "w"))
                 print(f"[coord] dumped run -> {args.dump} (sha256 {rec['output_sha256'][:16]}..)", flush=True)
-            if RECEIPTS:                                   # PROVE: sweep the ring once for signed per-stage receipts
+            if RECEIPTS and not r.get("proof_verified"):  # PROVE: sweep the ring once for signed per-stage receipts
                 rx = ret_sock if ret_sock is not None else pipe_sock
                 send_msg(pipe_sock, {"op": "receipt", "receipts": []})
                 recs = recv_msg(rx)
@@ -1323,9 +1633,210 @@ def main():
             print(f"[coord] dumped run -> {args.dump} (sha256 {hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]}..)", flush=True)
         return
 
-    _lo = args.lo if args.lo >= 0 else None
-    _hi = args.hi if args.hi >= 0 else None
+    finally:
+        for channel in (draft_sock, pipe_sock, ret_sock):
+            if channel is not None:
+                channel.close()
+
+
+def runtime_config_payload(args, config, lo, hi):
+    """The calibrated portable stage contract, independent of secrets/socket handles."""
+    import importlib.metadata
+    from pathlib import Path
+    here = Path(__file__).resolve().parent
+    files = ("specpipe.py", "pipeline.py", "fastverify.py", "mxfp4_guard.py", "ngram_draft.py", "specsample.py")
+    sources = {name: hashlib.sha256((here / name).read_bytes()).hexdigest() for name in files}
+    for name in ("pipeline_session", "pipeline_telemetry", "pipeline_plan", "gpt_oss_contract"):
+        module = __import__("shard." + name, fromlist=[name])
+        sources[name + ".py"] = hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+    versions = {}
+    for name in ("torch", "transformers", "kernels", "numpy"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return {"engine": "gpt-oss", "n_layers": int(config["num_hidden_layers"]), "nstages": args.nstages,
+            "config_sha256": hashlib.sha256(json.dumps({k: v for k, v in config.items()
+                if k not in ("_name_or_path", "name_or_path")}, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest(),
+            "source_sha256": hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest(),
+            "versions": {**versions, "torch_cuda": torch.version.cuda}, "quantization": config.get("quantization_config"),
+            "stage": args.stage, "lo": lo, "hi": hi, "head": args.stage == 0,
+            "tail": args.stage == args.nstages - 1, "fast": bool(args.fast), "served_head": bool(args.served_head),
+            "attn": args.attn, "max_ctx": args.max_ctx, "direct_return": bool(args.direct_return),
+            "window": os.environ.get("FV_WINDOW", "0") not in ("", "0"),
+            "sync_send": SYNC_SEND}
+
+
+def _cli_contract(args, parser):
+    from pathlib import Path
+    from shard.pipeline_plan import load_plan, resolve_bounds, validate_plan
+    from transformers import AutoConfig
+    guard, assignment = None, {}
+    if os.environ.get("SHARD_STAGE_LEASE_CONFIG") and not args.coordinator:
+        from shard.leased_runtime import load_local_lease_guard, process_lease_watchdog
+        guard = load_local_lease_guard(os.environ["SHARD_STAGE_LEASE_CONFIG"])
+        guard.assert_live()
+        assignment = getattr(guard, "stage_assignment", {}) or {}
+        process_lease_watchdog(guard)
+        if args.legacy_protocol:
+            parser.error("managed node leases require the authenticated protocol")
+    config = AutoConfig.from_pretrained(args.model, local_files_only=bool(args.deployment_plan or assignment)).to_dict()
+    plan = load_plan(args.deployment_plan, config=config) if args.deployment_plan else (
+        validate_plan(assignment["deployment_plan"], config=config) if assignment.get("deployment_plan") else None)
+    if plan is not None and assignment.get("deployment_plan") and validate_plan(assignment["deployment_plan"], config=config) != plan:
+        parser.error("CLI plan differs from the node-local leased assignment")
+    lo, hi = resolve_bounds(config, args.stage, args.nstages, split=args.split, lo=args.lo, hi=args.hi, plan=plan)
+    if not args.legacy_protocol and plan is None:
+        parser.error("strict protocol requires --deployment-plan or a leased assignment; --legacy-protocol is explicit compatibility")
+    if plan is not None:
+        args.n_layers = plan["n_layers"]
+        if not args.legacy_protocol:
+            args.direct_return = True
+            if not args.coordinator and args.stage == 0:
+                args.served_head = True
+        cohort = plan.get("model_cohort")
+        if not args.legacy_protocol and cohort is None:
+            parser.error("strict production plan requires the complete model_cohort and verified download inventory")
+        if cohort:
+            if not args.legacy_protocol:
+                from shard.gpt_oss_contract import validate_supported_cohort
+                validate_supported_cohort(cohort, config)
+            if hashlib.sha256((Path(args.model) / "config.json").read_bytes()).hexdigest() != cohort["config_sha256"]:
+                parser.error("model config differs from the deployment cohort")
+            from shard.download_inventory import verify_inventory
+            verify_inventory(args.model, expected_checkpoint_id=cohort["checkpoint_id"],
+                             expected_repo=cohort["model_id"], verify_files=True)
+        if args.coordinator:
+            if args.next and args.next != plan["coordinator"]["head"] or args.tail and args.tail != plan["coordinator"]["tail"]:
+                parser.error("coordinator endpoints differ from plan")
+            args.next, args.tail = plan["coordinator"]["head"], plan["coordinator"]["tail"]
+        else:
+            row = plan["stages"][args.stage]
+            if args.next and args.next != (row["next_endpoint"] or ""):
+                parser.error("next endpoint differs from plan")
+            args.next = row["next_endpoint"] or ""
+            if guard:
+                if (guard.ring_id != plan["ring_id"] or guard.model_cohort_sha256 != plan["cohort_id"] or
+                        guard.node_id != row["node_id"] or guard.gpu_uuid.lower() != row["gpu_uuid"].lower()):
+                    parser.error("node lease identity differs from stage plan")
+                if not args.device.startswith("cuda"):
+                    parser.error("leased production stage requires its assigned CUDA GPU")
+                actual = str(getattr(torch.cuda.get_device_properties(args.device), "uuid", ""))
+                if actual.lower() != guard.gpu_uuid.lower():
+                    parser.error("actual CUDA device UUID differs from lease")
+    payload = runtime_config_payload(args, config, lo, hi)
+    if guard and getattr(guard, "expected_runtime_config", None) != payload:
+        parser.error("effective GPT-OSS runtime differs from its measured lease calibration")
+    caller_key = None
+    if not args.legacy_protocol:
+        key_path = (args.coordinator_key or os.environ.get("SHARD_COORDINATOR_KEY")) if args.coordinator else NODE_KEY_PATH
+        if not key_path:
+            parser.error("strict coordinator requires --coordinator-key or SHARD_COORDINATOR_KEY")
+        caller_key = load_or_make_node_key(key_path)
+    session = None if args.legacy_protocol else SessionConfig.from_plan(plan, -1 if args.coordinator else args.stage,
+        ttl_s=min(3600, max(30, args.timeout * 2)), caller_key=caller_key)
+    print("CONFIG " + json.dumps({**payload, "protocol": "legacy" if session is None else "shard-pipeline-session/1",
+        "runtime_config": payload,
+        "runtime_config_sha256": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest(),
+        "ring_id": plan["ring_id"] if plan else None, "cohort_id": plan["cohort_id"] if plan else None,
+        "K": args.K, "depth": args.depth, "ngram_n": args.ngram_n,
+        "margin_policy": {"mode": "adaptive" if NgramDrafter(ng=args.ngram_n).adaptive else "fixed",
+                          "cap": NgramDrafter(ng=args.ngram_n).margin_cap}, "torch": torch.__version__}, sort_keys=True), flush=True)
+    return lo, hi, session, guard, plan
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--stage", type=int, default=0)
+    ap.add_argument("--nstages", type=int, required=True)
+    ap.add_argument("--lo", type=int, default=-1, help="explicit layer-block start (uneven VRAM-aware split; -1 = even)")
+    ap.add_argument("--hi", type=int, default=-1, help="explicit layer-block end (exclusive; -1 = even split)")
+    ap.add_argument("--split", default=None, help="comma-separated positive per-stage layer counts")
+    ap.add_argument("--deployment-plan", help="validated shard-pipeline-plan/1 file")
+    ap.add_argument("--coordinator-key", help="existing controller Ed25519 key file; never embedded in the plan")
+    ap.add_argument("--legacy-protocol", action="store_true", help="explicit compatibility with older raw-op rings")
+    ap.add_argument("--adaptive-pipe", action="store_true", help="greedy live shape-gated K/depth adaptation at drained boundaries")
+    ap.add_argument("--adaptive-depth", action="store_true", help="fixed-K same-shape depth adjustment; no full-greedy control cost")
+    ap.add_argument("--json-result", action="store_true", help="emit the complete measured/signed result as RESULT JSON")
+    ap.add_argument("--coordinator", action="store_true", help="in-house entry node: draft + drive, no 120B layers")
+    ap.add_argument("--served-head", action="store_true", help="stage 0 runs as a swarm serve node (embeds token ids)")
+    ap.add_argument("--direct-return", action="store_true", help="tail sends results straight to the coordinator (1 hop, not relayed)")
+    ap.add_argument("--tail", default="", help="coordinator: host:port of the tail, for the direct return channel")
+    ap.add_argument("--tree", default="", help="coordinator: tree spec 'width,depth' (e.g. 3,6) -> tree speculation")
+    ap.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")        # target
+    ap.add_argument("--draft", default="Qwen/Qwen2.5-0.5B-Instruct")
+    ap.add_argument("--listen-port", type=int, default=29501)
+    ap.add_argument("--next", default="")
+    ap.add_argument("--device", default="cuda:0")           # this stage's block
+    ap.add_argument("--draft-device", default="cuda:1")     # draft (head only; its own GPU)
+    ap.add_argument("--draft-server", default="", help="host:port of the in-house vLLM draft service (else local draft)")
+    ap.add_argument("--ngram-draft", action="store_true", help="coordinator: model-free n-gram/prompt-lookup drafter "
+                    "(no draft server, no KV) — the long-context spec-decode path; survives past 100k where the 20b draft OOMs")
+    ap.add_argument("--ngram-n", type=int, default=3, help="n-gram suffix length for --ngram-draft (tune 2-4)")
+    ap.add_argument("--reasoning", default="", help="gpt-oss reasoning_effort (low|medium|high); low cuts the "
+                    "analysis channel so the answer starts sooner (key for copy/retrieval-heavy long-ctx tasks)")
+    ap.add_argument("--K", type=int, default=6)
+    ap.add_argument("--adaptive", action="store_true", help="tune K live from the running acceptance rate")
+    ap.add_argument("--fast", action="store_true", help="serve node: static-cache CUDA-graph verify (~5x, fixed-K linear)")
+    ap.add_argument("--attn", default="eager", help="attention impl for stages: eager | flex_attention "
+                    "(flex = O(n) prefill on Ada, needed for long context with gpt-oss sinks)")
+    ap.add_argument("--prompt-file", default="", help="read the prompt from this file (for 100k-token prompts)")
+    ap.add_argument("--draft-ctx", type=int, default=0, help="window the draft query to the last N tokens "
+                    "(0=full); keeps the draft fast at long context (a full-95k draft is ~800ms/round)")
+    ap.add_argument("--prefill-chunk", type=int, default=0, help="chunk the prefill into this many tokens "
+                    "(0=one shot); long prompts need chunking so per-chunk activations stay bounded")
+    ap.add_argument("--max-ctx", type=int, default=2048, help="fast-verify static cache size (prompt+gen ceiling); "
+                    "sized to the request, not a hardware limit — the KV cache is ~tens of KB/token, so a 4090 "
+                    "stage holds far more than the old 2048 default. overflow fails clean (ContextOverflow), never corrupts")
+    ap.add_argument("--sweep", default="", help="comma K list to measure on one load, 0=adaptive (e.g. 2,3,4,0)")
+    ap.add_argument("--pipe", action="store_true", help="coordinator: PIPELINED spec-decode (depth chunks in flight; needs --direct-return)")
+    ap.add_argument("--depth", type=int, default=4, help="pipelined coordinator: verify chunks in flight")
+    ap.add_argument("--prefill-depth", type=int, default=8, help="pipelined coordinator: PREFILL chunks in flight "
+                    "(overlap prefill across stages; >=nstages fills the pipe -> ~Nstage-fold faster TTFT)")
+    ap.add_argument("--temp", type=float, default=0.0, help="sampling temperature (0=greedy/argmax, exact legacy path); "
+                    ">0 enables LOSSLESS speculative sampling at the tail (temp/top-p/top-k)")
+    ap.add_argument("--top-p", type=float, default=1.0, help="nucleus sampling cutoff (with --temp>0)")
+    ap.add_argument("--top-k", type=int, default=0, help="top-k sampling cutoff (0=off; with --temp>0)")
+    ap.add_argument("--seed", type=int, default=0, help="tail sampler seed (reproducible sampled runs / receipts)")
+    ap.add_argument("--n-layers", type=int, default=0, help="coordinator: the model's TRUE layer count for the "
+                    "receipt coverage check (e.g. 36 for gpt-oss-120b); 0 derives it from the receipts "
+                    "themselves, which a layer-omitting ring can game (warned loudly)")
+    ap.add_argument("--sample-test", type=int, default=0, help="coordinator: draw N iid next-tokens via PLAIN vs "
+                    "SPECULATIVE sampling and report TV distance (on-swarm losslessness proof); needs --ngram-draft")
+    ap.add_argument("--resume-file", default="", help="coordinator: versioned checkpoint (as written by --ft-dump) "
+                    "to RESUME from (re-prefill prompt+committed on a healed ring, continue) — fault tolerance; "
+                    "a checkpoint from another prompt/model/settings is REFUSED (CheckpointError)")
+    ap.add_argument("--ft-dump", default="", help="coordinator: run resumable + atomically write the versioned "
+                    "checkpoint {schema,job,prompt_sha256,...,output_ids,ids_sha256} here on completion OR "
+                    "mid-request node death (exit 3 if a node died), so the control plane can heal+resume")
+    ap.add_argument("--compare", action="store_true", help="coordinator: SYNC then PIPE (cold+warm) in ONE process for a clean A/B")
+    ap.add_argument("--depths", default="2,4,8", help="--compare: pipe depths to sweep (one process)")
+    ap.add_argument("--ks", default="4", help="--compare: K values to sweep (one process; graph recaptures per K)")
+    ap.add_argument("--tree-fast", default="", help="coordinator: FAST graphed tree spec 'w,d' (cold+warm)")
+    ap.add_argument("--dump", default="", help="--pipe: write {prompt, output_ids, tok_s} JSON here (for the receipt)")
+    ap.add_argument("--prompt", default="Explain decentralized computing in two sentences.")
+    ap.add_argument("--max-new", type=int, default=128)
+    ap.add_argument("--timeout", type=float, default=120.0)
+    args = ap.parse_args()
+    wire.key_from_env()                 # shared swarm key (SHARD_PSK); fail fast before the model load
+    lo, hi, session_config, lease_guard, plan = _cli_contract(args, ap)
+    if args.prompt_file:                # long (100k) prompts can't fit on the CLI
+        args.prompt = open(args.prompt_file).read()
+
+    if args.coordinator:
+        return _run_coordinator(args, session_config, plan)
+
+    _lo, _hi = lo, hi
     parts = load_stage(args.model, args.stage, args.nstages, device=args.device, attn=args.attn, lo=_lo, hi=_hi)
+    parts["_session_config"], parts["_lease_guard"] = session_config, lease_guard
+    if session_config is not None:
+        parts["_session_key"] = load_or_make_node_key(NODE_KEY_PATH)
+        from shard.pipeline_telemetry import StageTelemetry
+        parts["_telemetry"] = StageTelemetry(node_id=session_config.descriptor()["node_id"],
+            cohort_id=session_config.plan["cohort_id"], index=args.stage,
+            path=os.environ.get("SHARD_STAGE_TELEMETRY_FILE"))
+        parts["_telemetry"].start(endpoint=args.next or None, config=session_config,
+            target_index=args.stage + 1 if args.next else None, send=_raw_send_msg, recv=_raw_recv_msg)
 
     if args.stage != 0 or args.served_head:                 # swarm serve node (stage 0 embeds token ids)
         is_tail = args.stage == args.nstages - 1

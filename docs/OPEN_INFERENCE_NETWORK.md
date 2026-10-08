@@ -7,6 +7,10 @@ region labels guide discovery; measured links decide placement.
 
 ## Implemented components
 
+The existing GPT-OSS runtime now has the same leased serving adapter and authenticated
+pipeline session contract. See [GPT-OSS deployment and measurement](GPT_OSS_PRODUCTION.md)
+for immutable downloads, exact executable templates, measured chunk geometry and migration.
+
 | Component | Implementation | Responsibility |
 |---|---|---|
 | Signed open offers | `shard/offers.py` | Reuse Ed25519 libp2p identity, sequence/TTL, model cohorts, optional exact stage calibrations |

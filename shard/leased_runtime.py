@@ -21,7 +21,7 @@ import time
 def local_lease_guard(spec):
     from .leases import LeaseLedger
     required = {"ledger", "node_id", "principal", "lease_id", "fencing_token", "ring_id", "cohort_id"}
-    if not isinstance(spec, dict) or not required <= set(spec) or set(spec) - required - {"runtime_config"}:
+    if not isinstance(spec, dict) or not required <= set(spec) or set(spec) - required - {"runtime_config", "assignment"}:
         raise ValueError("exact local stage lease configuration required")
     # This file is created by the local runner, never accepted as a remote principal.
     principal = spec["principal"]
@@ -30,12 +30,13 @@ def local_lease_guard(spec):
     guard = ledger.guard(spec["lease_id"], spec["fencing_token"], principal=principal,
                          ring_id=spec["ring_id"], model_cohort_sha256=spec["cohort_id"])
     guard.expected_runtime_config = spec.get("runtime_config")
+    guard.stage_assignment = spec.get("assignment")
     return guard
 
 
 def load_local_lease_guard(path):
     p = Path(path)
-    if p.is_symlink() or p.stat().st_size > 16384:
+    if p.is_symlink() or p.stat().st_size > 262144:
         raise ValueError("invalid local lease configuration file")
     return local_lease_guard(json.loads(p.read_text(encoding="utf-8")))
 
@@ -104,10 +105,12 @@ class LeasedProcessRunner:
                 spec = {"ledger": self.ledger_path, "node_id": lease.node_id,
                         "principal": self.guard.principal, "lease_id": lease.lease_id,
                         "fencing_token": lease.fencing_token, "ring_id": lease.ring_id,
-                        "cohort_id": lease.model_cohort_sha256, "runtime_config": self.runtime_config}
+                        "cohort_id": lease.model_cohort_sha256, "runtime_config": self.runtime_config,
+                        "assignment": dict(assignment)}
                 with os.fdopen(fd, "w", encoding="utf-8") as out:
                     json.dump(spec, out)
-                env = {**os.environ, **self.environment, "SHARD_STAGE_LEASE_CONFIG": config}
+                env = {**os.environ, **self.environment, "SHARD_STAGE_LEASE_CONFIG": config,
+                       "SHARD_STAGE_TELEMETRY_FILE": config + ".telemetry.json"}
                 options = {"env": env, "stdin": subprocess.DEVNULL}
                 if os.name == "nt":
                     options["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -149,6 +152,7 @@ class LeasedProcessRunner:
             self.guard.end_work(self._work)
             self._work = None
             Path(self._config).unlink(missing_ok=True)
+            Path(self._config + ".telemetry.json").unlink(missing_ok=True)
         except Exception as exc:
             # Cleanup failure deliberately keeps the durable reservation occupied.
             self._error = type(exc).__name__
@@ -163,9 +167,17 @@ class LeasedProcessRunner:
 
     def status(self):
         with self._lock:
+            telemetry = None
+            if self._config is not None:
+                path = Path(self._config + ".telemetry.json")
+                if path.exists() and not path.is_symlink() and path.stat().st_size <= 65536:
+                    try:
+                        body = json.loads(path.read_text(encoding="utf-8"))
+                        if body.get("schema") == "shard-stage-telemetry/1": telemetry = body
+                    except (OSError, ValueError): pass
             return {"pid": None if self._process is None else self._process.pid,
                     "running": self._process is not None and self._process.poll() is None,
-                    "resident_work_held": self._work is not None, "error": self._error}
+                    "resident_work_held": self._work is not None, "error": self._error, "telemetry": telemetry}
 
 
 def configured_stage_factory(ledger_path, stages):
@@ -190,7 +202,9 @@ def configured_stage_factory(ledger_path, stages):
                 or assignment["tail"] != (assignment["stage"] == assignment["nstages"] - 1)):
             raise ValueError("stage roles differ from execution order")
         matching = [row for row in configured if all(row.get(k) == assignment.get(k)
-                    for k in ("cohort_id", "lo", "hi", "head", "tail"))]
+                    for k in ("cohort_id", "lo", "hi", "head", "tail")) and
+                    (assignment.get("runtime_config_sha256") is None or
+                     config_digest(row["runtime_config"]) == assignment["runtime_config_sha256"])]
         if len(matching) != 1:
             raise ValueError("no unique locally calibrated stage template")
         row = matching[0]
@@ -205,6 +219,11 @@ def configured_stage_factory(ledger_path, stages):
             return {k: v for k, v in values.items() if k.startswith("V4_") and k not in {"V4_DIR", "V4_DEV"}}
         if v4_flags(env) != v4_flags(cfg.get("environment", {})):
             raise ValueError("effective stage environment differs from calibration")
+        if cfg.get("engine") == "gpt-oss":
+            def oss_flags(values):
+                return {k: v for k, v in values.items() if k.startswith("FV_")}
+            if oss_flags(env) != oss_flags(cfg.get("environment", {})):
+                raise ValueError("effective GPT-OSS stage environment differs from calibration")
         allowed_placeholders = {"lo", "hi", "stage", "nstages", "next"}
         for arg in row["argv"]:
             for _, field, fmt, conversion in string.Formatter().parse(arg):

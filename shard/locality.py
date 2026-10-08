@@ -29,6 +29,9 @@ def shortlist_candidates(nodes, model, policy=None, measurements=None, *, now=No
     per = float(m.get("layer_vram_mb", 1)) + float(m.get("kv_mb_per_layer", 0))
     def capacity(index):
         node = nodes[index]
+        if "allowed_spans" in node:
+            cap = max((row["hi"] - row["lo"] for row in node["allowed_spans"]), default=0)
+            return min(cap, node["cap_layers"]) if node.get("cap_layers") is not None else cap
         lv = (float(node["layer_vram_mb"]) + float(m.get("kv_mb_per_layer", 0))
               if node.get("layer_vram_mb") else per)
         raw = max(0, float(node["free_vram_mb"]) - float(m.get("reserve_mb", 0)))
@@ -78,7 +81,15 @@ def shortlist_candidates(nodes, model, policy=None, measurements=None, *, now=No
             try:
                 age = now - timestamp(row["measured_at"])
                 if -30 <= age <= number(row["ttl_s"], "ttl_s", minimum=1e-9):
-                    proximity[row["dst"]] = number(row["rtt_ms"], "rtt_ms")
+                    if measurements.get("schema") == "shard-link-measurements/2":
+                        if row.get("reachable") is not True:
+                            continue
+                        value = number(row["latency_ms"], "latency_ms")
+                        if row.get("hop_policy") == "half_rtt_assumption":
+                            value /= 2
+                    else:
+                        value = number(row["rtt_ms"], "rtt_ms")
+                    proximity[row["dst"]] = min(value, proximity.get(row["dst"], math.inf))
             except (KeyError, ValueError, TypeError):
                 continue  # Full snapshot validation follows on the bounded frontier.
         for i in sorted(range(len(nodes)), key=lambda i: proximity.get(nodes[i]["id"], math.inf)):
@@ -112,12 +123,12 @@ def timestamp(value):
     return number(value, "measured_at")
 
 
-def link_snapshot(nodes, rtt=None, measurements=None, *, now=None):
+def link_snapshot(nodes, rtt=None, measurements=None, *, now=None, route_ids=None):
     """Sparse observations are authoritative; stale/missing links cannot become zero.
 
     Legacy dense matrices retain their existing RTT-as-hop-delay interpretation.
-    New directed rtt_ms observations use that same conservative interpretation,
-    and explicitly report the assumption rather than inventing one-way precision.
+    Version 1 retains that conservative interpretation. Version 2 records the
+    selected transport route and an explicit one-way or RTT normalization policy.
     """
     now = time.time() if now is None else timestamp(now)
     ids = [node["id"] for node in nodes]
@@ -138,8 +149,10 @@ def link_snapshot(nodes, rtt=None, measurements=None, *, now=None):
                 edges[ids[i], ids[j]] = {"rtt_ms": dense[i][j], "source": "legacy_dense"}
         uncertainty.append("legacy RTT mesh has no freshness proof")
     else:
-        if not isinstance(measurements, dict) or measurements.get("schema") != "shard-link-measurements/1":
+        if not isinstance(measurements, dict) or measurements.get("schema") not in (
+                "shard-link-measurements/1", "shard-link-measurements/2"):
             raise ValueError("unsupported link measurement schema")
+        version2 = measurements["schema"].endswith("/2")
         rows = measurements.get("edges")
         if not isinstance(rows, list):
             raise ValueError("measurement edges must be a list")
@@ -149,23 +162,71 @@ def link_snapshot(nodes, rtt=None, measurements=None, *, now=None):
                 raise ValueError("link endpoints must be nonempty node IDs")
             measured = timestamp(row["measured_at"])
             ttl = number(row["ttl_s"], "ttl_s", minimum=1e-9)
-            latency = number(row["rtt_ms"], "rtt_ms")
+            latency_kind, hop_policy = "legacy_rtt", "conservative_rtt"
+            metadata = {}
+            if version2:
+                for field in ("route_id", "channel", "src_endpoint", "dst_endpoint", "dialer_id"):
+                    if not isinstance(row.get(field), str) or not row[field].strip():
+                        raise ValueError(f"route measurement needs {field}")
+                    metadata[field] = row[field]
+                if "dial_endpoint" in row:
+                    if not isinstance(row["dial_endpoint"], str) or not row["dial_endpoint"].strip():
+                        raise ValueError("route dial_endpoint must be a nonempty string")
+                    metadata["dial_endpoint"] = row["dial_endpoint"]
+                if type(row.get("reachable")) is not bool:
+                    raise ValueError("route reachable must be a boolean")
+                latency_kind, hop_policy = row.get("latency_kind"), row.get("hop_policy")
+                valid = {("one_way", "measured_one_way"), ("rtt", "conservative_rtt"), ("rtt", "half_rtt_assumption")}
+                if (latency_kind, hop_policy) not in valid:
+                    raise ValueError("route latency_kind/hop_policy is inconsistent")
+                latency = number(row["latency_ms"], "latency_ms")
+                metadata.update(reachable=row["reachable"], latency_kind=latency_kind,
+                                hop_policy=hop_policy, measured_latency_ms=latency)
+                hop = latency / 2 if hop_policy == "half_rtt_assumption" else latency
+            else:
+                latency = hop = number(row["rtt_ms"], "rtt_ms")
             bandwidth = row.get("bandwidth_mbps")
             if bandwidth is not None:
                 bandwidth = number(bandwidth, "bandwidth_mbps", minimum=1e-9)
-            key = row["src"], row["dst"]
+            key = row["src"], row["dst"], metadata.get("route_id", "legacy")
             if key not in latest or measured >= latest[key][0]:
-                latest[key] = measured, ttl, latency, bandwidth
-        for key, (measured, ttl, latency, bandwidth) in latest.items():
+                latest[key] = measured, ttl, latency, hop, bandwidth, metadata
+        selections = {}
+        if route_ids is not None:
+            if not version2 or not isinstance(route_ids, list):
+                raise ValueError("route_ids must be a list of src/dst/route_id selections")
+            for selection in route_ids:
+                if (not isinstance(selection, dict) or set(selection) != {"src", "dst", "route_id"}
+                        or any(not isinstance(selection[k], str) or not selection[k].strip() for k in selection)):
+                    raise ValueError("route selection needs exactly nonempty src/dst/route_id")
+                pair = selection["src"], selection["dst"]
+                if pair in selections and selections[pair] != selection["route_id"]:
+                    raise ValueError("conflicting route selection")
+                selections[pair] = selection["route_id"]
+        for key, (measured, ttl, latency, hop, bandwidth, metadata) in latest.items():
             if not -30 <= now - measured <= ttl:
                 uncertainty.append(f"expired/future link {key[0]} -> {key[1]}")
                 continue
-            edges[key] = {"rtt_ms": latency, "bandwidth_mbps": bandwidth, "source": "fresh_sparse"}
+            pair = key[:2]
+            if metadata.get("reachable") is False:
+                continue
+            if pair in selections and selections[pair] != key[2]:
+                continue
+            candidate = {"rtt_ms": latency, "hop_ms": hop, "bandwidth_mbps": bandwidth,
+                         "source": "fresh_sparse", "measured_at": measured, "ttl_s": ttl, **metadata}
+            if pair not in edges or hop < edges[pair].get("hop_ms", edges[pair]["rtt_ms"]):
+                edges[pair] = candidate
         for i, source in enumerate(ids):
             for j, destination in enumerate(ids):
                 if i != j and (source, destination) in edges:
-                    dense[i][j] = edges[source, destination]["rtt_ms"]
-        uncertainty.append("RTT is priced as conservative hop delay, not measured one-way latency")
+                    dense[i][j] = edges[source, destination].get("hop_ms", edges[source, destination]["rtt_ms"])
+        if version2:
+            if any(row.get("hop_policy") == "half_rtt_assumption" for row in edges.values()):
+                uncertainty.append("RTT/2 is an explicit symmetry assumption, not measured one-way delay")
+            if any(row.get("hop_policy") == "conservative_rtt" for row in edges.values()):
+                uncertainty.append("explicit conservative RTT-as-hop pricing")
+        else:
+            uncertainty.append("RTT is priced as conservative hop delay, not measured one-way latency")
     return {"rtt": dense, "edges": edges, "uncertainty": uncertainty, "now": now}
 
 
@@ -189,6 +250,8 @@ def candidate_tiers(nodes, snapshot, policy=None):
     def close(a, b):
         if a == b:
             return True
+        if (a, b) in edges and (b, a) in edges and all(edges[key].get("latency_kind") == "one_way" for key in ((a, b), (b, a))):
+            return edges[a, b]["hop_ms"] + edges[b, a]["hop_ms"] <= limit
         return all((x, y) in edges and edges[x, y]["rtt_ms"] <= limit
                    for x, y in ((a, b), (b, a)))
     fresh_mesh = any(row.get("source") == "fresh_sparse" for row in edges.values())

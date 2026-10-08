@@ -19,6 +19,7 @@ launch tail-first so each node connects to an already-listening successor:
 """
 
 import argparse, json, os, socket, sys, time
+from contextlib import nullcontext
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 import wire
@@ -144,16 +145,23 @@ def load_stage(model_id, stage, nstages, device="cuda", dtype="auto", attn="eage
     ns = namespace(checkpoint_tensor_names(model_id))          # the checkpoint's own module paths
     dmap = device_map_for_block(ns, n_layers, lo, hi, is_head=is_head, is_tail=is_tail,
                                 tied=tied, device=device)
-    # P0-2: Fail-loud verification for MXFP4 checkpoints to prevent silent bf16 dequantization OOM
-    if "mxfp4" in str(model_id).lower() or "gpt-oss" in str(model_id).lower():
-        from mxfp4_guard import verify_mxfp4_runtime_environment, assert_mxfp4_quantized
+    # The checkpoint config is authoritative; a directory rename must not bypass
+    # the MXFP4 gate, and an intentional non-quantized model must remain compatible.
+    from mxfp4_guard import (config_uses_mxfp4, verify_mxfp4_runtime_environment,
+                            native_mxfp4_loading, assert_mxfp4_quantized)
+    native_fp4 = config_uses_mxfp4(cfg)
+    load_guard = nullcontext()
+    if native_fp4:
         verify_mxfp4_runtime_environment(enforce=True)
+        load_guard = native_mxfp4_loading(cfg)
 
     print(f"[s{stage}] loading layers [{lo}:{hi}] of {model_id} ...", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, device_map=dmap,
-                                                 attn_implementation=attn)
-    if "mxfp4" in str(model_id).lower() or "gpt-oss" in str(model_id).lower():
-        assert_mxfp4_quantized(model, model_id=model_id)
+    with load_guard:
+        model = AutoModelForCausalLM.from_pretrained(model_id, config=cfg, dtype=dtype, device_map=dmap,
+                                                     attn_implementation=attn)
+    if native_fp4:
+        assert_mxfp4_quantized(model, model_id=model_id, layer_range=(lo, hi),
+                               layer_path=ns["layers"], expected_device=device)
     m = module_at(model, ns["inner"])                          # holds the layer list + rotary
     parts = {"rotary": m.rotary_emb, "n_layers": n_layers, "lo": lo, "hi": hi, "_model": model}
     if is_head:

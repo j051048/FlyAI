@@ -11,11 +11,18 @@ Flow: eps -> launch tail-first (stage3=tail, stage0=served-head; all --fast --di
       -> draft_server (vLLM gpt-oss-20b) on coord -> warm barrier -> coord SYNC sweep, PIPE sweep.
 Teardown is manual (vastai stop/destroy). Stage order is taken as given (fixed across both runs).
 """
-import os, sys, json, time, subprocess, argparse, concurrent.futures as cf
+import os, sys, json, time, subprocess, argparse, shlex, re, concurrent.futures as cf
+from pathlib import Path
+_REPO = Path(__file__).resolve().parents[1]
+if (_REPO / "shard").is_dir() and str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
 KEY = "/root/.ssh/vast_c0mpute"
 # transport secret — NEVER hardcode (this file is in a public repo). Read from env or ~/.shard_psk (gitignored).
-PSK = (os.environ.get("SHARD_PSK") or open(os.path.expanduser("~/.shard_psk")).read().strip())
+PSK = os.environ.get("SHARD_PSK", "")
+if not PSK and os.path.isfile(os.path.expanduser("~/.shard_psk")):
+    PSK = open(os.path.expanduser("~/.shard_psk")).read().strip()
+WORKSPACE = os.environ.get("SHARD_WORKSPACE", "/root/FlyAI")
 PORT = 29600
 DRAFT_PORT = 8200
 M120 = "/root/models/gpt-oss-120b"
@@ -52,7 +59,8 @@ def ssh22(inst):
 def rssh(inst, cmd, timeout=120):
     h, p = ssh22(inst)
     return subprocess.run(["ssh", "-i", KEY, "-p", str(p)] + SSHO + [f"root@{h}", cmd],
-                          capture_output=True, text=True, timeout=timeout)
+                          capture_output=True, text=True, timeout=timeout,
+                          **({"input":cmd.stdin} if hasattr(cmd,"stdin") else {}))
 
 
 def fire(inst, cmd, timeout=25):
@@ -65,31 +73,60 @@ def fire(inst, cmd, timeout=25):
         pass
 
 
+class RemoteCommand(str):
+    def __new__(cls, command, payload):
+        value = str.__new__(cls, command)
+        value.stdin = json.dumps(payload)
+        return value
+
+
+def managed_command(name, argv, environment=None):
+    source = ("import json,sys; from shard.managed_launch import ManagedLauncher; d=json.load(sys.stdin); "
+              "m=ManagedLauncher('.shard-processes'); print(json.dumps(m.start(d['name'],d['argv'],environment=d['environment'])))")
+    command = "cd " + shlex.quote(WORKSPACE) + " && python3 -c " + shlex.quote(source)
+    return RemoteCommand(command, {"name":name,"argv":list(argv),"environment":dict(environment or {})})
+
+
+def process_command(argv, environment=None):
+    source = ("import json,sys,os,subprocess; d=json.load(sys.stdin); "
+              "r=subprocess.run(d['argv'],env={**os.environ,**d['environment']}); sys.exit(r.returncode)")
+    command = "cd " + shlex.quote(WORKSPACE) + " && python3 -c " + shlex.quote(source)
+    return RemoteCommand(command, {"argv":list(argv),"environment":dict(environment or {})})
+
+
+def remote_config(inst, model):
+    source = "from pathlib import Path; print((Path(" + repr(model) + ")/'config.json').read_text())"
+    result = rssh(inst, "python3 -c " + shlex.quote(source), 30)
+    if result.returncode:
+        raise RuntimeError("cannot read node model config before deployment")
+    return json.loads(result.stdout)
+
+
 def launch_stage(inst, stage, nstages, nxt_ep, served_head, max_ctx=2048):
-    is_tail = stage == nstages - 1
-    nextarg = f" --next {nxt_ep}" if nxt_ep else ""
-    head = " --served-head" if served_head else ""
-    # kill prior GPU procs (NEVER pkill -f specpipe -> would kill this ssh's match); free the port
-    cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
-           f"fuser -k {PORT}/tcp 2>/dev/null; sleep 2; rm -f /root/stage.log; cd /root && "
-           f"SHARD_PSK={PSK} setsid bash -c 'python3 specpipe.py --stage {stage} --nstages {nstages} "
-           f"--model {M120} --listen-port {PORT}{nextarg}{head} --fast --direct-return "
-           f"--max-ctx {max_ctx} --timeout 600 > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
-    fire(inst, cmd)
+    argv = ["python3", "phase0/specpipe.py", "--legacy-protocol", "--stage", str(stage),
+            "--nstages", str(nstages), "--model", M120, "--listen-port", str(PORT),
+            "--fast", "--direct-return", "--max-ctx", str(max_ctx), "--timeout", "600"]
+    if nxt_ep: argv += ["--next", nxt_ep]
+    if served_head: argv += ["--served-head"]
+    fire(inst, managed_command(f"specpipe.stage{stage}", argv, {"SHARD_PSK": PSK}))
 
 
 def warm_stage(inst, label):
+    match = re.search(r"stage([0-9]+)", label)
+    if match is None: raise ValueError("stage label must identify its managed stage")
+    name = f"specpipe.stage{match.group(1)}"
     for _ in range(80):
-        r = rssh(inst, "grep -ciE 'listening' /root/stage.log 2>/dev/null; "
-                       "grep -ciE 'Traceback|Error|exit status' /root/stage.log 2>/dev/null", 30)
-        nums = [x for x in r.stdout.split() if x.isdigit()]
-        if nums and nums[0] != "0":
-            return label, True
-        if len(nums) > 1 and nums[1] != "0":
-            tail = rssh(inst, "tail -5 /root/stage.log", 20).stdout
-            return f"{label} ERR: {tail[-400:]}", False
+        source = ("import json; from pathlib import Path; from shard.managed_launch import ManagedLauncher; "
+                  f"m=ManagedLauncher('.shard-processes'); x=m.status({name!r}); p=Path('.shard-processes')/{(name+'.log')!r}; "
+                  "text=p.read_text(errors='replace')[-8192:] if p.exists() else ''; "
+                  "x['listening']='listening on' in text; print(json.dumps(x))")
+        r = rssh(inst, "cd " + shlex.quote(WORKSPACE) + " && python3 -c " + shlex.quote(source), 30)
+        if r.returncode: return label + " managed status failed", False
+        status = json.loads(r.stdout.strip().splitlines()[-1])
+        if not status["running"]: return label + " owned stage exited", False
+        if status["listening"]: return label, True
         time.sleep(10)
-    return f"{label} TIMEOUT", False
+    return label + " TIMEOUT", False
 
 
 def main():
@@ -150,11 +187,9 @@ def main():
         print("[draft] --skip-draft: reusing the draft already running on coord", flush=True)
     else:
         print("[draft] starting vLLM gpt-oss-20b on coord (loads in parallel with stages)...", flush=True)
-        fire(coord, f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
-                    f"fuser -k {DRAFT_PORT}/tcp 2>/dev/null; sleep 2; rm -f /root/draft.log; cd /root && "
-                    f"SHARD_PSK={PSK} CUDA_VISIBLE_DEVICES=0 setsid bash -c "
-                    f"'/root/vllmenv/bin/python draft_server.py --model {M20} --port {DRAFT_PORT} "
-                    f"--max-len {min(a.max_ctx, 8192)} > /root/draft.log 2>&1' </dev/null >/dev/null 2>&1 &")
+        fire(coord, managed_command("oss-draft", ["/root/vllmenv/bin/python", "phase0/draft_server.py",
+            "--model", M20, "--port", str(DRAFT_PORT), "--max-len", str(min(a.max_ctx,8192))],
+            {"SHARD_PSK": PSK, "CUDA_VISIBLE_DEVICES": "0"}))
 
     print("[launch] stages tail-first; wait each to listen before launching its predecessor "
           "(120B partial load ~1-2min/node, so a predecessor never connects to a dead successor)...", flush=True)
@@ -168,12 +203,12 @@ def main():
 
     # wait for the draft server
     for _ in range(60):
-        r = rssh(coord, "grep -ciE 'ready, listening' /root/draft.log 2>/dev/null", 20)
+        r = rssh(coord, "grep -ciE 'ready, listening' /root/FlyAI/.shard-processes/oss-draft.log 2>/dev/null", 20)
         if r.stdout.strip().split() and r.stdout.strip().split()[0] != "0":
             print("[draft] ready", flush=True); break
         time.sleep(10)
     else:
-        print("[draft] not ready:", rssh(coord, "tail -6 /root/draft.log", 20).stdout[-500:], flush=True); return
+        print("[draft] not ready:", rssh(coord, "tail -6 /root/FlyAI/.shard-processes/oss-draft.log", 20).stdout[-500:], flush=True); return
 
     head_ep = f"{eps[0][0]}:{eps[0][1]}"
     tail_ep = f"{eps[nstages-1][0]}:{eps[nstages-1][1]}"
@@ -193,12 +228,13 @@ def main():
             k = seen.get(st, 0); seen[st] = k + 1            # nudge duplicates so they don't overlap on the map
             return (base[0] + 0.0, base[1] + 3.0 * k)
         nodes = []
-        span = 36 // nstages
+        from shard.pipeline_plan import parse_split, model_layers
+        spans = parse_split(None, model_layers(remote_config(stages[0], M120)), nstages)
         for k, s in enumerate(stages):
             la, lo = latlon(s.get("geolocation"))
             role = "head" if k == 0 else ("tail" if k == nstages - 1 else "mid")
             nodes.append({"idx": k, "city": (s.get("geolocation") or "US").split(",")[0],
-                          "lat": la, "lon": lo, "layers": f"{k*span}-{(k+1)*span}", "role": role,
+                          "lat": la, "lon": lo, "layers": f"{spans[k][0]}-{spans[k][1]}", "role": role,
                           "ip": ep(s)[0]})                    # real public IP — verifiable on the map
         cla, clo = latlon(coord.get("geolocation"))
         nodes.append({"idx": 99, "city": (coord.get("geolocation") or "Utah").split(",")[0],
@@ -207,11 +243,9 @@ def main():
         nodes_json = _json.dumps({"nodes": nodes, "hops": hops_ms, "loop_ms": loop_ms}).replace("'", "")
         rssh(coord, f"cat > /root/nodes.json <<'NODESEOF'\n{nodes_json}\nNODESEOF", 20)
         print(f"\n[gateway] launching on coord:29600 (sole coordinator) head={head_ep} tail={tail_ep}", flush=True)
-        fire(coord, f"fuser -k 29600/tcp 2>/dev/null; sleep 2; rm -f /root/gateway.log; "
-                    f"cd /root && SHARD_PSK={PSK} setsid bash -c 'exec python3 -u gateway.py --head {head_ep} "
-                    f"--tail {tail_ep} --draft 127.0.0.1:{DRAFT_PORT} --port 29600 --max-new 4096 "
-                    f"--max-ctx {a.max_ctx} "
-                    f"--nodes-file /root/nodes.json > /root/gateway.log 2>&1' </dev/null >/dev/null 2>&1 &")
+        fire(coord, managed_command("oss-demo-gateway", ["python3", "phase0/gateway.py", "--head", head_ep,
+            "--tail", tail_ep, "--draft", f"127.0.0.1:{DRAFT_PORT}", "--port", "29600", "--max-new", "4096",
+            "--max-ctx", str(a.max_ctx), "--nodes-file", "/root/nodes.json"], {"SHARD_PSK": PSK}))
         for _ in range(30):                                  # wait for the gateway to bind (torch import ~15-20s)
             r = rssh(coord, "ss -ltnp 2>/dev/null | grep -c :29600", 20)
             if r.stdout.strip().startswith("1"):
@@ -229,17 +263,17 @@ def main():
         print("[done] stages still warm; teardown: vastai destroy instance <id>", flush=True)
         return
 
-    base = (f"cd /root && SHARD_PSK={PSK} python3 specpipe.py --coordinator --nstages {nstages} "
-            f"--model {M20} --draft-server 127.0.0.1:{DRAFT_PORT} --next {head_ep} "
-            f"--direct-return --tail {tail_ep} --prompt \"{a.prompt}\" --max-new {a.max_new} --timeout 600")
-
+    argv = ["python3", "phase0/specpipe.py", "--legacy-protocol", "--coordinator", "--nstages", str(nstages),
+            "--model", M120, "--draft-server", f"127.0.0.1:{DRAFT_PORT}", "--next", head_ep,
+            "--tail", tail_ep, "--direct-return", "--max-new", str(a.max_new), "--max-ctx", str(a.max_ctx),
+            "--prompt", a.prompt]
     if a.tree:
-        print(f"\n[run] === FAST TREE spec (w,d={a.tree}), cold+warm ===", flush=True)
-        r = rssh(coord, base + f" --tree-fast {a.tree} 2>&1 | grep -viE 'INFO|WARNING|warn'", 1800)
+        argv += ["--tree-fast", a.tree]
     else:
-        dump = " --dump /root/run.json" if a.dump else ""
-        print(f"\n[run] === COMPARE: SYNC vs PIPE (ks={a.ks}, depths={a.depths}), cold+warm, ONE process ===", flush=True)
-        r = rssh(coord, base + f" --compare --ks {a.ks} --depths {a.depths}{dump} 2>&1 | grep -viE 'INFO|WARNING|warn'", 1800)
+        argv += ["--compare", "--ks", a.ks, "--depths", a.depths]
+    if a.dump: argv += ["--dump", "/root/run.json"]
+    r = rssh(coord, process_command(argv, {"SHARD_PSK":PSK}), 1800)
+    if r.returncode: raise SystemExit("coordinator failed; see its owned log/output")
     print(r.stdout[-2500:], flush=True)
     print("\n[done] stages still warm; teardown: vastai destroy instance <id>", flush=True)
 

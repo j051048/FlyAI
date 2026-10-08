@@ -101,7 +101,7 @@ class FastVerify:
         # -> ~few-ULP FP non-associativity that MoE routing can amplify (same class as cross-K, NOT
         # bit-identical to the full read). OFF by default to keep the engine bit-exact; opt in per-node
         # with FV_WINDOW=1 for long-context speed. Bucketing (above) stays bit-identical and always on.
-        self.use_window = bool(os.environ.get("FV_WINDOW"))
+        self.use_window = os.environ.get("FV_WINDOW", "0") not in ("", "0")
 
     def _bucket(self, need):                                    # smallest bucket >= need, clamped to maxlen
         for b in self.DECODE_BUCKETS:

@@ -19,6 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+deploy = ["psutil>=5.9"]
+gpt-oss = ["safetensors>=0.5", "transformers>=4.55", "huggingface-hub>=0.34"]
 v4 = ["einops>=0.7", "safetensors>=0.5", "transformers>=4.48"]
 # Apple-silicon backend: shard/mlx_runtime.py imports these lazily (Mac-only)
 mlx = ["mlx>=0.21", "mlx-lm>=0.20"]

@@ -53,14 +53,15 @@ class NgramDrafter:
                 self.adaptive = True
             else:
                 try:
-                    self.margin_cap = int(env_margin)
+                    self.margin_cap = int(env_margin.removeprefix("fixed:"))
                     self.adaptive = False
                 except ValueError:
-                    self.margin_cap = margin
-                    self.adaptive = (adaptive if adaptive is not None else (margin == 256))
+                    raise ValueError("NGRAM_MARGIN requires auto, fixed:<nonnegative integer>, or a legacy integer") from None
         else:
             self.margin_cap = margin
             self.adaptive = (adaptive if adaptive is not None else (margin == 256))
+        if type(self.margin_cap) is not int or self.margin_cap < 0:
+            raise ValueError("n-gram margin must be a nonnegative integer")
 
         self.margin = self.margin_cap
         self.indexed = 0             # committed positions < this are in `table`

@@ -80,6 +80,9 @@ import threading
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+if os.path.isdir(os.path.join(_REPO_ROOT, "shard")) and _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.dirname(_HERE))
 
@@ -91,9 +94,21 @@ import torch  # noqa: E402
 import v4_levers  # noqa: E402
 
 try:                                                    # flat box layout (files pushed to /root/) else package
-    from transport import send_msg, recv_msg
+    from transport import send_msg as _raw_send_msg, recv_msg as _raw_recv_msg
 except ImportError:
-    from shard.transport import send_msg, recv_msg
+    from shard.transport import send_msg as _raw_send_msg, recv_msg as _raw_recv_msg
+try:
+    from shard.pipeline_session import SessionConfig, SessionSocket, SessionAcceptor, ProtocolError, hello_client, send_message, recv_message
+except ImportError:
+    from pipeline_session import SessionConfig, SessionSocket, SessionAcceptor, ProtocolError, hello_client, send_message, recv_message
+
+
+def send_msg(sock, payload):
+    return send_message(_raw_send_msg, sock, payload)
+
+
+def recv_msg(sock):
+    return recv_message(_raw_recv_msg, sock)
 try:
     from receipt import (ReceiptSigner, load_or_make_node_key, pub_b64, verify_coverage,
                          wire_receipt, ReceiptError)
@@ -549,6 +564,8 @@ class _KeepWarm:
 
     def __init__(self, sock):
         self.sock = sock
+        self.session_config = getattr(sock, "config", None)
+        self.session_key = getattr(sock, "caller_key", None)
         self.lock = threading.Lock()
         self.last = time.monotonic()
         self._stop = False
@@ -742,8 +759,12 @@ def _fwd_open(kw, nxt, timeout, msg, tag="[s]"):
         pass
     kw.attach(None)
     sock = _dial(*nxt.rsplit(":", 1), timeout=timeout)    # a re-dial that fails raises into the serve
+    if getattr(kw, "session_config", None) is not None:
+        cfg = kw.session_config
+        sock = hello_client(sock, cfg, cfg.index + 1, "forward", _raw_send_msg, _raw_recv_msg,
+                            key=getattr(kw, "session_key", None))
     kw.attach(sock)                                       # loop's supervision, exactly as before
-    if SWARM_TOKEN is not None:
+    if SWARM_TOKEN is not None and getattr(kw, "session_config", None) is None:
         # the fresh link must greet like the launch-time dial did, or a token-mode successor
         # (rightly) drops it as a stranger and the self-heal this function exists for never lands
         send_msg(sock, {"op": "hello_pred", "token": SWARM_TOKEN})
@@ -845,7 +866,8 @@ def _reset_capacity_error(st, msg):
 
 def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=None, device=None,
                 receipts=None, key_path=None, timeout=600.0, bind="127.0.0.1", ready=None,
-                ret_relay=None, dspark=False, runtime_metrics=None, token_privacy=None, lease_guard=None):
+                ret_relay=None, dspark=False, runtime_metrics=None, token_privacy=None, lease_guard=None,
+                session_config=None):
     """Serve one contiguous layer block [lo:hi) in the fire-forward ring.
 
     head (stage 0)      embeds token ids -> h [b, s, 4, dim], runs its layers, forwards (h, ids).
@@ -875,6 +897,21 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
             raise ValueError("leased GPU UUID differs from the actual stage CUDA device")
     receipts = RECEIPTS if receipts is None else receipts
     key_path = key_path or NODE_KEY_PATH
+    if session_config is None and lease_guard is not None:
+        assignment = getattr(lease_guard, "stage_assignment", {}) or {}
+        if assignment.get("deployment_plan"):
+            session_config = SessionConfig.from_plan(assignment["deployment_plan"], stage,
+                ttl_s=min(3600, max(30, timeout * 2)), caller_key=load_or_make_node_key(key_path))
+    if session_config is not None:
+        row = session_config.stage(stage)
+        if (session_config.index, session_config.plan["nstages"], row["lo"], row["hi"]) != (stage, nstages, lo, hi):
+            raise ValueError("stage geometry differs from its authenticated protocol plan")
+        if lease_guard is not None and (lease_guard.ring_id != session_config.plan["ring_id"] or
+                lease_guard.model_cohort_sha256 != session_config.plan["cohort_id"] or
+                lease_guard.node_id != row["node_id"] or lease_guard.gpu_uuid.lower() != (row.get("gpu_uuid") or "").lower()):
+            raise ValueError("authenticated stage plan differs from its node-local lease")
+        if ret_relay is not None:
+            raise ValueError("strict sessions require the plan's direct tail endpoint; legacy return relay requires explicit compatibility")
     if str(dev).startswith("cuda"):
         # generate.py:92 does this and the reference NEEDS it: model.py's lru_cached index helpers
         # (get_window_topk_idxs:261, get_compress_topk_idxs:275, get_dspark_topk_idxs:744) build
@@ -921,7 +958,7 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
         example = torch.zeros(1, 1, args.hc_mult, args.dim, dtype=st.dtype, device=dev)
         v4_wire_codec.warmup(example)
         del example
-    node_key = load_or_make_node_key(key_path) if receipts else None
+    node_key = load_or_make_node_key(key_path) if receipts or session_config is not None else None
     print(f"[s{stage}] {st}", flush=True)
     # THE LEVER AUDIT, here and not later: everything a stage installs is installed by now, and every
     # number this process is about to produce is about whatever configuration it actually reached.
@@ -932,12 +969,16 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((bind, port))
-    srv.listen(4)
+    srv.listen(32)
+    acceptor = (SessionAcceptor(srv, session_config, _raw_send_msg, _raw_recv_msg,
+                               key=node_key, timeout=timeout) if session_config is not None else None)
     # non-tail stages dial the forward leg at startup (a dead --next at boot is a launcher bug); the
     # sidecar tunnels FWD_RING to the next stage's inbound. Kernel accepts the handshake as soon as
     # the peer is listening, so this completes before the peer calls accept().
     nxt_sock = _dial(*nxt.rsplit(":", 1), timeout=timeout) if (not tail and nxt) else None
-    if nxt_sock is not None and SWARM_TOKEN is not None:
+    if nxt_sock is not None and session_config is not None:
+        nxt_sock = hello_client(nxt_sock, session_config, stage + 1, "forward", _raw_send_msg, _raw_recv_msg, key=node_key)
+    elif nxt_sock is not None and SWARM_TOKEN is not None:
         send_msg(nxt_sock, {"op": "hello_pred", "token": SWARM_TOKEN})
     print(f"[s{stage}] listening {bind}:{port}"
           + (f" -> {nxt}" if nxt_sock is not None else " (tail)")
@@ -948,24 +989,28 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
     try:
         if tail:
             _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=(ckpt_dir if dspark
-                                                                               else None))
+                                                                               else None), acceptor=acceptor)
         elif ret_relay is not None:
             _serve_relay_ingress(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts,
                                  timeout, ret_relay)
         else:
-            _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout)
+            _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout, acceptor=acceptor)
     finally:
         # Teardown: this stage serves no more jobs, so drop the horizon it was carrying. In a real
         # ring that is one process per stage and the clear is cosmetic; in the IN-PROCESS shape (the
         # selftest runs every stage as a thread beside the coordinator and the oracle) the horizon is
         # a shared global, and a dead stage thread must not leave one job's value behind it.
         _set_job_horizon(None)
+        if acceptor is not None:
+            acceptor.close()
+        else:
+            srv.close()
 
 
 _STRAY = (ConnectionError, OSError, ValueError, KeyError, TypeError, struct.error)
 
 
-def _accept_pred(srv, timeout):
+def _accept_pred(srv, timeout, acceptor=None):
     """Accept the predecessor, tolerating stray connections on the public engine port. The port is
     internet-facing (a scanner racing the real predecessor for accept() sends e.g. an HTTP probe,
     whose bytes parse as a garbage frame length and would crash the stage — cascading the ring). So
@@ -973,6 +1018,8 @@ def _accept_pred(srv, timeout):
     seconds, while a silent scanner never becomes readable and is ignored; a connection that delivers
     an unparseable/oversized frame is dropped and we keep waiting. token-mode returns after the
     hello_pred greeting; token-less returns the first frame as `queued`."""
+    if acceptor is not None:
+        return acceptor.get("drive" if acceptor.config.index == 0 else "forward"), None
     pending = []
     while True:
         ready, _, _ = select.select([srv] + pending, [], [])
@@ -1033,7 +1080,7 @@ def _warm_until_accept(nxt_sock, period=5.0):
     return stop
 
 
-def _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout):
+def _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout, acceptor=None):
     """Head/middle serve loop: process a frame, forward it down the ring, never answer the pipe.
 
     The HEAD's predecessor IS the coordinator, so it gets a `reaccept` closure: a coordinator that
@@ -1043,11 +1090,11 @@ def _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receip
     there is a genuine upstream death and should still cascade."""
     stop_warm = _warm_until_accept(nxt_sock)   # keep the just-dialed forward leg warm through accept-wait
     try:
-        conn, queued = _accept_pred(srv, timeout)
+        conn, queued = _accept_pred(srv, timeout, acceptor=acceptor)
     finally:
         stop_warm()                            # stop BEFORE the forward loop touches nxt_sock
     print(f"[s{stage}] predecessor connected", flush=True)
-    reaccept = (lambda: _accept_pred(srv, timeout)) if head else None
+    reaccept = (lambda: _accept_pred(srv, timeout, acceptor=acceptor)) if head else None
     _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, conn, queued, timeout,
                   reaccept=reaccept)
 
@@ -1176,13 +1223,17 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
             raise RuntimeError(f"s{stage}: unknown op {op!r}")
 
 
-def _tail_bringup(srv, timeout):
+def _tail_bringup(srv, timeout, acceptor=None):
     """Identify the two tail-inbound streams WITHOUT ever block-recv'ing a silent one. The
     predecessor connection is accepted early (the upstream stage dialed at launch) but stays silent
     until the first job frame flows the ring; the coordinator-return greets immediately. So select
     on the accepted set and only recv a connection that is READABLE — a plain accept-then-recv here
     deadlocks: the tail would block reading the silent predecessor while the coordinator blocks
     waiting for its ret_ok. Returns (ret, pred, queued)."""
+    if acceptor is not None:
+        ret = acceptor.get("return")
+        pred = acceptor.get("drive" if acceptor.config.index == 0 else "forward")
+        return ret, pred, None
     ret = pred = queued = None
     pending = []
     while ret is None or pred is None:
@@ -1293,7 +1344,7 @@ class _RetChannel:
                 pass
 
 
-def _tail_return_reaccept(srv, chan, timeout):
+def _tail_return_reaccept(srv, chan, timeout, acceptor=None):
     """Own srv.accept() after bring-up so a coordinator RESTART is survivable. A restarting
     coordinator re-dials the return channel (hello_return); the tail's serve loop is blocked reading
     its predecessor and cannot accept it, and without this the coordinator's connect_ring would hang
@@ -1302,6 +1353,15 @@ def _tail_return_reaccept(srv, chan, timeout):
     already answering on the new socket) and only then acks. The predecessor never re-connects here
     (the upstream stage stays up while the head survives); a stray/scanner frame is dropped."""
     while True:
+        if acceptor is not None:
+            try:
+                conn = acceptor.get("return")
+            except OSError:
+                return
+            old = chan.swap(conn)
+            if old is not None:
+                old.close()
+            continue
         try:
             ready, _, _ = select.select([srv], [], [])
             if srv not in ready:
@@ -1340,7 +1400,7 @@ def _tail_return_reaccept(srv, chan, timeout):
         print("[tail] coordinator-return re-accepted — ring survived a coordinator restart", flush=True)
 
 
-def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
+def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acceptor=None):
     """Tail serve loop. Accepts BOTH inbound streams (predecessor + coordinator-return) on the one
     engine port, classified by the hello_return greeting, then serves: run the block, collapse the
     hyper-connections, sample, and send the token id back on the return channel.
@@ -1352,10 +1412,10 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
 
     `ckpt_dir` is set only when the stage was built --dspark: it is where the drafter's `mtp.*` come
     from, and passing it is what makes a drafted ring possible at all."""
-    ret, pred, queued = _tail_bringup(srv, timeout)
+    ret, pred, queued = _tail_bringup(srv, timeout, acceptor=acceptor)
     print("[tail] predecessor + coord-return connected", flush=True)
     chan = _RetChannel(ret)
-    threading.Thread(target=_tail_return_reaccept, args=(srv, chan, timeout), daemon=True,
+    threading.Thread(target=_tail_return_reaccept, args=(srv, chan, timeout, acceptor), daemon=True,
                      name="v4-tail-reaccept").start()
 
     signer = None
@@ -1519,7 +1579,7 @@ def _hostport(s):
     return h or "127.0.0.1", int(p)
 
 
-def connect_ring(head, tail, timeout=600.0, token=None, retry_s=300):
+def connect_ring(head, tail, timeout=600.0, token=None, retry_s=300, session_config=None):
     """Dial the head engine (pipe) + the return tunnel to the tail (ret), with retries — the daemon
     starts the coordinator while other stages may still be pulling weights. Mirrors
     shard.coordinate.connect_ring: hello_return classifies the tail-side stream, the token (env-only)
@@ -1531,10 +1591,17 @@ def connect_ring(head, tail, timeout=600.0, token=None, retry_s=300):
         try:
             pipe = socket.create_connection(_hostport(head), timeout=timeout)
             pipe.setsockopt(*NODELAY)
+            if session_config is not None:
+                pipe = hello_client(pipe, session_config, 0, "drive", _raw_send_msg, _raw_recv_msg,
+                                    session_id=__import__("secrets").token_hex(16))
             ret = socket.create_connection(_hostport(tail), timeout=timeout)
             ret.setsockopt(*NODELAY)
             ret.settimeout(timeout)
-            if token:
+            if session_config is not None:
+                ret = hello_client(ret, session_config, session_config.plan["nstages"] - 1, "return",
+                                   _raw_send_msg, _raw_recv_msg, grant=pipe.grant)
+                return pipe, ret
+            elif token:
                 send_msg(pipe, {"op": "hello_pred", "token": token})
                 send_msg(ret, {"op": "hello_return", "token": token})
             else:
@@ -1549,6 +1616,8 @@ def connect_ring(head, tail, timeout=600.0, token=None, retry_s=300):
                         s.close()
                     except OSError:
                         pass
+            if isinstance(e, ProtocolError):
+                raise
             time.sleep(min(2.0, max(0.25, deadline - time.time())))
     raise ConnectionError(f"v4 ring not reachable after {retry_s}s: {type(last).__name__}: {last}")
 
@@ -3246,7 +3315,7 @@ def _coord_cli(a):
     eos = tok.eos_token_id
     eos_ids = tuple(eos) if isinstance(eos, (list, tuple)) else ((eos,) if eos is not None else ())
     pipe, ret = connect_ring(a.head, a.tail, timeout=a.timeout, token=SWARM_TOKEN,
-                             retry_s=a.connect_retry)
+                             retry_s=a.connect_retry, session_config=getattr(a, "session_config", None))
     # The COORDINATOR-side half of the lever audit, on stderr so the SHARD_JOB_* stdout contract the
     # node daemon parses stays clean. Its most valuable line is the WRONG PROCESS one: V4_LAZY_DRAFT
     # and V4_PIPELINED_SPEC are read HERE and nowhere else, and an operator who set them on the
@@ -3371,6 +3440,8 @@ def main():
     s.add_argument("--dspark", action="store_true",
                    help="tail only: build the DSpark MTP speculator stages (step 4)")
     s.add_argument("--dir", default=os.environ.get("V4_DIR", "/root/v4"))
+    s.add_argument("--deployment-plan")
+    s.add_argument("--legacy-protocol", action="store_true")
     s.add_argument("--device", default=None)
     s.add_argument("--bind", default=os.environ.get("M25_ENGINE_BIND", "127.0.0.1"))
     s.add_argument("--receipts", action="store_true")
@@ -3381,6 +3452,9 @@ def main():
     c.add_argument("--head", default=f"127.0.0.1:{ENG_IN}")
     c.add_argument("--tail", default=f"127.0.0.1:{FWD_RET}")
     c.add_argument("--dir", default=os.environ.get("V4_DIR", "/root/v4"))
+    c.add_argument("--deployment-plan")
+    c.add_argument("--legacy-protocol", action="store_true")
+    c.add_argument("--coordinator-key", default=os.environ.get("SHARD_COORDINATOR_KEY"))
     c.add_argument("--receipts", action="store_true")
     c.add_argument("--timeout", type=int, default=600)
     c.add_argument("--connect-retry", type=int, default=300, dest="connect_retry")
@@ -3398,13 +3472,38 @@ def main():
             from shard.leased_runtime import load_local_lease_guard, process_lease_watchdog
             lease_guard = load_local_lease_guard(lease_config)
             lease_stop = process_lease_watchdog(lease_guard)
+        session_config = None
+        plan = None
+        if a.deployment_plan:
+            from shard.pipeline_plan import load_plan
+            plan = load_plan(a.deployment_plan)
+        elif lease_guard is not None:
+            plan = (getattr(lease_guard, "stage_assignment", {}) or {}).get("deployment_plan")
+        if not a.legacy_protocol:
+            if plan is None or not plan.get("model_cohort"):
+                ap.error("strict V4 stage requires a full model-cohort deployment plan; legacy is explicit")
+            raw = open(os.path.join(a.dir, "config.json"), "rb").read()
+            import hashlib
+            if hashlib.sha256(raw).hexdigest() != plan["model_cohort"]["config_sha256"]:
+                ap.error("V4 checkpoint config differs from the deployment cohort")
+            session_config = SessionConfig.from_plan(plan, a.stage, caller_key=load_or_make_node_key(NODE_KEY_PATH))
         serve_stage(a.stage, a.nstages, a.lo, a.hi, a.port, nxt=a.next, ckpt_dir=a.dir,
                     device=a.device, receipts=(a.receipts or RECEIPTS), bind=a.bind,
                     ret_relay=a.ret_relay, dspark=a.dspark, runtime_metrics=a.runtime_metrics,
-                    lease_guard=lease_guard)
+                    lease_guard=lease_guard, session_config=session_config)
         if lease_stop is not None:
             lease_stop.set()
     elif a.cmd == "coord":
+        a.session_config = None
+        if not a.legacy_protocol:
+            if not a.deployment_plan or not a.coordinator_key:
+                ap.error("strict V4 coordinator requires --deployment-plan and --coordinator-key")
+            from shard.pipeline_plan import load_plan
+            plan = load_plan(a.deployment_plan)
+            if not plan.get("model_cohort"):
+                ap.error("strict V4 coordinator requires the full model cohort")
+            a.head, a.tail = plan["coordinator"]["head"], plan["coordinator"]["tail"]
+            a.session_config = SessionConfig.from_plan(plan, -1, caller_key=load_or_make_node_key(a.coordinator_key))
         sys.exit(_coord_cli(a))
     elif a.cmd == "selftest":
         selftest()

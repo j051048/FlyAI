@@ -19,28 +19,40 @@ def _integer(value, name, minimum=1, maximum=1_000_000):
 def workload_spec(value):
     value = dict(value or {})
     depth = _integer(value.get("depth", 1), "depth", maximum=256)
-    block = _integer(value.get("block_tokens", depth), "block_tokens", maximum=256)
+    frame_tokens = _integer(value.get("frame_tokens", 1), "frame_tokens", maximum=256)
+    block = _integer(value.get("block_tokens", frame_tokens if frame_tokens > 1 else depth), "block_tokens", maximum=256)
     gain = number(value.get("acceptance_gain", 1.0), "acceptance_gain", minimum=1)
     if gain > block:
         raise ValueError("acceptance_gain cannot exceed block_tokens")
     cancel = value.get("cancel_rate")
     if cancel is not None and number(cancel, "cancel_rate") > 1:
         raise ValueError("cancel_rate must be <=1")
-    frame_tokens = _integer(value.get("frame_tokens", 1), "frame_tokens", maximum=256)
-    if frame_tokens != 1:
-        raise ValueError("this cost model requires frame_tokens=1; chunk service needs separate measured geometry")
+    if frame_tokens > 1:
+        _integer(value.get("context_tokens"), "chunk context_tokens")
+        if value.get("warmness") not in ("cold", "warm"):
+            raise ValueError("chunk planning requires explicit cold/warm state")
+        if value.get("draft_tokens") != frame_tokens - 1 or type(value.get("draft_tokens")) is not int:
+            raise ValueError("verify chunk must bind frame_tokens == K+1")
+        if cancel is None or "stale_frames_per_valid" not in value:
+            raise ValueError("chunk planning requires observed/explicit cancel_rate and stale_frames_per_valid")
+        if number(value["stale_frames_per_valid"], "stale_frames_per_valid") > depth - 1:
+            raise ValueError("stale frames exceed the finite in-flight suffix")
     return {"depth": depth, "block_tokens": block, "acceptance_gain": gain,
             "generated_tokens": _integer(value.get("generated_tokens", 256), "generated_tokens"),
             "frame_tokens": frame_tokens,
+            "context_tokens": value.get("context_tokens"), "warmness": value.get("warmness"),
+            "stale_frames_per_valid": value.get("stale_frames_per_valid", 0),
             "cancel_rate": cancel, "refill_ms": number(value.get("refill_ms", 0), "refill_ms"),
             "replay_frames_per_cancel": number(value.get("replay_frames_per_cancel", 0), "replay_frames_per_cancel")}
 
 
-def stage_observation(node, layers, fallback_ms, *, now, start=None):
+def stage_observation(node, layers, fallback_ms, *, now, start=None, workload=None,
+                      require_fresh_chunk=True):
+    frame_tokens = (workload or {}).get("frame_tokens", 1)
     trace = node.get("stage_trace")
     warning = []
     if trace is not None:
-        if not isinstance(trace, dict) or trace.get("schema") != "shard-stage-trace/1":
+        if not isinstance(trace, dict) or trace.get("schema") not in ("shard-stage-trace/1", "shard-stage-trace/2"):
             raise ValueError("unsupported stage trace schema")
         age = now - timestamp(trace["measured_at"])
         ttl = number(trace["ttl_s"], "trace ttl_s", minimum=1e-9)
@@ -60,8 +72,12 @@ def stage_observation(node, layers, fallback_ms, *, now, start=None):
         if prefill is not None:
             prefill = number(prefill, "prefill_ms")
         expected = {"node_id": node["id"], "gpu_uuid": node.get("gpu_uuid"),
-                    "cohort_id": node.get("cohort_id"), "frame_tokens": 1,
+                    "cohort_id": node.get("cohort_id"), "frame_tokens": frame_tokens,
                     "runtime_config_sha256": node.get("runtime_config_sha256")}
+        if frame_tokens > 1:
+            if trace.get("schema") != "shard-stage-trace/2":
+                raise ValueError("verify chunk needs version-2 bound stage measurement")
+            expected.update(context_tokens=(workload or {}).get("context_tokens"), warmness=(workload or {}).get("warmness"))
         bound = True
         for key, value in expected.items():
             if value is None or trace.get(key) is None:
@@ -84,6 +100,8 @@ def stage_observation(node, layers, fallback_ms, *, now, start=None):
                     "uncertainty": [] if matches else [f"{node['id']}: stage trace reused for another block/range"]}
         if not -30 <= age <= ttl:
             warning.append(f"{node['id']}: expired stage trace")
+    if frame_tokens > 1 and require_fresh_chunk:
+        raise ValueError("verify chunk service cannot be derived from missing/unbound/expired measurement")
     warning.append(f"{node['id']}: scalar stage service estimate; no fresh matching stage trace")
     return {"service_ms": layers * fallback_ms, "queue_ms": 0, "shared_ms": 0,
             "shared_id": None, "prefill_ms": None, "source": "scalar_estimate", "uncertainty": warning}
@@ -122,7 +140,7 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
     w = workload_spec(workload)
     stages, start = [], 0
     for n in order:
-        stages.append(stage_observation(nodes[n], alloc[n], layer_ms[n], now=now, start=start))
+        stages.append(stage_observation(nodes[n], alloc[n], layer_ms[n], now=now, start=start, workload=w))
         start += alloc[n]
     warnings = [warning for stage in stages for warning in stage["uncertainty"]]
     if not isinstance(workload, dict) or workload.get("context_tokens") is None:
@@ -133,7 +151,7 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
             trace = nodes[n].get("stage_trace")
             if trace and trace.get("context_tokens") != context:
                 warnings.append(f"{nodes[n]['id']}: trace context differs/unknown; service extrapolation is unverified")
-    payload = number(model.get("decode_bytes", 0), "decode_bytes") * w["frame_tokens"]
+    payload = number(model.get("wire_bytes_per_token", model.get("decode_bytes", 0)), "decode_bytes") * w["frame_tokens"]
     hops, transfers, bandwidths = [], [], []
     for a, b in zip(order, order[1:]):
         hops.append(L[a][b])
@@ -158,33 +176,37 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
             prefill += pfbytes * 8 / (number(bw, "bandwidth_mbps", minimum=1e-9) * 1000)
     decode_needed = max(0, w["generated_tokens"] - 1)  # prefill emits the first committed token
     if objective == "serial":
-        elapsed = serial * decode_needed + prefill
+        valid = math.ceil(decode_needed / w["acceptance_gain"]) if w["frame_tokens"] > 1 else decode_needed
+        frames = valid
+        refill = 0
+        if w["frame_tokens"] > 1:
+            frames += math.ceil(valid * w["stale_frames_per_valid"])
+            frames += math.ceil(valid * w["cancel_rate"] * w["replay_frames_per_cancel"])
+            refill = valid * w["cancel_rate"] * w["refill_ms"]
+            warnings.append("chunk forecast prices full stale/replay frame work; early-abort savings not assumed")
+        elapsed = serial * frames + refill + prefill
         first = serial
     elif objective == "pipeline":
-        rounds = math.ceil(decode_needed / w["acceptance_gain"])
-        # Full acceptance can continue without a cancellation drain. Otherwise
-        # explicitly model complete bounded-window drain plus observed replay.
-        if w["acceptance_gain"] == w["block_tokens"] and not w["cancel_rate"]:
-            total = max(1, math.ceil(decode_needed / w["frame_tokens"]))
-            sample = min(total, max(64, w["depth"] * 4))
-            replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], sample)
+        if w["frame_tokens"] > 1:
+            valid_frames = math.ceil(decode_needed / w["acceptance_gain"])
+            stale = math.ceil(valid_frames * w["stale_frames_per_valid"])
+            replay = math.ceil(valid_frames * w["cancel_rate"] * w["replay_frames_per_cancel"])
+            frames = max(1, valid_frames + stale + replay)
+            sampled = min(frames, max(64, w["depth"] * 4))
+            replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], sampled)
             elapsed = replies[-1]
-            if total > sample:
-                period = min(w["depth"], sample - 1)
-                cycle = (replies[-1] - replies[-1 - period]) / period
-                elapsed += (total - sample) * cycle
-                warnings.append("steady-state tail extrapolated from bounded resource-calendar simulation")
+            if frames > sampled:
+                period = min(w["depth"], sampled - 1)
+                elapsed += (frames - sampled) * (replies[-1] - replies[-1-period]) / period
+            # Observed cancellation drains/refills are additional synchronization
+            # barriers. Full suffix work is conservative when early-abort skips it.
+            elapsed += valid_frames * w["cancel_rate"] * w["refill_ms"]
+            first = replies[0] if decode_needed else 0
+            elapsed = (elapsed if decode_needed else 0) + prefill
+            warnings.append("chunk forecast prices full stale/replay frame work; early-abort savings not assumed")
         else:
-            replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], w["block_tokens"])
-            cancel = 1.0 if w["cancel_rate"] is None else w["cancel_rate"]
-            replay = cancel * w["replay_frames_per_cancel"] * serial
-            elapsed = rounds * (replies[-1] + replay + w["refill_ms"])
-            if w["cancel_rate"] is None:
-                warnings.append("acceptance distribution absent; conservative drain-per-round estimate")
-        first = replies[0] if decode_needed else 0.0
-        if not decode_needed:
-            elapsed = 0.0
-        elapsed += prefill
+            elapsed, first, token_warnings = _token_pipeline(stages, hops, transfers, entry, back, w, decode_needed, serial, prefill)
+            warnings.extend(token_warnings)
     else:
         raise ValueError("objective must be serial or pipeline")
     constraints = [{"kind": "stage", "node_id": nodes[n]["id"], "service_ms": stages[i]["service_ms"]}
@@ -203,7 +225,36 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
     return {"prediction_only": True, "objective": objective, "predicted_request_ms": elapsed,
             "predicted_serial_step_ms": serial, "predicted_first_frame_ms": first,
             "predicted_committed_tok_s": 1000 * w["generated_tokens"] / elapsed if elapsed else None,
-            "finite_depth": w["depth"], "acceptance_gain": w["acceptance_gain"],
+            "finite_depth": w["depth"], "acceptance_gain": w["acceptance_gain"], "frame_tokens": w["frame_tokens"],
             "bottleneck": max(constraints, key=lambda row: row["service_ms"]),
             "stages": stages, "uncertainty": sorted(set(warnings)),
             "scope": "resource-calendar prediction; hardware acceptance requires a live verified run"}
+
+
+def _token_pipeline(stages, hops, transfers, entry, back, w, decode_needed, serial, prefill):
+    warnings = []
+    rounds = math.ceil(decode_needed / w["acceptance_gain"])
+    # Full acceptance can continue without a cancellation drain. Otherwise
+    # explicitly model complete bounded-window drain plus observed replay.
+    if w["acceptance_gain"] == w["block_tokens"] and not w["cancel_rate"]:
+        total = max(1, math.ceil(decode_needed / w["frame_tokens"]))
+        sample = min(total, max(64, w["depth"] * 4))
+        replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], sample)
+        elapsed = replies[-1]
+        if total > sample:
+            period = min(w["depth"], sample - 1)
+            cycle = (replies[-1] - replies[-1 - period]) / period
+            elapsed += (total - sample) * cycle
+            warnings.append("steady-state tail extrapolated from bounded resource-calendar simulation")
+    else:
+        replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], w["block_tokens"])
+        cancel = 1.0 if w["cancel_rate"] is None else w["cancel_rate"]
+        replay = cancel * w["replay_frames_per_cancel"] * serial
+        elapsed = rounds * (replies[-1] + replay + w["refill_ms"])
+        if w["cancel_rate"] is None:
+            warnings.append("acceptance distribution absent; conservative drain-per-round estimate")
+    first = replies[0] if decode_needed else 0.0
+    if not decode_needed:
+        elapsed = 0.0
+    elapsed += prefill
+    return elapsed, first, warnings

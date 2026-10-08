@@ -381,6 +381,11 @@ class ManagedRingBackend:
     """Existing inference backend plus node-local process lifecycle acknowledgements."""
     def __init__(self, backend, nodes):
         self.backend, self.nodes = backend, tuple(nodes)
+        self._telemetry_lock = threading.Lock()
+        self._telemetry = {}
+        self._telemetry_at = 0.0
+        self._telemetry_loading = False
+        self._telemetry_closed = False
 
     def __getattr__(self, name):
         return getattr(self.backend, name)
@@ -402,6 +407,7 @@ class ManagedRingBackend:
                 raise errors[0]
 
     def close(self):
+        self._telemetry_closed = True
         self.backend.close()
         errors = []
         for client, lease, _ in self.nodes:
@@ -413,6 +419,36 @@ class ManagedRingBackend:
                 errors.append(exc)
         if errors:
             raise errors[0]
+
+    def stats(self):
+        """Metrics reads never wait for node RPC; stale observations retain timestamps."""
+        now = time.monotonic()
+        with self._telemetry_lock:
+            if not self._telemetry_closed and not self._telemetry_loading and now - self._telemetry_at >= 5:
+                self._telemetry_loading = True
+                threading.Thread(target=self._refresh_telemetry, daemon=True,
+                                 name="ring-stage-telemetry").start()
+            snapshot = dict(self._telemetry)
+        return {**self.backend.stats(), "node_telemetry": snapshot}
+
+    def _refresh_telemetry(self):
+        from concurrent.futures import ThreadPoolExecutor
+        def read(record):
+            client, lease, _ = record
+            try:
+                status = client.operation("stage_status", lease)
+                return client.node_id, {"available": status.get("telemetry") is not None,
+                                        "sample": status.get("telemetry"), "observed_at": time.time()}
+            except Exception:
+                return client.node_id, {"available": False, "observed_at": time.time()}
+        try:
+            with ThreadPoolExecutor(max_workers=min(16, len(self.nodes))) as workers:
+                observed = dict(workers.map(read, self.nodes))
+            with self._telemetry_lock:
+                self._telemetry, self._telemetry_at = observed, time.monotonic()
+        finally:
+            with self._telemetry_lock:
+                self._telemetry_loading = False
 
 
 
@@ -441,7 +477,7 @@ class FormationController:
             self.tick(asynchronous=True)
 
     def form(self, ring_id, cohort, profile, *, rtt=None, measurements=None, locality=None,
-             objective="serial", workload=None, ttl_s=120, warmup_timeout_s=60):
+             objective="serial", workload=None, ttl_s=120, warmup_timeout_s=60, coordinator_id=None, route_ids=None):
         from .plan import plan_ring
         from .leases import LeaseRequest, LeaseResources
         from .resources import PlacementRequirements
@@ -481,7 +517,8 @@ class FormationController:
             diagnostics = {}
             plan = plan_ring(nodes, rtt, profile, locality=locality or {"mode": "prefer_local"},
                              objective=objective, workload=workload, measurements=measurements, now=self.clock(),
-                             diagnostics=diagnostics)
+                             diagnostics=diagnostics, **({"coordinator_id": coordinator_id} if coordinator_id is not None else {}),
+                             **({"route_ids": route_ids} if route_ids is not None else {}))
             if plan is None:
                 raise ControlError(diagnostics.get("reason", "no compatible ring found in the examined candidates"))
             plan["ring_id"] = ring_id

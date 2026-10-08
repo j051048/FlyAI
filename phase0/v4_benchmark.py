@@ -399,7 +399,8 @@ class LiveRingAdapter:
     backend = "live_ring"
 
     def __init__(self, protocol: dict, directory: Path, head: str, tail: str,
-                 *, swarm_id="v4-benchmark", timeout=600.0, retry_s=300.0):
+                 *, swarm_id="v4-benchmark", timeout=600.0, retry_s=300.0,
+                 deployment_plan=None, coordinator_key=None):
         require_protocol(protocol)
         self.artifact_verification = verify_checkpoint(directory, protocol["checkpoint"])
         source = source_identity()
@@ -421,8 +422,27 @@ class LiveRingAdapter:
         self.vp = importlib.import_module("v4_pipe")
         self.timeout, self.swarm_id, self.layer_count = timeout, swarm_id, protocol["layer_count"]
         self.protocol = protocol
+        session_options = {}
+        if deployment_plan is not None:
+            from shard.pipeline_plan import load_plan, validate_plan
+            from shard.pipeline_session import SessionConfig
+            from shard.manifest import load_key
+            plan = load_plan(deployment_plan) if isinstance(deployment_plan, (str, Path)) else validate_plan(deployment_plan)
+            if (plan["n_layers"] != self.layer_count or plan["coordinator"]["head"] != head or plan["coordinator"]["tail"] != tail):
+                raise BenchmarkError("benchmark endpoints/layers differ from deployment plan")
+            expected = {(n["node_id"], n["gpu_uuid"], n["signer_pubkey"], n["layer_start"], n["layer_end"])
+                        for n in protocol["hardware"]}
+            actual = {(n["node_id"], n["gpu_uuid"], n["signer_pubkey"], n["lo"], n["hi"]) for n in plan["stages"]}
+            if actual != expected or plan.get("model_cohort", {}).get("config_sha256") != protocol["checkpoint"]["config_sha256"]:
+                raise BenchmarkError("benchmark hardware/config differs from deployment plan")
+            key_path = coordinator_key or os.environ.get("SHARD_COORDINATOR_KEY")
+            if not key_path:
+                raise BenchmarkError("strict benchmark requires a coordinator signing key")
+            session_options["session_config"] = SessionConfig.from_plan(plan, -1,
+                ttl_s=min(3600, max(30, timeout * 2)), caller_key=load_key(key_path))
+            self.swarm_id = plan["ring_id"]
         self.pipe, self.ret = self.vp.connect_ring(head, tail, timeout=timeout,
-                                                  token=self.vp.SWARM_TOKEN, retry_s=retry_s)
+                                                  token=self.vp.SWARM_TOKEN, retry_s=retry_s, **session_options)
 
     def generate(self, prompt_ids, max_new, *, mode, nonce, job_id, on_token):
         self._job_id = job_id
@@ -698,6 +718,8 @@ def main(argv=None) -> int:
     live.add_argument("--tail", default="127.0.0.1:29612")
     live.add_argument("--timeout", type=float, default=600.0)
     live.add_argument("--connect-retry", type=float, default=300.0)
+    live.add_argument("--deployment-plan", help="authenticated pipeline plan for a strict running ring")
+    live.add_argument("--coordinator-key", help="existing receipt-format signing key; never copied into reports")
     live.add_argument("--fresh-ring", action="store_true", help="operator asserts processes/models are freshly started")
     live.add_argument("--out", required=True)
     check = sub.add_parser("verify", help="reverify raw receipts, token parity, complete protocol and speed")
@@ -720,7 +742,8 @@ def main(argv=None) -> int:
         if args.command == "run":
             protocol = _read(args.protocol)
             adapter = LiveRingAdapter(protocol, Path(args.dir), args.head, args.tail,
-                                      timeout=args.timeout, retry_s=args.connect_retry)
+                                      timeout=args.timeout, retry_s=args.connect_retry,
+                                      deployment_plan=args.deployment_plan, coordinator_key=args.coordinator_key)
             try:
                 report = run_suite(adapter, protocol, fresh_ring=args.fresh_ring,
                                    on_sample=lambda partial: _write(args.out, partial))

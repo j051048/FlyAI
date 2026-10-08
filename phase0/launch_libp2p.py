@@ -19,7 +19,7 @@ coordinator-return by content (hello_return), both arriving on the tail engine's
 Teardown is manual (vastai destroy)."""
 import argparse, re, secrets, shlex, sys, time
 
-from launch_oss import ep, fire, instances, rssh, warm_stage, M120, PORT, PSK
+from launch_oss import ep, fire, instances, rssh, warm_stage, M120, PORT, PSK, managed_command, remote_config, process_command
 
 LIBP2P = 29600          # sidecar libp2p listen (== the vast-mapped public port)
 ENG_IN = 29610          # engine listen / sidecar inbound target
@@ -63,9 +63,9 @@ def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, nonc
     sd = f"-seed {shlex.quote(seed)}" if seed else ""
     bs = " ".join(f"-dht-bootstrap {shlex.quote(b)}" for b in (dht_bootstrap or []))
     nn = f"echo {nonce} > /root/sidecar.nonce; " if nonce else ""
-    inner = (f"/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
-             f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} > /root/sidecar.log 2>&1")
-    return (f"fuser -k {LIBP2P}/tcp 2>/dev/null; sleep 1; rm -f /root/sidecar.log; {nn}"
+    inner = (f"cd /root/FlyAI && python3 -m shard.managed_launch --state-dir .shard-processes --name oss-sidecar start -- /tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
+             f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs}")
+    return (f"{nn}"
             f"setsid bash -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &")
 
 
@@ -86,7 +86,7 @@ def launch_sidecar(inst, announce, inbound, forwards, seed=None, dht_bootstrap=N
                 # nonce-gated (M4): only THIS launch's log can satisfy the check — a stale
                 # sidecar.log from a previous run (flaked ssh never ran the rm) reads as 0.
                 r = rssh(inst, f"[ \"$(cat /root/sidecar.nonce 2>/dev/null)\" = \"{nonce}\" ] && "
-                               f"grep -cE 'tunnel up|listening' /root/sidecar.log 2>/dev/null || echo 0", 20)
+                               f"grep -cE 'tunnel up|listening' /root/FlyAI/.shard-processes/oss-sidecar.log 2>/dev/null || echo 0", 20)
                 if r.returncode == 0:
                     last = r.stdout.strip().splitlines()[-1].strip() if r.stdout.strip() else "0"
                     if last not in ("", "0"):
@@ -99,17 +99,15 @@ def launch_sidecar(inst, announce, inbound, forwards, seed=None, dht_bootstrap=N
 
 
 def launch_engine(inst, stage, nstages, served_head, max_ctx, timeout, sync_send, model, receipts=False, lo=-1, hi=-1):
-    head = " --served-head" if served_head else ""
-    nxt = f" --next 127.0.0.1:{FWD_RING}" if stage < nstages - 1 else ""
-    lohi = f" --lo {lo} --hi {hi}" if lo >= 0 else ""        # explicit (uneven, VRAM-aware) split; else even
-    env = (f"SHARD_TRANSPORT=libp2p" + (" SHARD_SYNC_SEND=1" if sync_send else "")
-           + (" SHARD_RECEIPTS=1" if receipts else ""))
-    cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
-           f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 6; rm -f /root/stage.log /root/.shard_next_*; cd /root && "
-           f"{env} setsid bash -c 'python3 specpipe.py --stage {stage} --nstages {nstages} --model {model} "
-           f"--listen-port {ENG_IN}{nxt}{head} --fast --direct-return --max-ctx {max_ctx}{lohi} "
-           f"--timeout {timeout} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
-    fire(inst, cmd)
+    argv = ["python3", "phase0/specpipe.py", "--legacy-protocol", "--stage", str(stage), "--nstages", str(nstages),
+            "--model", model, "--listen-port", str(ENG_IN), "--fast", "--direct-return", "--max-ctx", str(max_ctx), "--timeout", str(timeout)]
+    if served_head: argv.append("--served-head")
+    if stage < nstages - 1: argv += ["--next", f"127.0.0.1:{FWD_RING}"]
+    if lo >= 0: argv += ["--lo", str(lo), "--hi", str(hi)]
+    env = {"SHARD_TRANSPORT": "libp2p"}
+    if sync_send: env["SHARD_SYNC_SEND"] = "1"
+    if receipts: env["SHARD_RECEIPTS"] = "1"
+    fire(inst, managed_command(f"specpipe.stage{stage}", argv, env))
 
 
 def main():
@@ -138,16 +136,9 @@ def main():
     sids = [int(x) for x in a.stages.split(",")]
     insts = instances(); stages = [insts[i] for i in sids]; nstages = len(stages)
     head, tail = stages[0], stages[-1]
-    # per-stage [lo, hi): explicit (uneven, VRAM-aware) or even (specpipe derives it from -1)
-    if a.layers:
-        counts = [int(x) for x in a.layers.split(",")]
-        assert len(counts) == nstages, "layers count must match nstages"
-        b = [0]
-        for c in counts:
-            b.append(b[-1] + c)
-        lohis = [(b[k], b[k + 1]) for k in range(nstages)]
-    else:
-        lohis = [(-1, -1)] * nstages
+    from shard.pipeline_plan import parse_split, model_layers
+    config = remote_config(stages[0], a.model)
+    lohis = parse_split(a.layers, model_layers(config), nstages)
 
     if not a.no_launch:
         print("[libp2p] collecting PeerIds ...", flush=True)
@@ -182,7 +173,7 @@ def main():
             print(f"  {'OK' if ok else 'FAIL'} stage{k}", flush=True)
             if not ok:
                 print("[abort] engine failed to warm; sidecar.log + stage.log:", flush=True)
-                print(rssh(stages[k], "tail -5 /root/sidecar.log; echo ---; tail -8 /root/stage.log", 30).stdout, flush=True)
+                print(rssh(stages[k], "tail -5 /root/FlyAI/.shard-processes/oss-sidecar.log; echo ---; tail -8 /root/stage.log", 30).stdout, flush=True)
                 sys.exit(1)
 
     # coordinator on the head: --next = head engine (local), --tail = head sidecar ret-forward
@@ -191,12 +182,18 @@ def main():
     renv = " SHARD_RECEIPTS=1" if a.receipts else ""
     smpl = f" --temp {a.temp} --top-p {a.top_p} --top-k {a.top_k} --seed {a.seed}" if a.temp > 0 else ""
     # M4: pipefail — without it the pipeline's rc is the trailing grep's and a crashed coord exits 0
-    cmd = (f"set -o pipefail; cd /root && SHARD_TRANSPORT=libp2p{sync}{renv} python3 specpipe.py --coordinator --nstages {nstages} "
-           f"--model {a.model} --ngram-draft --ngram-n {a.ngram_n} --pipe --depth {a.depth} --K {a.K} "
-           f"--next 127.0.0.1:{ENG_IN} --direct-return --tail 127.0.0.1:{FWD_RET} --prompt-file {a.prompt_file} "
-           f"--prefill-chunk {a.prefill_chunk} --max-ctx {a.max_ctx} --max-new {a.max_new}{smpl} "
-           f"--reasoning {a.reasoning} --timeout {a.edge_timeout} --dump /root/run.json 2>&1 | grep -viE 'INFO|WARNING|warn'")
-    r = rssh(head, cmd, timeout=a.edge_timeout + 600)
+    argv = ["python3", "phase0/specpipe.py", "--legacy-protocol", "--coordinator", "--nstages", str(nstages),
+            "--model", a.model, "--ngram-draft", "--ngram-n", str(a.ngram_n), "--pipe", "--depth", str(a.depth), "--K", str(a.K),
+            "--next", f"127.0.0.1:{ENG_IN}", "--direct-return",
+            "--tail", f"127.0.0.1:{FWD_RET}", "--prompt-file", a.prompt_file,
+            "--prefill-chunk", str(a.prefill_chunk), "--max-ctx", str(a.max_ctx), "--max-new", str(a.max_new),
+            "--reasoning", a.reasoning, "--timeout", str(a.edge_timeout), "--dump", "/root/run.json"]
+    env = {"SHARD_TRANSPORT":"libp2p"}
+    if a.receipts: env['SHARD_RECEIPTS']='1'
+    if a.sync_send: env['SHARD_SYNC_SEND']='1'
+    if hasattr(a,'temp') and a.temp>0: argv += ['--temp',str(a.temp),'--top-p',str(a.top_p),'--top-k',str(a.top_k),'--seed',str(a.seed)]
+    r = rssh(head, process_command(argv, env), timeout=a.edge_timeout + 600)
+    if r.returncode: raise SystemExit('coordinator failed')
     print(r.stdout[-3000:], flush=True)
     if r.stderr.strip():
         print("[stderr]", r.stderr[-800:], flush=True)

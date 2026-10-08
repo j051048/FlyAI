@@ -146,6 +146,37 @@ def sign_offer(body, key):
     return result
 
 
+def _offer_trace(offer, cohort_id, profile, *, now):
+    """Check a trace in its recorded shape before it can enter a planner pool.
+
+    Missing identity bindings allow registration, but never eligibility. The
+    caller cannot substitute a scalar speed for an unbound chunk observation.
+    """
+    from .locality import timestamp, number
+    from .planning_cost import stage_observation
+    trace = profile["stage_trace"]
+    if not isinstance(trace, dict):
+        raise ValueError("stage trace must be an object")
+    frame_tokens = trace.get("frame_tokens", 1)
+    if type(frame_tokens) is not int or not 1 <= frame_tokens <= 256:
+        raise ValueError("invalid trace frame_tokens")
+    workload = {"frame_tokens": frame_tokens}
+    if frame_tokens > 1:
+        context = trace.get("context_tokens")
+        if type(context) is not int or not 1 <= context <= 1_000_000:
+            raise ValueError("invalid trace context_tokens")
+        if trace.get("warmness") not in ("cold", "warm"):
+            raise ValueError("invalid trace warmness")
+        workload.update(context_tokens=context, warmness=trace["warmness"])
+    age = now - timestamp(trace["measured_at"])
+    ttl = number(trace["ttl_s"], "trace ttl_s", minimum=1e-9)
+    observed = stage_observation({"id": offer["node_id"], "gpu_uuid": offer["gpu_uuid"],
+        "cohort_id": cohort_id, "runtime_config_sha256": profile.get("runtime_config_sha256"),
+        "stage_trace": trace}, trace["layer_end"] - trace["layer_start"], profile.get("layer_ms") or 1,
+        now=now, start=trace["layer_start"], workload=workload, require_fresh_chunk=False)
+    return observed, -30 <= age <= ttl
+
+
 def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
     now = time.time() if now is None else now
     if not isinstance(body, dict) or body.get("schema") != SCHEMA or len(canonical(body)) > 256 * 1024:
@@ -222,12 +253,10 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
             # Validate at admission so one signed malformed observation cannot
             # make planning fail for every honest node in the same cohort.
             try:
-                from .planning_cost import stage_observation
                 trace = profile["stage_trace"]
-                stage_observation({"id": body["node_id"], "gpu_uuid": body["gpu_uuid"],
-                    "cohort_id": cohort.cohort_id, "runtime_config_sha256": profile.get("runtime_config_sha256"),
-                    "stage_trace": trace}, 1, profile.get("layer_ms") or 1,
-                    now=now, start=trace.get("layer_start"))
+                _, fresh = _offer_trace(body, cohort.cohort_id, profile, now=now)
+                if not fresh:
+                    raise ValueError("stage trace expired or is from the future")
                 if trace["layer_end"] > cohort.n_layers:
                     raise ValueError("trace lies outside the model")
             except (ValueError, TypeError, KeyError) as exc:
@@ -245,17 +274,32 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
                 cfg = record["runtime_config"]
                 if (req.model_id != cohort.model_id or req.provenance.checkpoint_id != cohort.checkpoint_id
                         or req.provenance.node_id != body["node_id"] or req.layer_end > cohort.n_layers
-                        or not isinstance(cfg, dict) or cfg.get("lo") != req.layer_start or cfg.get("hi") != req.layer_end
+                        or not isinstance(cfg, dict) or type(cfg.get("lo")) is not int or type(cfg.get("hi")) is not int
+                        or cfg.get("lo") != req.layer_start or cfg.get("hi") != req.layer_end
                         or type(cfg.get("head")) is not bool or type(cfg.get("tail")) is not bool
                         or cfg["head"] != (req.layer_start == 0) or cfg["tail"] != (req.layer_end == cohort.n_layers)
                         or hashlib.sha256(canonical(cfg)).hexdigest() != req.provenance.runtime_config_sha256):
                     raise ValueError("calibration identity or runtime differs from offer")
+                if not isinstance(cfg.get("environment", {}), dict) or any(not isinstance(k, str) for k in cfg.get("environment", {})):
+                    raise ValueError("runtime environment must be a string-keyed mapping")
                 if any(k.startswith("SHARD_") for k in cfg.get("environment", {})):
                     raise ValueError("private provisioning cannot appear in a public calibration")
                 bounds = req.layer_start, req.layer_end
-                if bounds in seen_ranges:
+                if type(cfg.get("n_layers", cohort.n_layers)) is not int or cfg.get("n_layers", cohort.n_layers) != cohort.n_layers:
+                    raise ValueError("calibration model depth differs from cohort")
+                for key in ("stage", "index", "nstages"):
+                    if key in cfg and (type(cfg[key]) is not int or cfg[key] < (1 if key == "nstages" else 0)):
+                        raise ValueError("calibration stage geometry must be integer")
+                index = cfg.get("stage", cfg.get("index"))
+                if "stage" in cfg and "index" in cfg and cfg["stage"] != cfg["index"]:
+                    raise ValueError("calibration stage/index differs")
+                if index is not None and "nstages" in cfg and (index >= cfg["nstages"] or
+                        cfg["head"] != (index == 0) or cfg["tail"] != (index == cfg["nstages"] - 1)):
+                    raise ValueError("calibration roles differ from stage geometry")
+                identity = (*bounds, req.provenance.runtime_config_sha256)
+                if identity in seen_ranges:
                     raise ValueError("duplicate stage calibration")
-                seen_ranges.add(bounds)
+                seen_ranges.add(identity)
             except (ValueError, TypeError, KeyError) as exc:
                 raise OfferError("invalid stage calibration") from exc
     try:
@@ -336,18 +380,42 @@ class OfferRegistry:
                 # A fresh signed announcement is not a calibration of an absent speed.
                 if profile.get("layer_ms") is None and profile.get("stage_trace") is None:
                     continue
-                if profile.get("layer_ms") is None:
-                    from .planning_cost import stage_observation
-                    trace = profile["stage_trace"]
-                    observed = stage_observation({"id": offer["node_id"], "gpu_uuid": offer["gpu_uuid"],
-                        "cohort_id": cohort_id, "runtime_config_sha256": profile.get("runtime_config_sha256"),
-                        "stage_trace": trace}, trace["layer_end"] - trace["layer_start"], 1,
-                        now=now, start=trace["layer_start"])
-                    if observed["source"] != "fresh_stage_trace":
+                if profile.get("stage_trace") is not None:
+                    try:
+                        observed, fresh = _offer_trace(offer, cohort_id, profile, now=now)
+                    except (ValueError, TypeError, KeyError):
+                        # An old persisted record cannot poison all honest offers.
+                        continue
+                    if not fresh or observed["source"] != "fresh_stage_trace":
                         continue
                 def mib(name):
                     value = resources[name]
                     return None if value is None else value / (1024 * 1024)
+                templates = {}
+                if "calibrations" in model:
+                    from .resources import PlacementRequirements, NodeResources, evaluate_fit
+                    from .locality import timestamp
+                    allowed = []
+                    capacity = NodeResources(**{key: resources[key] for key in (
+                        "available_vram_bytes", "available_ram_bytes", "pinnable_ram_bytes", "available_disk_bytes")})
+                    for record in model["calibrations"]:
+                        req = PlacementRequirements.from_dict(record["requirements"])
+                        age = now - timestamp(req.provenance.measured_at)
+                        if not -30 <= age <= self.max_ttl_s or not evaluate_fit(req, capacity)["fits"]:
+                            continue
+                        config = record["runtime_config"]
+                        span = {"lo": req.layer_start, "hi": req.layer_end,
+                            "head": config["head"], "tail": config["tail"],
+                            "runtime_config_sha256": req.provenance.runtime_config_sha256,
+                            "gpu_bytes": req.gpu.peak_bytes, "host_bytes": req.host.peak_bytes,
+                            "pinned_bytes": req.host.pinned_bytes}
+                        if "stage" in config or "index" in config:
+                            span["stage_index"] = config.get("stage", config.get("index"))
+                        if "nstages" in config:
+                            span["nstages"] = config["nstages"]
+                        allowed.append(span)
+                    templates = {"allowed_spans": allowed, "resource_capacity": {
+                        key: resources[key] for key in ("available_vram_bytes", "available_ram_bytes", "pinnable_ram_bytes")}}
                 nodes.append({**profile, "id": offer["node_id"], "cohort_id": cohort_id, "peer_id": offer["peer_id"],
                               "gpu_uuid": offer["gpu_uuid"], "memory_domain_id": offer["memory_domain_id"],
                               "host_id": offer.get("host_id"), "public_ip": offer.get("public_ip"),
@@ -355,7 +423,7 @@ class OfferRegistry:
                               "free_vram_mb": mib("available_vram_bytes"), "free_ram_mb": mib("available_ram_bytes"),
                               "pinnable_ram_mb": mib("pinnable_ram_bytes"),
                               "offer_sequence": offer["sequence"], "offer_expires_at": offer["issued_at"] + offer["ttl_s"],
-                              "measurement_source": "signed_operator_report", "hardware_attested": False})
+                              "measurement_source": "signed_operator_report", "hardware_attested": False, **templates})
         return nodes
 
     def get(self, node_id):
