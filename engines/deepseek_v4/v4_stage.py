@@ -124,6 +124,9 @@ V4_PROFILE_GPU_EVERY = int(os.environ.get("V4_PROFILE_GPU_EVERY", "16"))
 V4_EXPERT_PREFETCH = os.environ.get("V4_EXPERT_PREFETCH", "0") not in ("", "0")
 V4_EXPERT_PREFETCH_SLOTS = int(os.environ.get("V4_EXPERT_PREFETCH_SLOTS", "2"))
 V4_EXPERT_PREFETCH_WARMUP = int(os.environ.get("V4_EXPERT_PREFETCH_WARMUP", "2"))
+V4_PREFILL_EXPERT_PIPELINE = os.environ.get("V4_PREFILL_EXPERT_PIPELINE", "0") not in ("", "0")
+V4_PREFILL_EXPERT_DEPTH = int(os.environ.get("V4_PREFILL_EXPERT_DEPTH", "2"))
+V4_PREFILL_EXPERT_BATCH = int(os.environ.get("V4_PREFILL_EXPERT_BATCH", "0"))
 V4_EXPERT_PLACEMENT = os.environ.get("V4_EXPERT_PLACEMENT", "gpu")
 V4_EXPERT_CACHE_SLOTS = int(os.environ.get("V4_EXPERT_CACHE_SLOTS", "0"))
 V4_EXPERT_CACHE_MIB = int(os.environ.get("V4_EXPERT_CACHE_MIB", "0"))
@@ -793,7 +796,8 @@ class Stage:
                  expert_cache_reserve_bytes=None, expert_cache_reference=False,
                  runtime_profile=None, expert_prefetch=None, kv_placement=None,
                  kv_gpu_budget_bytes=None, kv_host_budget_bytes=None,
-                 kv_reference=False, prefill_query_chunk=None):
+                 kv_reference=False, prefill_query_chunk=None,
+                 prefill_expert_pipeline=None, prefill_expert_depth=None, prefill_expert_batch=None):
         for name, value in (("runtime_profile", runtime_profile), ("expert_prefetch", expert_prefetch)):
             if value is not None and type(value) is not bool:
                 raise ValueError(f"{name} must be a boolean or None")
@@ -840,6 +844,13 @@ class Stage:
         self._expert_placement = V4_EXPERT_PLACEMENT if expert_placement is None else expert_placement
         if self._expert_placement not in ("gpu", "ram"):
             raise ValueError("expert_placement must be 'gpu' or 'ram'")
+        from v4_prefill_expert_pipeline import validate_options
+        self._prefill_pipeline_options = validate_options(
+            enabled=V4_PREFILL_EXPERT_PIPELINE if prefill_expert_pipeline is None else prefill_expert_pipeline,
+            depth=V4_PREFILL_EXPERT_DEPTH if prefill_expert_depth is None else prefill_expert_depth,
+            batch_size=V4_PREFILL_EXPERT_BATCH if prefill_expert_batch is None else prefill_expert_batch)
+        if self._prefill_pipeline_options["enabled"] and self._expert_placement != "ram":
+            raise ValueError("prefill expert pipeline requires RAM expert placement")
         self._expert_cache_reference = bool(expert_cache_reference)
         if self._expert_cache_reference and (self._expert_placement != "ram" or str(self.device) != "cpu"):
             raise ValueError("expert cache reference emulation requires RAM placement on CPU")
@@ -1306,7 +1317,21 @@ class Stage:
             runtime.profiler = self._runtime_profile
             runtime.configure_prefetch(enabled=self._expert_prefetch,
                 max_slots=V4_EXPERT_PREFETCH_SLOTS, warmup_steps=V4_EXPERT_PREFETCH_WARMUP)
+            runtime.configure_prefill_pipeline(**self._prefill_pipeline_options)
         self._hybrid_cache_ready = True
+
+    def prefill_pipeline_config(self):
+        """Stable configuration only; job observations do not alter calibration identity."""
+        return {"schema": "v4-prefill-expert-pipeline/1", **self._prefill_pipeline_options,
+                "placement": self._expert_placement,
+                "scope": "known local routed-expert copies; original token and Expert row shapes"}
+
+    def prefill_pipeline_status(self):
+        """Actual per-pool bounded copy/consumer observations, never a speed claim."""
+        return {"config": self.prefill_pipeline_config(),
+                "pools": {f"{block.ffn._hybrid_runtime.role}:{block.layer_id}":
+                    block.ffn._hybrid_runtime.prefill_pipeline_status()
+                    for block in self._hybrid_blocks}}
 
     def placement_requirements(self, calibration=None):
         """An explicit measured resource contract, never a guess from checkpoint bytes."""

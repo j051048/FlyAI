@@ -36,14 +36,19 @@ def serve_open_config(config_path, *, auth_file, bind="127.0.0.1", port=8000,
             manifest["coordinator"]["tail"], assignments,
             mode=row.get("mode", "pipelined"), swarm_id=manifest["ring_id"],
             max_context=row.get("max_context", 8192), timeout=row.get("io_timeout_s", 60),
-            pipeline_plan=manifest, coordinator_key=service.key)
+            pipeline_plan=manifest, coordinator_key=service.key,
+            speculation_policy=row.get("speculation_policy"),
+            conversation_cache=row.get("conversation_cache"),
+            calibrated_runtime_configs=row.get("verified_runtime_configs"),
+            lease_fences=row.get("verified_lease_fences"))
 
     service = OpenNetworkService(config_path, factory)
     gateway = server = None
     try:
         service.form_all()
         gateway = Gateway(auth=AuthRegistry.from_file(auth_file), ring_pool=service.pool,
-                          default_model=service.config.get("default_model"))
+                          default_model=service.config.get("default_model"),
+                          session_affinity=service.config.get("session_affinity", False))
         if bind not in {"127.0.0.1", "localhost", "::1"} and not (tls_cert and tls_key):
             raise ControlError("public inference listener requires TLS")
         server = gateway.server(bind, port)

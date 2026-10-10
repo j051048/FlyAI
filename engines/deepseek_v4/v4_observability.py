@@ -51,7 +51,7 @@ def source_inventory():
     files = list(engine.glob("v4_*.py"))
     vendor = root / "vendor" / "deepseek_v4_ref"
     files += list(vendor.rglob("*.py")) if vendor.is_dir() else []
-    for name in ("receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport"):
+    for name in ("receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport", "speculation_policy"):
         path = root / "shard" / (name + ".py")
         if path.is_file():
             files.append(path)
@@ -95,6 +95,9 @@ def runtime_observation(stage, *, session_config=None, phase="loaded"):
         "wire_mode": "fp8" if env.get("V4_FP8_WIRE", "0") not in ("", "0") else "bf16",
         "transport": "engine-message-socket; external route declared by deployment",
         "backend_identity": {"hadamard": hadamard_identity()},
+        "optimizations": {
+            "prefill_expert_pipeline": stage.prefill_pipeline_status() if hasattr(stage, "prefill_pipeline_status") else {"enabled": False},
+            "conversation_cache": stage._conversation_cache.status() if hasattr(stage, "_conversation_cache") else {"enabled": False}},
         "versions": {"python": platform.python_version(), "torch": str(getattr(torch_module, "__version__", "unknown")),
             "cuda": getattr(getattr(torch_module, "version", None), "cuda", None),
             "tilelang": getattr(tilelang_module, "__version__", None)}, "phase": phase}

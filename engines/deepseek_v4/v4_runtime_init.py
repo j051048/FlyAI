@@ -192,7 +192,7 @@ def prepare_cpu_selftest():
               "V4_MOE_GROUPED": "0", "V4_MOE_IN_GRAPH": "0", "V4_FP8_GEMV": "0",
               "V4_FP8_SHARED": "0", "V4_DSPARK_GRAPH": "0", "V4_DSPARK_MOE": "0",
               "V4_WIRE_FUSED": "0", "V4_EXPERT_PLACEMENT": "gpu", "V4_KV_PLACEMENT": "gpu",
-              "V4_LEVERS_STRICT": "0"}
+              "V4_PREFILL_EXPERT_PIPELINE": "0", "V4_LEVERS_STRICT": "0"}
     os.environ.update(recipe)
     if cpu is not None:
         cpu.V4_KERNELS = "cpu"

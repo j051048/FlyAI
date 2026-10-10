@@ -37,6 +37,23 @@ except ImportError:                                           # flat import (dep
 SCHEMA = "shard-receipt/1"
 
 
+def validate_conversation_restore(value):
+    """Signed state-restore declaration, never a count of replayed forwards."""
+    fields = {"schema", "transaction_id", "prefix", "identity_sha256", "entry_id", "state_digest", "scope"}
+    if not isinstance(value, dict) or set(value) != fields or value["schema"] != "v4-conversation-restore/1":
+        raise ValueError("unknown conversation restore schema/fields")
+    prefix = value["prefix"]
+    if not isinstance(prefix, dict) or set(prefix) != {"token_count", "digest"} or type(prefix["token_count"]) is not int or prefix["token_count"] < 1:
+        raise ValueError("invalid opaque conversation prefix")
+    for digest in (prefix["digest"], value["identity_sha256"], value["state_digest"]):
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("invalid conversation content digest")
+    for field in ("transaction_id", "entry_id", "scope"):
+        if not isinstance(value[field], str) or not 1 <= len(value[field]) <= 256:
+            raise ValueError("invalid conversation restore metadata")
+    return json.loads(json.dumps(value, sort_keys=True, allow_nan=False))
+
+
 class ReceiptError(Exception):
     """A receipt failed to verify — bad signature, wrong signer, or malformed. Always raised
     (never a silent False) so a caller attributing pay fails closed."""
@@ -89,7 +106,8 @@ class ReceiptSigner:
         self._out.update(_h(out_bytes))
         self.n += 1
 
-    def finalize(self, runtime_metrics: dict | None = None, runtime_observation: dict | None = None) -> dict:
+    def finalize(self, runtime_metrics: dict | None = None, runtime_observation: dict | None = None,
+                 conversation_restore: dict | None = None) -> dict:
         """Stamp pubkey + signature into a signed receipt dict and return it."""
         body = dict(self.meta, schema=SCHEMA, n_chunks=self.n,
                     in_root=self._in.hexdigest(), out_root=self._out.hexdigest(),
@@ -100,6 +118,8 @@ class ReceiptSigner:
         if runtime_observation is not None:
             from shard.runtime_observation import validate_runtime_observation
             body["runtime_observation"] = validate_runtime_observation(runtime_observation)
+        if conversation_restore is not None:
+            body["conversation_restore"] = validate_conversation_restore(conversation_restore)
         body["sig"] = base64.b64encode(self.priv.sign(_canonical(body))).decode()
         return body
 
@@ -120,6 +140,11 @@ def verify_receipt(receipt: dict, expected_pubkey: str | None = None) -> None:
             validate_runtime_observation(receipt["runtime_observation"])
         except (ValueError, TypeError, OverflowError) as e:
             raise ReceiptError(f"invalid runtime observation: {e}") from e
+    if "conversation_restore" in receipt:
+        try:
+            validate_conversation_restore(receipt["conversation_restore"])
+        except (ValueError, TypeError) as error:
+            raise ReceiptError("invalid conversation restore evidence") from error
     pub_b64 = receipt.get("pubkey")
     sig_b64 = receipt.get("sig")
     if not pub_b64 or not sig_b64:

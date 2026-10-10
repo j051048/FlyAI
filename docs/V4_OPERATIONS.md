@@ -1,11 +1,12 @@
 # V4 运行自检、strict 部署与性能复测
 
-2026-10-08，基于 `a6e96e3` 后的本地改造。适用原生 43 层 V4-Flash，
+2026-10-09，按当前工作区运行时与服务接线。适用原生 43 层 V4-Flash，
 不是 V4.1 的兼容声明，也不代表新的 5090 集群成绩。
 
-本轮统一的相关非 GPU 回归为 **1620 passed、3 skipped、41 GPU-marked deselected**，
-耗时 435.10 秒；不是全仓 CI。两个完整 CPU 自检与真实本地 socket/HTTP/签名回归均在
-这组结果内。GPU Hadamard、图重捕获/state 对照和实际集群 SLO 仍待执行。
+CPU 数值、真实本地 socket/HTTP/签名回归各有独立范围；不是全仓 CI 或 GPU 吞吐证明。
+GPU Hadamard、图重捕获/state 对照、状态缓存与专家 DMA 流水仍需要实际设备验收。
+本轮请求边界优化的配置和证据范围见
+[V4_STATEFUL_OPTIMIZATIONS](V4_STATEFUL_OPTIMIZATIONS.md)。
 
 ## 1. 统一运行时初始化
 
@@ -115,6 +116,12 @@ health 汇总各阶段的 owned PID、监听、连接事件和本地首条异常
 宣称原进程身份。尚未导入的 lazy 模块明确为 UNJUDGED，不把缺省猜成已生效。
 未知环境项的值不进入公开观察。
 
+签名观察的 `optimizations` 分开记录本机前缀快照和实际专家流水状态。
+请求级 `optimizations.speculation_policy` 记录有限配方的选择/反馈；这些观察不改变签名
+声明与算术证明的边界。前缀缓存命中时，新的收据只计本次 fresh suffix 的 forward，
+另签署 `conversation_restore` 声明；响应的 `proof.scope` 为
+`fresh_suffix_with_signed_prefix_restore`，不能当作重新执行完整前缀的证据。
+
 Hadamard 身份另保留实际函数、依赖版本及模块文件摘要，防止只换扩展二进制却声称
 同一后端。部署升级应使用新的 checkout/release 路径，排空旧请求后启动新进程；
 不在正在服务的 checkout 上原地替换源码并继续使用旧校准。
@@ -147,6 +154,8 @@ python phase0/v4_benchmark.py compare before.json after.json --vary env:V4_REFIL
 
 实际模型、tokenizer、prompt IDs、输出长度、GPU/driver、层分配及路线必须冻结。
 源码实验仍先过数值对照；多个因素同时变化的结果不能登记为单变量收益。
+缓存实验另分 exact repeat、冷 prompt 和扩展 prompt；`extended_shadow` 每请求仍执行完整
+原始 prefill，其候选 suffix、快照及参考成本均须计入，不能登记为普通多轮增量加速。
 网络声明由 `prepare --network network.json` 冻结，包含 transport、实际路线身份摘要、
 测量方法和延迟语义；没有原历史 prompt IDs 的 Rust 同类题只能作为新基线。
 
@@ -166,3 +175,23 @@ python phase0/v4_link_probe.py run --endpoint 127.0.0.1:30790 --route-id caller-
 输出全部原始样本、精确收发字节、connect、P50/P95 和有效往返字节速率。
 每次 echo 都核对新的 challenge 与完整 payload。该时间包含 SSH/OS/echo 处理，
 不是光纤 RTT 的独立测量，也不计入模型推理验收。
+
+## 7. 三项默认关闭的状态优化
+
+完整配置和配额说明见 [V4_STATEFUL_OPTIMIZATIONS](V4_STATEFUL_OPTIMIZATIONS.md)。
+服务入口仍是 `v4_network_service.py --config/--auth-file`，没有新增一个隐式调优 CLI：
+
+| 配置 | 放置位置 | 操作边界 |
+|---|---|---|
+| `speculation_policy.enabled` | `network.json` 的 `formations[i]` | 只在请求开始选择本地批准的 greedy/pipelined 配方，要求每个已选节点的真实校准和租约 |
+| `conversation_cache.enabled` | 同一 formation；节点另设 `V4_CONVERSATION_CACHE_MIB` 等配额 | 全环排空后 prepare/commit；exact repeat 快路径，`extended_shadow` 每请求保留完整参考 prefill |
+| `V4_PREFILL_EXPERT_PIPELINE=1` | RAM 专家 stage 环境及校准 | 本层 Gate 后的有限专家 DMA FIFO；depth/batch 总槽位受已有缓存容量限制 |
+
+缺省仍沿用原路径。cache TTL、entry/host/GPU restore 配额必须计入共享主机预算；
+策略/缓存状态按认证 tenant、cohort/source/config、环 generation/owner 和 lease fences 隔离。
+新加入节点或升级不复用旧状态，换环仍在请求边界执行。配置字段不由公开 HTTP 请求提供。
+
+专家 FIFO 不重新分块 token/attention/Compressor，不改变 Expert 行形状或升序累加。
+它复用 canonical pinned banks 与固定 slot，靠复制/消费者 CUDA 事件保护源和槽位；
+不能把 requested 开关、CPU emulation 或条件跳过的测试写成真实 DMA/计算重叠证据。
+真实 Vast 的速度与持续服务验收仍按原协议另做；这里没有新的吞吐改善数字。

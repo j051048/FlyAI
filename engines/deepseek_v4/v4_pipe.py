@@ -540,7 +540,7 @@ def _make_step_frame(h, ids, start_pos, signer, *, token_envelope=None):
 # TAIL reads them, which is exactly why they belong here: a forwarding stage rebuilds the frame around
 # its own activations (`_make_step_frame`), so anything the coordinator says to the tail has to be
 # named as header or it is dropped at the first hop and the tail simply never sees the hint.
-_PASSTHRU = ("epoch", "cpos", "dnxt", "dprev")
+_PASSTHRU = ("epoch", "cpos", "dnxt", "dprev", "conversation_shadow")
 
 
 def _fenced(msg, epoch):
@@ -1008,6 +1008,11 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
             install_stage_lease_checks(st, lease_guard)
         if ckpt_dir is not None:
             st.load(ckpt_dir)
+    preloaded_drafter = {}
+    if tail and dspark and session_config is not None:
+        loaded_drafter = _tail_drafter(st, ckpt_dir, preloaded_drafter)
+        if hasattr(st, "observe_runtime_drafter"):
+            st.observe_runtime_drafter(loaded_drafter)
     declared_config = getattr(lease_guard, "expected_runtime_config", None)
     if declared_config is not None:
         from v4_resources import runtime_config_payload
@@ -1038,6 +1043,10 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
     st._runtime_session_config = session_config
     st._diagnostic_stage_index = stage
     st._diagnostic_operation = "listen"
+    from v4_conversation_protocol import configured_cache
+    st._conversation_cache = configured_cache(st)
+    st._conversation_lease_guard = lease_guard
+    st._conversation_restore_note = None
     from v4_observability import runtime_observation
     loaded_observation = runtime_observation(st, session_config=session_config)
     _stage_event("loaded", stage, operation="load", observation=loaded_observation,
@@ -1073,7 +1082,8 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
         if tail:
             st._diagnostic_operation = "predecessor_accept"
             _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=(ckpt_dir if dspark
-                                                                               else None), acceptor=acceptor)
+                                                                               else None), acceptor=acceptor,
+                        drafter_cache=preloaded_drafter)
         elif ret_relay is not None:
             _serve_relay_ingress(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts,
                                  timeout, ret_relay)
@@ -1240,6 +1250,16 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
             st._diagnostic_operation = op
             if op == "reset":
                 st._diagnostic_job_id = msg.get("job_id")
+                st._conversation_reset_parameters = dict(msg)
+                from v4_conversation_protocol import reset_shadow
+                reset_shadow(st)
+                st._conversation_job_binding = {k: msg.get(k) for k in ("job_id", "nonce", "swarm_id")}
+                grant = getattr(conn, "grant", None)
+                st._conversation_session_epoch = f"{grant['boot_id']}:{grant['fence']}" if grant else None
+                st._conversation_restore_note = None
+                for prepared in getattr(st, "_conversation_pending", {}).values():
+                    st._conversation_cache.abort_restore(prepared["ticket"])
+                st._conversation_pending = {}
             if op == "reset":
                 capacity_error = _reset_capacity_error(st, msg)
                 if capacity_error is not None:
@@ -1256,6 +1276,13 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                                         msg.get("job_id", "job"), lo, hi, nonce=msg.get("nonce"))
                           if receipts else None)
                 _fwd_open(kw, nxt, timeout, msg, tag)          # propagate reset UNCHANGED down the ring
+                continue
+            if op == "conversation_control":
+                from v4_conversation_protocol import handle_stage_control
+                ack = handle_stage_control(st, msg, stage_index=stage,
+                    session=getattr(st, "_runtime_session_config", None), signer_key=node_key)
+                msg.setdefault("acks", []).append(ack)
+                kw.send(msg)
                 continue
             if op == "receipt":                               # job done: append my receipt, pass on
                 timer.report()                                # the job barrier: one timing line per job
@@ -1294,7 +1321,12 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 start_pos = int(msg["start_pos"])
                 timer.lap("pre")
                 st._diagnostic_operation = "forward"
-                h = st.forward(h, ids, start_pos)
+                from v4_conversation_protocol import shadow_before_step, shadow_after_step
+                is_shadow = shadow_before_step(st, msg)
+                try:
+                    h = st.forward(h, ids, start_pos)
+                finally:
+                    shadow_after_step(st, msg)
                 timer.sync()
                 timer.lap("fwd")
                 st._diagnostic_operation = "encode_output"
@@ -1410,7 +1442,8 @@ def _finalize_stage_receipt(signer, stage):
         from v4_observability import runtime_observation
         observation = runtime_observation(stage, session_config=getattr(stage, "_runtime_session_config", None),
                                           phase="job_complete")
-        return signer.finalize(runtime_metrics=snapshot, runtime_observation=observation)
+        return signer.finalize(runtime_metrics=snapshot, runtime_observation=observation,
+                               conversation_restore=getattr(stage, "_conversation_restore_note", None))
     return signer.finalize() if snapshot is None else signer.finalize(runtime_metrics=snapshot)
 
 
@@ -1504,7 +1537,7 @@ def _tail_return_reaccept(srv, chan, timeout, acceptor=None):
         print("[tail] coordinator-return re-accepted — ring survived a coordinator restart", flush=True)
 
 
-def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acceptor=None):
+def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acceptor=None, drafter_cache=None):
     """Tail serve loop. Accepts BOTH inbound streams (predecessor + coordinator-return) on the one
     engine port, classified by the hello_return greeting, then serves: run the block, collapse the
     hyper-connections, sample, and send the token id back on the return channel.
@@ -1527,7 +1560,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
     signer = None
     reply_identity = {}
     temp, gen = 0.0, None                                    # sampling arm, (re)set per job by the reset
-    drafter, built = None, {}                                # per-job arm, process-lifetime drafter
+    drafter, built = None, drafter_cache if drafter_cache is not None else {}
     epoch = 0                                                # newest speculation generation seen (fence)
     timer = _timer("[tail]", ("recv", "pre", "fwd", "out", "logits", "draft", "send"),
                    getattr(st, "device", None), getattr(st, "_runtime_profile", None))
@@ -1542,6 +1575,16 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
             st._diagnostic_operation = op
             if op == "reset":
                 st._diagnostic_job_id = msg.get("job_id")
+                st._conversation_reset_parameters = dict(msg)
+                from v4_conversation_protocol import reset_shadow
+                reset_shadow(st)
+                st._conversation_job_binding = {k: msg.get(k) for k in ("job_id", "nonce", "swarm_id")}
+                grant = getattr(pred, "grant", None)
+                st._conversation_session_epoch = f"{grant['boot_id']}:{grant['fence']}" if grant else None
+                st._conversation_restore_note = None
+                for prepared in getattr(st, "_conversation_pending", {}).values():
+                    st._conversation_cache.abort_restore(prepared["ticket"])
+                st._conversation_pending = {}
             if op == "reset":
                 reply_identity = ({key: msg.get(key) for key in ("job_id", "swarm_id", "nonce")}
                                   if msg.get("reply_binding") == 1 else {})
@@ -1581,6 +1624,15 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                        if temp > 0 and msg.get("seed") is not None else None)
                 chan.send({"ok": True, "op": "reset_ok", **reply_identity} if reply_identity else "ok")
                 continue
+            if op == "conversation_control":
+                from v4_conversation_protocol import handle_stage_control
+                index = getattr(st, "_diagnostic_stage_index", 0)
+                ack = handle_stage_control(st, msg, stage_index=index,
+                    session=getattr(st, "_runtime_session_config", None), signer_key=node_key, drafter=drafter)
+                msg.setdefault("acks", []).append(ack)
+                job = {k: msg["request"]["job"][k] for k in ("job_id", "nonce", "swarm_id")}
+                chan.send({"op": "conversation_ack", "job": job, "acks": msg["acks"], **reply_identity})
+                continue
             if op == "receipt":
                 timer.report()                                # the job barrier: one timing line per job
                 if signer is not None:
@@ -1605,7 +1657,12 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                 start_pos = int(msg["start_pos"])
                 timer.lap("pre")
                 st._diagnostic_operation = "forward"
-                h = st.forward(h, ids, start_pos)
+                from v4_conversation_protocol import shadow_before_step, shadow_after_step
+                is_shadow = shadow_before_step(st, msg)
+                try:
+                    h = st.forward(h, ids, start_pos)
+                finally:
+                    shadow_after_step(st, msg)
                 timer.sync()
                 timer.lap("fwd")
                 if signer is not None:
@@ -1624,7 +1681,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                     out["epoch"], out["pos"] = int(msg["epoch"]), start_pos
                 timer.sync()
                 timer.lap("logits")
-                if drafter is not None:                       # dspark: draft the next block locally
+                if drafter is not None and not is_shadow:     # shadow's MTP is rebuilt at its barrier
                     st._diagnostic_operation = "draft"
                     draft_msg = dict(msg, ids=ids) if envelope is not None else msg
                     if envelope is not None:
@@ -1633,6 +1690,11 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                             draft_msg["dnxt"] = hint
                     out.update(drafter.on_chunk(draft_msg, st, out) or {})
                 out.update(reply_identity)
+                if is_shadow:
+                    shadow_after_step(st, msg, out=out)
+                if start_pos == 0:
+                    from v4_conversation_protocol import MATH_REPLY
+                    st._conversation_prefill_reply = {k: out[k] for k in MATH_REPLY if k in out}
                 timer.sync()
                 timer.lap("draft")
                 st._diagnostic_operation = "send_return"
@@ -1769,7 +1831,7 @@ def _timed_receipts(enabled, pipe, ret, layer_count, nonce, **kwargs):
     return receipts, verified, time.perf_counter() - started
 
 
-def _coord_io(cancel_check, on_token, expected_job=None):
+def _coord_io(cancel_check, on_token, expected_job=None, *, conversation=None, pipe=None, ret=None):
     """Cancellation boundaries around I/O and committed callbacks.
 
     A service owner also closes its active sockets on cancel/deadline so a
@@ -1778,7 +1840,10 @@ def _coord_io(cancel_check, on_token, expected_job=None):
     def guard():
         if cancel_check is not None:
             cancel_check()
+    if conversation is not None and conversation.enabled and expected_job is None:
+        raise ValueError("conversation caching requires strict current-job bindings")
     awaiting_reset = [False]
+    reset_message = [None]
     privacy = _configured_token_privacy()
     def send(sock, msg):
         guard()
@@ -1787,10 +1852,15 @@ def _coord_io(cancel_check, on_token, expected_job=None):
         if expected_job is not None and msg.get("op") == "reset":
             msg = dict(msg, reply_binding=1)
             awaiting_reset[0] = True
+            reset_message[0] = dict(msg)
+        if conversation is not None and not conversation.before_send(msg):
+            return
         send_msg(sock, msg)
         guard()
     def recv(sock):
         guard()
+        if conversation is not None and conversation.pending_reply is not None:
+            return conversation.cached_reply()
         for _ in range(256):
             result = recv_msg(sock)
             guard()
@@ -1801,6 +1871,10 @@ def _coord_io(cancel_check, on_token, expected_job=None):
                     if result.get("op") != "reset_ok":
                         raise RuntimeError("expected identity-bound reset barrier before token replies")
                     awaiting_reset[0] = False
+                    if conversation is not None:
+                        conversation.after_reset(pipe, ret, send_msg, recv_msg, reset_message[0])
+                elif conversation is not None:
+                    conversation.after_prefill(pipe, ret, send_msg, recv_msg, result)
                 return result
             if awaiting_reset[0] and isinstance(result, dict) and ("token" in result or "fenced" in result):
                 continue  # old in-flight replies may arrive on a newly reattached return channel
@@ -1815,15 +1889,24 @@ def _coord_io(cancel_check, on_token, expected_job=None):
 
 def coordinate(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_id="swarm",
                job_id="job", layer_count=None, receipts=False, temp=0.0, seed=0, timeout=600.0,
-               on_token=None, cancel_check=None, expected_by_signer=None, strict_job_binding=False):
+               on_token=None, cancel_check=None, expected_by_signer=None, strict_job_binding=False, conversation=None):
     """Greedy sequential decode over the fire-forward ring. Weightless: the head embeds, the tail
     samples, and this loop only threads token ids and the settlement nonce over the sockets.
 
     Returns {ok, tokens, prompt_tokens, receipts, receipts_ok}. `receipts` sweeps the ring once at
     the end and verifies coverage against `layer_count` and the job nonce (fail-closed, C10)."""
+    if v4_levers._recipe_request("pipelined", None) == "off":
+        v4_levers.note("V4_PIPELINED_SPEC", False)
+        v4_levers.note("V4_LAZY_DRAFT", False)
+        v4_levers.note("V4_SPEC_DEPTH", 1)
+        v4_levers.note("V4_REFILL_FLOOR", 1)
     nonce = _privacy_job_nonce(nonce)
+    if conversation is not None:
+        conversation.cancel_check = cancel_check
+        conversation.bind_tokens(prompt_ids, eos_ids=eos_ids)
     _send, _recv, on_token = _coord_io(cancel_check, on_token,
-        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None)
+        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None,
+        conversation=conversation, pipe=pipe, ret=ret)
     ret.settimeout(timeout)
     _send(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
                     "temp": float(temp), "seed": int(seed),
@@ -1885,7 +1968,7 @@ def _drafter_propose(drafter, ng):
 def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_id="swarm",
                     job_id="job", layer_count=None, receipts=False, timeout=600.0, on_token=None,
                     K=4, ng=3, drafter=None, cancel_check=None, expected_by_signer=None,
-                    strict_job_binding=False):
+                    strict_job_binding=False, conversation=None):
     """SPECULATIVE decode over the fire-forward ring — the g-lever that beats the transport ceiling.
     Each round proposes K draft tokens, sends the (cur + drafts) chunk through the ring in ONE
     traversal, the tail returns the model's greedy token at EVERY chunk position, and we commit the
@@ -1900,8 +1983,12 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
 
     Returns coordinate()'s dict plus spec stats {rounds, generated, g, accept_hist}."""
     nonce = _privacy_job_nonce(nonce)
+    if conversation is not None:
+        conversation.cancel_check = cancel_check
+        conversation.bind_tokens(prompt_ids, eos_ids=eos_ids)
     _send, _recv, on_token = _coord_io(cancel_check, on_token,
-        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None)
+        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None,
+        conversation=conversation, pipe=pipe, ret=ret)
     plan_verify_round = _dspark().plan_verify_round        # ONE accept rule, shared with the tail
     propose = _drafter_propose(drafter, ng)
     ret.settimeout(timeout)
@@ -2017,7 +2104,7 @@ def _conf_send_len(confs, thresh, min_send):
 def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_id="swarm",
                       job_id="job", layer_count=None, receipts=False, timeout=600.0, on_token=None,
                       conf_gate=None, conf_thresh=None, conf_min=None, conf_probe=None,
-                      cancel_check=None, expected_by_signer=None, strict_job_binding=False):
+                      cancel_check=None, expected_by_signer=None, strict_job_binding=False, conversation=None):
     """DSPARK speculative decode over the fire-forward ring — the headline drafted path.
 
     Same propose->verify->accept->rollback contract coordinate_spec proves, with the proposer moved
@@ -2054,8 +2141,12 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     selftest tells "the drafter proposed nothing" apart from "the drafter proposed and was rejected"
     and how a bench reads the gate's effect."""
     nonce = _privacy_job_nonce(nonce)
+    if conversation is not None:
+        conversation.cancel_check = cancel_check
+        conversation.bind_tokens(prompt_ids, eos_ids=eos_ids)
     _send, _recv, on_token = _coord_io(cancel_check, on_token,
-        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None)
+        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None,
+        conversation=conversation, pipe=pipe, ret=ret)
     plan_verify_round = _dspark().plan_verify_round        # ONE accept rule, shared with the tail
     gate = V4_DSPARK_CONF_GATE if conf_gate is None else bool(conf_gate)
     thresh = V4_DSPARK_CONF_THRESH if conf_thresh is None else float(conf_thresh)
@@ -2294,7 +2385,8 @@ class _FrameSender(threading.Thread):
 def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
                                 swarm_id="swarm", job_id="job", layer_count=None, receipts=False,
                                 timeout=600.0, on_token=None, depth=None, lazy=None, floor=None,
-                                cancel_check=None, expected_by_signer=None, strict_job_binding=False):
+                                cancel_check=None, expected_by_signer=None, strict_job_binding=False, conversation=None,
+                                draft_block_limit=None):
     """DSPARK speculative decode, PIPELINED — the same lossless round, streamed instead of chunked.
 
     Same contract as coordinate_dspark (same reset, same drafter, same accept rule, same emitted
@@ -2371,8 +2463,14 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     where they overlap. At floor=1 every topup counter is structurally zero and the round is the
     shipped one, frame for frame, hints included."""
     nonce = _privacy_job_nonce(nonce)
+    if conversation is not None:
+        conversation.cancel_check = cancel_check
+        conversation.bind_tokens(prompt_ids, eos_ids=eos_ids)
     _send, _recv, on_token = _coord_io(cancel_check, on_token,
-        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None)
+        {"job_id": job_id, "nonce": nonce, "swarm_id": swarm_id} if strict_job_binding else None,
+        conversation=conversation, pipe=pipe, ret=ret)
+    if draft_block_limit is not None and (type(draft_block_limit) is not int or not 1 <= draft_block_limit <= 256):
+        raise ValueError("approved draft block limit must be an integer in 1..256")
     W = int(depth or V4_SPEC_DEPTH)
     F = int(floor if floor is not None else V4_REFILL_FLOOR)
     if F < 1:
@@ -2611,7 +2709,13 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 st8.epoch += 1                                # over, so nothing more reaches the ring
             sender.stop()                                     # settle `pending` before draining on it
             continue
-        blk = [int(t) for t in (rep.get("draft") or [])]
+        raw_block = rep.get("draft") or []
+        if draft_block_limit is not None and (not isinstance(raw_block, list) or len(raw_block) > draft_block_limit):
+            with st8.lock:
+                st8.epoch += 1
+            sender.stop()
+            raise RuntimeError("tail draft exceeds the approved loaded block limit")
+        blk = [int(t) for t in raw_block]
         alt2 = [int(t) for t in (rep.get("d2") or [])]        # runner-up per slot, aligned with blk
         issued += bool(blk)                                   # what the TAIL paid for, block for block
         blen = max(blen, len(blk))
@@ -2738,7 +2842,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
             "receipts": recs, "receipts_ok": receipts_ok,
             "frames": frames, "drafted": drafted, "drafts_issued": issued, "lazy": lazy,
-            "floor": F, "generated": gen, "accepted": accepted,
+            "floor": F, "depth": W, "generated": gen, "accepted": accepted,
             "cancels": cancels, "cycles": cycles, "rounds": cycles,
             "g": (gen / cycles) if cycles else float(gen), "accept_hist": hist,
             "accept_by_depth": {d: tuple(v) for d, v in sorted(by_depth.items())},
@@ -2886,6 +2990,9 @@ ENG_ENV = [
     "V4_FAST_VERIFY", "V4_FAST_VERIFY_MAX",                                     # chunked verify
     "V4_KERNELS", "V4_DTYPE", "V4_MAX_SEQ", "V4_MAX_BATCH",                     # stage build-out
     "V4_HADAMARD",                                                              # shared service/bench backend
+    "V4_PREFILL_EXPERT_PIPELINE", "V4_PREFILL_EXPERT_DEPTH", "V4_PREFILL_EXPERT_BATCH",
+    "V4_CONVERSATION_CACHE_MIB", "V4_CONVERSATION_CACHE_GPU_MIB",
+    "V4_CONVERSATION_CACHE_ENTRIES", "V4_CONVERSATION_CACHE_TTL_S",
     "V4_KEEPWARM", "V4_KEEPWARM_MS",                                            # transport keep-warm
     "V4_DIAL_CONNECT_TIMEOUT", "V4_DIAL_RETRY_S",                               # inter-stage dial
     "V4_TIMING", "V4_TIMING_EVERY",                                             # instrumentation

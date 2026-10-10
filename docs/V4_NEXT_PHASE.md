@@ -1,6 +1,6 @@
 # V4 runtime and service hardening
 
-Current runtime/service entrypoints below are aligned to `c2ab623` (2026-10-08).
+Current runtime/service entrypoints below were rechecked against the working tree on 2026-10-09.
 The requested runtime paths are implemented, while real four/six RTX 5090 acceptance
 is still pending an explicitly provisioned actual cluster (owned or rented). Local CPU,
 real-socket and reference-model regressions are not GPU throughput measurements.
@@ -9,6 +9,13 @@ Use a complete repository checkout for the new deployment/gateway workflow.
 The subsequent open-contribution work adds signed public offers, node leases,
 locality-first heterogeneous planning, multi-ring serving and version-sticky
 lifecycle management. See [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md).
+
+Three additional paths are implemented with explicit default-off configuration:
+request-boundary selection among finite locally approved speculative recipes,
+whole-ring exact-repeat prompt snapshots with optional per-request extended-prefix
+reference shadow, and bounded local expert DMA lookahead during RAM-mode prefill.
+Their concrete settings and proof limits are in
+[V4_STATEFUL_OPTIMIZATIONS.md](V4_STATEFUL_OPTIMIZATIONS.md).
 
 ## Execution paths and limits
 
@@ -20,6 +27,9 @@ lifecycle management. See [OPEN_INFERENCE_NETWORK.md](OPEN_INFERENCE_NETWORK.md)
 | Hardware evidence | Frozen speed suite plus sustained same-prompt greedy controls, raw signatures, monotonic campaign intervals and declared SLOs | Timing and physical inventory are coordinator/operator provenance, not remote attestation |
 | Online service | Shared authenticated HTTP, global tenant limits/idempotency, one serial worker per READY ring, version-sticky routing, cancellation/SSE and replay recovery | Rings execute concurrently; history is memory-only; no continuous batching, durable coordinator HA or external billing |
 | Connection ownership | Signed challenge HELLO pins both identities, role/index/spans/cohort, purpose and execution plan; signed head grant binds forward/return and fences old owners | Compatible stage/controller keys and actual reachable tail endpoint are required; strict mode refuses the old return relay |
+| Request policy | One approved greedy/pipelined recipe is selected before each request from actual selected-stage capabilities | No trained-block/weight/runtime mutation within a request; tenant/generation/config scope, finite probe/history budget and actual committed feedback |
+| Prompt state cache | All stages prepare then commit a node-local snapshot of complete valid KV/recurrences/taps/MTP state | Exact token-prefix/mode/horizon/tenant/version/fence matching; extended shadow still runs the full original prefill every request |
+| Prefill expert transport | Known routes feed a bounded FIFO using existing pinned banks, copy stream and fixed cache leases | Preserves original Expert row shapes and accumulation; insufficient lookahead space falls back to demand DMA; no CPU expert fallback or network copies |
 | Miner admission | Distinct GPUs may share a host; real shared RAM/pin budgets, simultaneous H2D measurements and calibrated launch settings are checked | Measurements expire and must be rechecked at load; no automatic rental or remote provisioning |
 
 The local dispute helpers bind logical tensor bytes, both snapshots, deadline and
@@ -98,6 +108,14 @@ Include `--head`, `--tail`, `--dspark` for its real roles. A resource observatio
 automatically a complete placement calibration: retain a measured byte budget for all
 components, including peaks and reserves, as specified in [RESOURCE_CONTRACT.md](RESOURCE_CONTRACT.md).
 The report now exports `runtime_config_payload` to bind that calibration to its settings.
+Conversation snapshot host/GPU restore reserves and expert FIFO settings are included in
+that payload and must be part of the selected exact calibration. Snapshot reservations
+are additional to weights, normal KV, expert pools and reference-shadow scratch;
+shared-host totals still apply. Actual per-pool FIFO counters are runtime observations,
+not stable configuration identity or hardware certification.
+Changing these settings, reservations or helper source changes that identity even if the
+checkpoint is unchanged; remeasure and update approved templates/offers before loading
+a new process. Request recipe choice stays within those already validated capabilities.
 
 The `shard-deployment/1` bundle contains `model_id`, `layer_count`, `checkpoint_id`,
 `registration_policy`, `token_privacy`, `stages` and `host_io` keyed by host ID.
@@ -164,6 +182,19 @@ attempt supplies one complete receipt set; receipts from different attempts are 
 Unsupported sampling/tool/format settings are explicitly rejected. Retained idempotency
 and SSE resume are limited to this process and its bounded history.
 
+The optional prompt cache is configured through each managed formation, alongside its
+approved speculation policy; the controller supplies every selected stage calibration
+and lease binding. Public HTTP request JSON cannot supply these capabilities or recipes.
+An exact-repeat cache hit uses a fresh job/nonce and fresh suffix receipts, carrying a
+signed `conversation_restore` declaration. Its proof scope is
+`fresh_suffix_with_signed_prefix_restore`, not a newly executed full prefix.
+An extended-prefix shadow always retains the current request's full original prefill,
+whether the candidate matches or not; it does not certify ordinary multi-turn speedups.
+Optional tenant/cohort session affinity prefers a READY original ring but never transfers
+KV or overrides drain/fault/version isolation.
+It is enabled by the managed service's top-level `session_affinity` boolean; the legacy
+static pool CLI also has `--session-affinity`, without automatically enabling state caching.
+
 ## Vast cluster acceptance
 
 First run [V4_BENCHMARK.md](V4_BENCHMARK.md): four-card >=40 / six-card >=30 committed
@@ -193,6 +224,10 @@ now explicitly reports `hardware_verified=False`; it cannot pass the hardware ga
 GPU CI uses an idle dedicated sm120 runner, requires real CUDA and retains JUnit results.
 It refuses busy runners and does not kill other GPU workloads. A single-runner kernel
 regression is separate from the four/six-card speed and sustained-service acceptance.
+The default-off stateful features need additional real-weight CUDA/Vast validation of
+exact-repeat and cold/extended requests, MTP/rollback, expiry/fencing, partial restore,
+cancel/disconnect and pinned-source/cache-consumer pressure. Retain shadow and restore
+costs and explicit receipt scopes; CPU or socket regressions do not establish a GPU gain.
 
 ## Validation history and current evidence scope
 

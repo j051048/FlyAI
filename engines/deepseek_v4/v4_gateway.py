@@ -12,6 +12,7 @@ import hmac
 import importlib
 import inspect
 import json
+from contextlib import nullcontext
 import math
 import os
 from pathlib import Path
@@ -55,7 +56,8 @@ class V4RingBackend:
     """One serial ring's connections. Numeric/receipt failures are never retried."""
     service_name = "v4-serial-gateway"
     def __init__(self, directory, head, tail, assignments, *, mode="pipelined", max_retries=1,
-                 timeout=60.0, max_context=8192, swarm_id="v4-service", vp=None, tokenizer=None, pipeline_plan=None, coordinator_key=None):
+                 timeout=60.0, max_context=8192, swarm_id="v4-service", vp=None, tokenizer=None, pipeline_plan=None, coordinator_key=None,
+                 speculation_policy=None, conversation_cache=None, calibrated_runtime_configs=None, lease_fences=None):
         if mode not in ("greedy", "dspark", "pipelined"):
             raise ValueError("invalid V4 service mode")
         if type(max_retries) is not int or not 0 <= max_retries <= 3:
@@ -99,6 +101,66 @@ class V4RingBackend:
         self._last_ok = 0.0
         self._stats = {"attempts": 0, "reconnects": 0, "replayed_tokens": 0, "receipt_failures": 0}
         self._idle_thread = None
+        self._feature_secret = os.urandom(32)
+        self._runtime_configs = calibrated_runtime_configs or {}
+        self._lease_fences = lease_fences or {}
+        self._policy = None
+        self._conversation_owner = None
+        self._last_policy_record = None
+        self._last_conversation_record = None
+        for name, value in (("speculation_policy", speculation_policy), ("conversation_cache", conversation_cache)):
+            if value is not None and (not isinstance(value, dict) or type(value.get("enabled", False)) is not bool):
+                raise ValueError(f"{name} requires an explicit boolean enabled flag")
+        if conversation_cache and conversation_cache.get("enabled", False) and set(conversation_cache) - {
+                "enabled", "max_entries", "ttl_s", "extended_shadow"}:
+            raise ValueError("unknown enabled conversation cache configuration")
+        feature_cohort = pipeline_plan.get("cohort_id") if pipeline_plan else None
+        if any(value and value.get("enabled", False) for value in (speculation_policy, conversation_cache)):
+            from v4_request_features import validate_selected_bindings
+            validate_selected_bindings(pipeline_plan, self._runtime_configs, self._lease_fences)
+        if speculation_policy and speculation_policy.get("enabled", False):
+            if pipeline_plan is None or not pipeline_plan.get("model_cohort"):
+                raise ValueError("adaptive request policies require a complete strict model cohort")
+            from shard.speculation_policy import SpeculationRecipe
+            from v4_request_features import build_policy
+            baseline = SpeculationRecipe("baseline", self.mode,
+                depth=getattr(vp, "V4_SPEC_DEPTH", 16) if self.mode == "pipelined" else 1,
+                floor=getattr(vp, "V4_REFILL_FLOOR", 1) if self.mode == "pipelined" else 1,
+                lazy=getattr(vp, "V4_LAZY_DRAFT", False) if self.mode == "pipelined" else False)
+            self._policy = build_policy(speculation_policy, baseline, self._runtime_configs,
+                feature_cohort, lease_fences=self._lease_fences, ring_id=pipeline_plan["ring_id"])
+        if conversation_cache and conversation_cache.get("enabled", False):
+            if pipeline_plan is None or not pipeline_plan.get("model_cohort") or not self._runtime_configs or not self._lease_fences:
+                raise ValueError("state caching requires strict identity and calibrated per-stage budgets")
+            if set(self._runtime_configs) != {stage["node_id"] for stage in pipeline_plan["stages"]}:
+                raise ValueError("state caching needs every selected stage configuration")
+            if any(not cfg.get("conversation_cache", {}).get("enabled", False)
+                   or cfg["conversation_cache"].get("host_reserved_bytes", 0) <= 0
+                   for cfg in self._runtime_configs.values()):
+                raise ValueError("state caching requires explicit calibrated node-local snapshot reserves")
+            from v4_conversation_protocol import ConversationCoordinator
+            self._conversation_owner = ConversationCoordinator(enabled=True,
+                max_entries=conversation_cache.get("max_entries", 128),
+                ttl_s=conversation_cache.get("ttl_s", 300),
+                extended_shadow=conversation_cache.get("extended_shadow", False))
+            from v4_observability import source_inventory
+            from shard.runtime_observation import digest
+            cohort_body = pipeline_plan["model_cohort"]
+            from v4_resources import inspect_checkpoint
+            # The coordinator's asset verification already pins actual config and
+            # tokenizer bytes. Hash the verified inventory, not a filename label.
+            inventory = inspect_checkpoint(directory)
+            token_assets = {key: value for key, value in inventory.get("artifact_catalog", {}).get("assets", {}).items()
+                            if key.startswith(("tokenizer", "vocab", "merges", "special_tokens"))}
+            if not token_assets:
+                raise ValueError("state caching requires globally pinned tokenizer assets")
+            encoder = ROOT / "vendor" / "deepseek_v4_ref" / "encoding" / "encoding_dsv4.py"
+            self._conversation_base = {"cohort_id": feature_cohort,
+                "numeric_contract": cohort_body["numeric_contract"], "source_id": digest(source_inventory()),
+                "config_sha256": digest(self._runtime_configs), "tokenizer_sha256": digest(token_assets),
+                "template_sha256": hashlib.sha256(encoder.read_bytes()).hexdigest(),
+                "ring_id": pipeline_plan["ring_id"],
+                "lease_fences": [[node, spec["fencing_token"]] for node, spec in sorted(self._lease_fences.items())]}
         if pipeline_plan is not None:
             self._idle_thread = threading.Thread(target=self._idle_keepalive, daemon=True, name="v4-session-keepalive")
             self._idle_thread.start()
@@ -155,7 +217,12 @@ class V4RingBackend:
         timeout_s = body.get("timeout_s", 600.0)
         if type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or not 0 < timeout_s <= 3600:
             raise AdmissionError("timeout_s must be finite in (0,3600]", status=400, code="invalid_request_error")
-        return {"prompt_ids": ids, "mode": mode, "max_new": maximum}, len(ids), maximum, timeout_s
+        payload = {"prompt_ids": ids, "mode": mode, "max_new": maximum}
+        if self._policy is not None:
+            payload["policy_allowed"] = "shard_mode" not in body
+            if payload["policy_allowed"] and len(ids) + maximum + 64 > self.max_context:
+                raise AdmissionError("adaptive policy reserves the approved speculative context margin", status=400, code="context_length_exceeded")
+        return payload, len(ids), maximum, timeout_s
 
     def decode(self, tokens):
         return self.tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
@@ -185,6 +252,8 @@ class V4RingBackend:
         self.abort()
         if self._idle_thread is not None:
             self._idle_thread.join(.2)
+        if self._conversation_owner is not None:
+            self._conversation_owner.entries.clear()
 
     def _idle_keepalive(self):
         while not self._idle_stop.wait(20):
@@ -232,8 +301,14 @@ class V4RingBackend:
 
     def _execute(self, job, emit, cancel_check):
         failures = []
+        decision = None
+        if self._policy is not None and job.payload.get("policy_allowed", False):
+            context = self._policy.context(tenant_id=job.tenant,
+                context_tokens=job.prompt_tokens, max_new_tokens=job.max_new)
+            decision = self._policy.choose(context)
+        selected_mode = decision.recipe.mode if decision is not None else job.payload["mode"]
+        policy_finished = False
         for attempt in range(self.max_retries + 1):
-            cancel_check()
             owner, done = object(), threading.Event()
             with self._lock:
                 self._attempt_owner = owner
@@ -243,7 +318,9 @@ class V4RingBackend:
             prefix, seen = job.checkpoint(), 0
             nonce = __import__("secrets").token_hex(32)
             attempt_id = f"{job.id}/attempt-{attempt + 1}"
+            conversation = None
             try:
+                cancel_check()
                 if self._channels is None:
                     remaining = job.deadline - time.monotonic()
                     # connect_ring does not expose its in-progress sockets: bound bootstrap
@@ -261,10 +338,26 @@ class V4RingBackend:
                 for channel in self._channels:
                     channel.settimeout(max(0.05, min(self.timeout, job.deadline - time.monotonic())))
                 self._stats["attempts"] += 1
+                if self._conversation_owner is not None and not prefix and job.max_new > 1:
+                    from v4_conversation_protocol import canonical
+                    session = getattr(self._channels[0], "grant", None)
+                    if session is None:
+                        raise ValueError("state-cache request has no live strict owner grant")
+                    identity = {**self._conversation_base,
+                        "tenant": hmac.new(self._feature_secret, job.tenant.encode(), hashlib.sha256).hexdigest(),
+                        "ring_epoch": f"{session['boot_id']}:{session['fence']}",
+                        "config_sha256": hashlib.sha256(canonical([self._conversation_base["config_sha256"], selected_mode])).hexdigest()}
+                    prefix_binding = {"token_count": len(job.payload["prompt_ids"]),
+                        "digest": hmac.new(self._feature_secret,
+                            canonical([identity["tenant"], job.payload["prompt_ids"]]), hashlib.sha256).hexdigest()}
+                    conversation = self._conversation_owner.request(identity, prefix_binding, max_new=job.max_new)
+                started = time.perf_counter()
+                offsets = []
 
                 def committed(token):
                     nonlocal seen
                     token = int(token)
+                    offsets.append(time.perf_counter() - started)
                     if seen < len(prefix):
                         if token != prefix[seen]:
                             raise ReplayMismatch("recomputed committed prefix differs; refusing unsafe resume")
@@ -274,33 +367,85 @@ class V4RingBackend:
                     seen += 1
 
                 method = {"greedy": self.vp.coordinate, "dspark": self.vp.coordinate_dspark,
-                          "pipelined": self.vp.coordinate_dspark_pipelined}[job.payload["mode"]]
+                          "pipelined": self.vp.coordinate_dspark_pipelined}[selected_mode]
                 kwargs = dict(eos_ids=self.eos_ids, nonce=nonce, swarm_id=self.swarm_id, job_id=attempt_id,
                     layer_count=self.layers, receipts=True, timeout=max(0.05, min(self.timeout, job.deadline - time.monotonic())),
                     on_token=committed, cancel_check=cancel_check, expected_by_signer=self.assignments,
                     strict_job_binding=True)
-                if job.payload["mode"] == "greedy":
+                if selected_mode == "greedy":
                     kwargs.update(temp=0.0, seed=0)
-                result = method(*self._channels, job.payload["prompt_ids"], job.max_new, **kwargs)
+                if decision is not None:
+                    kwargs.update(decision.recipe.coordinator_kwargs())
+                    if selected_mode == "pipelined":
+                        kwargs["draft_block_limit"] = self._policy.binding()["loaded_block_size"]
+                if conversation is not None:
+                    kwargs["conversation"] = conversation
+                audit = nullcontext()
+                if decision is not None:
+                    import v4_levers
+                    audit = v4_levers.request_recipe_audit(decision.recipe.to_dict())
+                with audit:
+                    result = method(*self._channels, job.payload["prompt_ids"], job.max_new, **kwargs)
+                returned = time.perf_counter() - started
                 cancel_check()
                 if not result.get("ok") or result.get("tokens") != job.checkpoint() or seen != len(job.checkpoint()):
                     raise ReplayMismatch("coordinator result differs from the committed callback frontier")
                 receipts = self._verify_receipts(result, nonce, attempt_id)
                 self._last_ok = time.monotonic()
-                return {"tokens": job.checkpoint(), "text": self.decode(job.checkpoint()),
+                optimization = {}
+                if conversation is not None:
+                    self._last_conversation_record = dict(conversation.record)
+                    optimization["conversation_cache"] = dict(conversation.record)
+                if decision is not None:
+                    if attempt or prefix:
+                        record = self._policy.discard(decision, reason="request_replayed")
+                    elif "receipt_sweep_s" not in result:
+                        # Valid output/receipts remain usable, but an unknown
+                        # sweep duration must never become a zero-cost sample.
+                        record = self._policy.discard(decision, reason="invalid_measurement")
+                    else:
+                        from shard.speculation_policy import feedback_from_result
+                        sweep = result["receipt_sweep_s"]
+                        feedback = feedback_from_result(result, first_token_s=offsets[0], last_token_s=offsets[-1],
+                            request_elapsed_s=returned-sweep, receipt_sweep_s=sweep,
+                            expected_recipe=decision.recipe)
+                        record = self._policy.observe(decision, feedback)
+                    policy_finished = True
+                    self._last_policy_record = record
+                    optimization["speculation_policy"] = record
+                response = {"tokens": job.checkpoint(), "text": self.decode(job.checkpoint()),
                     "finish_reason": "length" if len(job.tokens) >= job.max_new else "stop",
-                    "proof": {"verified": True, "scope": "complete_final_attempt", "attempt_id": attempt_id,
+                    "proof": {"verified": True, "scope": "fresh_suffix_with_signed_prefix_restore" if conversation and conversation.record.get("hit") else "complete_final_attempt", "attempt_id": attempt_id,
                               "nonce": nonce, "swarm_id": self.swarm_id, "receipts": receipts},
                     "recovery": {"attempts": attempt + 1, "replayed_committed_tokens": len(prefix),
                                  "strategy": "original_request_replay_with_prefix_check", "transport_failures": failures}}
+                if optimization:
+                    response["optimizations"] = optimization
+                return response
             except (OSError, EOFError) as error:
                 self._close_channels(owner)
-                cancel_check()  # cancellation/deadline never masquerades as retryable transport churn
+                try:
+                    cancel_check()  # cancellation/deadline never masquerades as retryable transport churn
+                except (JobCancelled, JobExpired) as stopped:
+                    if decision is not None and not policy_finished:
+                        self._policy.discard(decision, reason="request_expired" if isinstance(stopped, JobExpired) else "request_cancelled")
+                        policy_finished = True
+                    raise
                 failures.append(type(error).__name__)
                 if attempt >= self.max_retries:
+                    if decision is not None and not policy_finished:
+                        self._policy.discard(decision, reason="request_failed")
                     raise
                 self._stats["reconnects"] += 1
-            except Exception:
+            except Exception as error:
+                if conversation is not None:
+                    self._conversation_owner.entries.pop(conversation.key, None)
+                if decision is not None and not policy_finished:
+                    reason = "receipt_validation_failed" if isinstance(error, ReceiptValidationError) else (
+                        "request_expired" if isinstance(error, JobExpired) else
+                        "request_cancelled" if isinstance(error, JobCancelled) else "request_failed")
+                    self._policy.discard(decision, reason=reason)
+                    policy_finished = True
                 self._close_channels(owner)
                 raise
             finally:
@@ -364,7 +509,11 @@ class V4RingBackend:
                 "proof_verified": result["proof"]["verified"]}
 
     def stats(self):
-        return dict(self._stats)
+        values = dict(self._stats)
+        # No other request's tenant-scoped decisions or history are exposed here.
+        values["adaptive_policy_enabled"] = self._policy is not None
+        values["conversation_cache_enabled"] = self._conversation_owner is not None
+        return values
 
 
 
@@ -528,6 +677,7 @@ def main(argv=None):
     parser.add_argument("--auth-file", required=True)
     parser.add_argument("--deployment", help="concrete measured shard-deployment/1 bundle (single ring)")
     parser.add_argument("--ring-pool", help="shard-ring-pool/1 JSON: measured deployments, cohorts, node leases, aliases")
+    parser.add_argument("--session-affinity", action="store_true", help="prefer the same READY ring for tenant-scoped shard_session_id (requires --ring-pool)")
     parser.add_argument("--assignments", help="optional map to cross-check against deployment identities")
     parser.add_argument("--mode", choices=("greedy", "dspark", "pipelined"), default="pipelined")
     parser.add_argument("--max-context", type=int, default=8192)
@@ -541,6 +691,8 @@ def main(argv=None):
     parser.add_argument("--tls-key")
     parser.add_argument("--allow-insecure-http", action="store_true", help="explicitly permit non-loopback HTTP behind a trusted TLS proxy")
     args = parser.parse_args(argv)
+    if args.session_affinity and not args.ring_pool:
+        parser.error("--session-affinity requires --ring-pool")
     if args.ring_pool:
         if args.dir or args.deployment or args.assignments or args.skip_warmup:
             parser.error("--ring-pool owns per-ring dir/deployment/assignments and requires signed warmup")
@@ -554,7 +706,8 @@ def main(argv=None):
     if args.ring_pool:
         pool, default_model = load_ring_pool(args.ring_pool, warmup_timeout_s=args.warmup_timeout_s)
         try:
-            gateway = Gateway(auth=auth, ring_pool=pool, default_model=default_model)
+            gateway = Gateway(auth=auth, ring_pool=pool, default_model=default_model,
+                              session_affinity=args.session_affinity)
         except Exception:
             pool.shutdown()
             raise

@@ -288,7 +288,10 @@ class OpenNetworkService:
                     raise ControlError("planned preparation needs pinned artifacts and a supported mode")
                 assignment["preparation_mode"] = stage["preparation_mode"]
             selected.append((client, lease, assignment))
-        backend = self.backend_factory(directory, manifest, cohort, row, contracts)
+        feature_row = {**row, "verified_runtime_configs": runtime_configs,
+            "verified_lease_fences": {node_id: {"lease_id": lease["lease_id"], "fencing_token": lease["fencing_token"]}
+                                      for node_id, (_, lease) in leases.items()}}
+        backend = self.backend_factory(directory, manifest, cohort, feature_row, contracts)
         if backend.model_id != cohort.model_id or backend.layers != cohort.n_layers:
             backend.close()
             raise ControlError("engine does not implement the selected model cohort")

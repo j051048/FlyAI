@@ -91,7 +91,7 @@ def hybrid_block_cls(base_cls, ref_model, manager, *, device, emulation=False,
         def forward(self, *args, **kwargs):
             position = args[1] if len(args) > 1 else kwargs.get("start_pos", 0)
             runtime = self.ffn._hybrid_runtime
-            phase = "prefill" if position == 0 else runtime.phase
+            phase = "prefill" if position == 0 and runtime.phase != "replay" else runtime.phase
             with runtime.phase_context(phase):
                 if role == "draft" and position > 0 and runtime.phase != "replay" and not runtime._warmup_depth:
                     runtime.prefetch_for_attention()
@@ -142,6 +142,47 @@ class HybridMoE:
         self._prefetch_spare = 1
         self._pending_prediction = set()
         self._prefetch_counts = dict(requested=0, used=0, wasted=0, skipped=0, candidate_count=0)
+        self._prefill_pipeline_options = {"enabled": False, "depth": 2, "batch_size": 0}
+        self._prefill_pipeline_counts = self._empty_pipeline_counts()
+
+    @staticmethod
+    def _empty_pipeline_counts():
+        return dict(calls=0, fallback_calls=0, queued_batches=0, consumed_batches=0,
+                    cancelled_batches=0, new_copy_experts=0, copied_bytes=0, dma_bytes=0,
+                    peak_batches=0, peak_slots=0)
+
+    def configure_prefill_pipeline(self, *, enabled=False, depth=2, batch_size=0):
+        from v4_prefill_expert_pipeline import validate_options
+        self._prefill_pipeline_options = validate_options(enabled=enabled, depth=depth, batch_size=batch_size)
+        self._prefill_pipeline_counts = self._empty_pipeline_counts()
+
+    def prefill_pipeline_status(self):
+        from v4_prefill_expert_pipeline import plan, SCHEMA
+        config = (plan(self.cache, **self._prefill_pipeline_options) if self.cache is not None else
+                  {"schema": SCHEMA, "requested": dict(self._prefill_pipeline_options),
+                   "active": False, "reason": "cache_not_bound"})
+        return {"config": config, "observations": dict(self._prefill_pipeline_counts)}
+
+    def _prefill_pipeline(self, ordered, rows):
+        if (not self._prefill_pipeline_options["enabled"] or self.phase != "prefill"
+                or rows <= 1 or self._warmup_depth):
+            return None
+        from v4_prefill_expert_pipeline import ExpertBatchPipeline, plan
+        options = self._prefill_pipeline_options
+        policy = plan(self.cache, **options)
+        if not policy["active"] or len(ordered) <= policy["effective_batch_size"]:
+            self._prefill_pipeline_counts["fallback_calls"] += 1
+            return None
+        self._prefill_pipeline_counts["calls"] += 1
+        return ExpertBatchPipeline(self.cache, ordered, depth=options["depth"], batch_size=options["batch_size"])
+
+    def _finish_prefill_pipeline(self, pipeline):
+        pipeline.close()
+        stats = pipeline.stats()
+        for key in ("queued_batches", "consumed_batches", "cancelled_batches", "new_copy_experts", "copied_bytes", "dma_bytes"):
+            self._prefill_pipeline_counts[key] += stats[key]
+        for key in ("peak_batches", "peak_slots"):
+            self._prefill_pipeline_counts[key] = max(self._prefill_pipeline_counts[key], stats[key])
 
     def _host(self, name):
         return self.profiler.host(f"{self.role}.{self.phase}.{name}.host") \
@@ -173,6 +214,7 @@ class HybridMoE:
             self._prefetch_policy.reset_job()
         self.last_event = None
         self.grouped_steps = self.generic_steps = 0
+        self._prefill_pipeline_counts = self._empty_pipeline_counts()
 
     def prefetch_stats(self):
         return dict(self._prefetch_counts)
@@ -464,27 +506,39 @@ class HybridMoE:
             finally:
                 lease.release()
         else:
-            for begin in range(0, len(ordered), self.cache.capacity):
-                batch = ordered[begin:begin + self.cache.capacity]
-                with self._host("cache_schedule"):
-                    lease = self.cache.acquire(batch)
-                try:
-                    if shared is None:
-                        with self._gpu("shared"):
-                            shared = self.moe.shared_experts(xv)
-                    lease.wait_on()
-                    with self._gpu("routed"):
-                        for eid in batch:
-                            rows, top = zip(*pairs[eid])
-                            row_idx = torch.tensor(rows, dtype=torch.long, device=xv.device)
-                            top_idx = torch.tensor(top, dtype=torch.long, device=xv.device)
-                            expert = self.cache.experts[lease.mapping[eid]]
-                            # Preserve the original Expert.forward shape and duplicate-index
-                            # scatter: hash repeats keep the final write, not an extra sum.
-                            y[row_idx] += expert(xv[row_idx], weights[row_idx, top_idx, None])
-                    self._record_lease(lease, pairs, counts, timings)
-                finally:
-                    lease.release()
+            pipeline = self._prefill_pipeline(ordered, xv.shape[0])
+            try:
+                if pipeline is not None:
+                    with self._host("cache_schedule"):
+                        pipeline.__enter__()
+                    batches = pipeline
+                else:
+                    batches = ((ordered[begin:begin + self.cache.capacity], None)
+                               for begin in range(0, len(ordered), self.cache.capacity))
+                for batch, lease in batches:
+                    if lease is None:
+                        with self._host("cache_schedule"):
+                            lease = self.cache.acquire(batch)
+                    try:
+                        if shared is None:
+                            with self._gpu("shared"):
+                                shared = self.moe.shared_experts(xv)
+                        lease.wait_on()
+                        with self._gpu("routed"):
+                            for eid in batch:
+                                rows, top = zip(*pairs[eid])
+                                row_idx = torch.tensor(rows, dtype=torch.long, device=xv.device)
+                                top_idx = torch.tensor(top, dtype=torch.long, device=xv.device)
+                                expert = self.cache.experts[lease.mapping[eid]]
+                                # Expert row shapes and the logical ascending fold are identical;
+                                # the producer only changes when original packed bytes arrive.
+                                y[row_idx] += expert(xv[row_idx], weights[row_idx, top_idx, None])
+                        self._record_lease(lease, pairs, counts, timings)
+                    finally:
+                        lease.release()
+            finally:
+                if pipeline is not None:
+                    self._finish_prefill_pipeline(pipeline)
             if not self._warmup_depth:
                 self.generic_steps += 1
         if shared is None:

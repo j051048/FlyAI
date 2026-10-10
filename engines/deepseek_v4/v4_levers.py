@@ -55,6 +55,9 @@ self-test:  python3 phase0/v4_levers.py
 import os
 import re
 import sys
+import threading
+from collections.abc import MutableMapping
+from contextlib import contextmanager
 
 # ── the side table: which PROCESS must carry which var ────────────────────────────────────────────
 # STAGE        read by a module in the stage's import closure and acted on inside the stage process.
@@ -359,6 +362,7 @@ def _check_spec_depth(ctx):
     if ctx.side == COORDINATOR:
         vp = _mod("v4_pipe")
         req = str(vp.V4_SPEC_DEPTH) if vp is not None else "absent"
+        req = _recipe_request("depth", req)
         fact = _NOTES.get("V4_SPEC_DEPTH")         # the W a real round streamed at
         if fact is None:
             return req, "no-job-yet", None
@@ -541,6 +545,7 @@ def _check_lazy_draft(ctx):
     so. This is the lever whose var was set on six stages for hours; the WRONG PROCESS check below is
     what makes that visible in one line."""
     req = _flag("v4_pipe", "V4_LAZY_DRAFT")
+    req = _recipe_request("lazy", req)
     fact = _NOTES.get("V4_LAZY_DRAFT")
     if fact is None:
         return req, "no-job-yet", None
@@ -549,10 +554,13 @@ def _check_lazy_draft(ctx):
 
 def _check_pipelined(ctx):
     req = _flag("v4_pipe", "V4_PIPELINED_SPEC")
+    req = _recipe_request("pipelined", req)
     fact = _NOTES.get("V4_PIPELINED_SPEC")
     if fact is None:
         return req, "no-job-yet", None
     # a JOB may ask for pipelining without the env, so `on` observed against `off` requested is legal
+    if getattr(_NOTES.local, "recipe", None) is not None:
+        return req, fact, _agree(req, fact)
     return req, fact, not (req == "on" and fact == "off")
 
 
@@ -574,10 +582,12 @@ def _check_refill_floor(ctx):
     not act) wearing this lever's costume."""
     vp = _mod("v4_pipe")
     req = str(vp.V4_REFILL_FLOOR) if vp is not None else "absent"
+    req = _recipe_request("floor", req)
     fact = _NOTES.get("V4_REFILL_FLOOR")
     if fact is None:
         return req, "no-job-yet", None
-    set_here = os.environ.get("V4_REFILL_FLOOR", "") not in ("", "0")
+    set_here = (os.environ.get("V4_REFILL_FLOOR", "") not in ("", "0")
+                or getattr(_NOTES.local, "recipe", None) is not None)
     return req, fact, (req == fact) if set_here else True
 
 
@@ -693,6 +703,13 @@ LEVERS_BY_ENV = {lv.env: lv for lv in LEVERS}
 # fails loudly on its own (a missing V4_DIR cannot be mistaken for a slow ring). Listed rather than
 # pattern-matched so the registry test stays total — an unlisted new name fails the suite.
 NON_LEVER_ENV = {
+    "V4_PREFILL_EXPERT_PIPELINE": "bounded local expert DMA/compute FIFO; same prefill math",
+    "V4_PREFILL_EXPERT_DEPTH": "prefill expert FIFO depth, bounded by allocated cache slots",
+    "V4_PREFILL_EXPERT_BATCH": "experts per FIFO batch; zero chooses bounded capacity geometry",
+    "V4_CONVERSATION_CACHE_MIB": "per-stage host snapshot quota; zero disables state caching",
+    "V4_CONVERSATION_CACHE_GPU_MIB": "explicit GPU restore metadata reserve",
+    "V4_CONVERSATION_CACHE_ENTRIES": "bounded per-stage snapshot count",
+    "V4_CONVERSATION_CACHE_TTL_S": "local state checkpoint lifetime",
     "V4_KV_GPU_MIB": "explicit total GPU KV budget, including resident windows and shared workspace",
     "V4_KV_HOST_MIB": "explicit host KV history plus rollback/gate budget",
     "V4_SEALED_IDS": "version-negotiated opaque token frames; activations remain visible",
@@ -730,7 +747,63 @@ NON_LEVER_ENV = {
 # A coordinator lever has no rebound method to inspect: `lazy` is an ARGUMENT to a loop, so the only
 # honest observation is what the loop ran with. The loop says so here, once, and the audit reads the
 # fact instead of re-reading the env it already believed.
-_NOTES = {}
+class _ScopedNotes(MutableMapping):
+    """Default legacy notes plus isolated request observations for parallel rings."""
+    def __init__(self):
+        self.base = {}
+        self.local = threading.local()
+
+    def data(self):
+        return getattr(self.local, "notes", self.base)
+
+    def __getitem__(self, key):
+        return self.data()[key]
+
+    def __setitem__(self, key, value):
+        self.data()[key] = value
+
+    def __delitem__(self, key):
+        del self.data()[key]
+
+    def __iter__(self):
+        return iter(self.data())
+
+    def __len__(self):
+        return len(self.data())
+
+
+_NOTES = _ScopedNotes()
+
+
+def _recipe_request(field, fallback):
+    recipe = getattr(_NOTES.local, "recipe", None)
+    if recipe is None:
+        return fallback
+    value = recipe["mode"] == "pipelined" if field == "pipelined" else recipe[field]
+    return ("on" if value else "off") if isinstance(value, bool) else str(value)
+
+
+@contextmanager
+def request_recipe_audit(recipe):
+    """Called only after the service validates a finite calibrated recipe list.
+
+    Runtime allocation limits remain stage configuration; this scope describes
+    the coordinator's explicitly chosen request parameters.
+    """
+    old_notes = getattr(_NOTES.local, "notes", None)
+    old_recipe = getattr(_NOTES.local, "recipe", None)
+    _NOTES.local.notes, _NOTES.local.recipe = {}, dict(recipe)
+    try:
+        yield
+    finally:
+        if old_notes is None:
+            del _NOTES.local.notes
+        else:
+            _NOTES.local.notes = old_notes
+        if old_recipe is None:
+            del _NOTES.local.recipe
+        else:
+            _NOTES.local.recipe = old_recipe
 
 
 def note(env, value):
@@ -811,7 +884,9 @@ def audit(side=STAGE, stage=None):
         # research harness sets env in the same interpreter, and those are what produce numbers. So
         # the two are compared directly: an environment that says on against a module that parsed
         # off is a MISMATCH, whatever the live state then shows.
-        if set_here and req in ("off", "0", "False", "absent"):
+        recipe_override = (side == COORDINATOR and getattr(_NOTES.local, "recipe", None) is not None
+                           and lv.env in {"V4_PIPELINED_SPEC", "V4_LAZY_DRAFT", "V4_SPEC_DEPTH", "V4_REFILL_FLOOR"})
+        if set_here and req in ("off", "0", "False", "absent") and not recipe_override:
             out.append(Finding(lv.env, lv.side, os.environ[lv.env], f"module parsed {req}", "MISMATCH",
                                f"{lv.env} is set in this process's environment but {lv.owner} parsed "
                                f"it {req} — it was almost certainly set after the module was imported"))
@@ -879,6 +954,7 @@ ENGINE_MODULES = (
     "v4_expert_cache.py", "v4_hybrid.py", "v4_chunked_prefill.py", "v4_wire_codec.py",
     "v4_kv_runtime.py", "v4_privacy.py", "v4_gateway.py",
     "v4_runtime_init.py", "v4_observability.py", "v4_artifact_contract.py", "v4_tokenizer.py",
+    "v4_prefill_expert_pipeline.py", "v4_conversation_cache.py", "v4_conversation_protocol.py", "v4_request_features.py",
 )
 
 _ENV_RE = re.compile(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""")

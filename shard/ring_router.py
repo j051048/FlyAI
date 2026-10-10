@@ -9,6 +9,7 @@ import hashlib
 import json
 import threading
 import time
+from collections import OrderedDict
 
 try:
     from shard.service_queue import ServiceQueue, AdmissionError, JobCancelled, JobExpired
@@ -37,13 +38,54 @@ class RingRouter:
         return self.pool.models()
 
 
+class SessionAffinity:
+    """Tenant/cohort scoped, bounded hints for *new* ring admissions."""
+    def __init__(self, *, max_entries=1024, ttl_s=300.0, clock=time.monotonic):
+        import math
+        if type(max_entries) is not int or max_entries < 1 or type(ttl_s) not in (int, float) or not math.isfinite(ttl_s) or ttl_s <= 0:
+            raise ValueError("bounded affinity capacity and finite positive TTL required")
+        self.max_entries, self.ttl_s, self.clock = max_entries, ttl_s, clock
+        self._entries, self._lock = OrderedDict(), threading.RLock()
+
+    def _prune(self):
+        for key, (_, expires) in tuple(self._entries.items()):
+            if self.clock() >= expires:
+                self._entries.pop(key)
+
+    def preferred(self, tenant, cohort_id, session_id):
+        with self._lock:
+            self._prune()
+            key = (tenant, cohort_id, session_id)
+            value = self._entries.get(key)
+            if value is None:
+                return None
+            self._entries.move_to_end(key)
+            return value[0]
+
+    def remember(self, tenant, cohort_id, session_id, ring_id):
+        if not all(isinstance(v, str) and v for v in (tenant, cohort_id, session_id, ring_id)):
+            raise ValueError("complete affinity identity required")
+        with self._lock:
+            self._prune()
+            key = (tenant, cohort_id, session_id)
+            self._entries[key] = (ring_id, self.clock() + self.ttl_s)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+
+
 class MultiRingQueue(ServiceQueue):
     """Shares quota/idempotency/history globally; serial execution is per ring."""
-    def __init__(self, router, tenants, **options):
+    def __init__(self, router, tenants, *, session_affinity=False, affinity_max_entries=1024,
+                 affinity_ttl_s=300.0, **options):
+        if type(session_affinity) is not bool:
+            raise ValueError("session_affinity must be an explicit boolean")
         super().__init__(router, tenants, **options)
         self.router = router
         self._ring_workers = {}
         self._running_by_ring = {}
+        self._session_affinity = (SessionAffinity(max_entries=affinity_max_entries, ttl_s=affinity_ttl_s,
+            clock=self.clock) if session_affinity else None)
 
     def start(self):
         with self._condition:
@@ -94,6 +136,9 @@ class MultiRingQueue(ServiceQueue):
                 return job, False
             model = request.get("model", self.router.model_id)
             cohort, region = request.get("shard_cohort"), request.get("shard_region")
+            session_id = request.get("shard_session_id")
+            if session_id is not None and (not isinstance(session_id, str) or not 1 <= len(session_id) <= 128):
+                raise AdmissionError("session id must have 1..128 characters", status=400, code="invalid_request_error")
             if not isinstance(model, str) or (cohort is not None and not isinstance(cohort, str)) or (
                     region is not None and (not isinstance(region, str) or not region)):
                 raise AdmissionError("invalid model/cohort/region", status=400, code="invalid_request_error")
@@ -102,12 +147,18 @@ class MultiRingQueue(ServiceQueue):
                 maximum = request.get("max_tokens", request.get("max_completion_tokens", 512))
                 if type(maximum) is not int or not 1 <= maximum <= 4096:
                     raise AdmissionError("invalid completion token budget", status=400, code="invalid_request_error")
-                binding = self.router.pool.acquire(model_id, cohort_id, estimated_tokens=maximum, region=region)
+                preference = (self._session_affinity.preferred(tenant, cohort_id, session_id)
+                    if self._session_affinity is not None and session_id is not None else None)
+                acquire_options = {"estimated_tokens": maximum, "region": region}
+                if preference is not None:
+                    acquire_options["preferred_ring_id"] = preference
+                binding = self.router.pool.acquire(model_id, cohort_id, **acquire_options)
             except RingUnavailable as error:
                 raise AdmissionError(str(error), status=503, code="no_ready_ring") from error
             try:
                 prepared_body = dict(request, model=model_id)
                 prepared_body.pop("shard_cohort", None); prepared_body.pop("shard_region", None)
+                prepared_body.pop("shard_session_id", None)
                 payload, count, maximum, timeout_s = binding.backend.prepare(prepared_body)
                 self.router.pool.update_estimate(binding, count + maximum)
                 job, fresh = super().submit(tenant, payload, prompt_tokens=count, max_new=maximum,
@@ -119,6 +170,9 @@ class MultiRingQueue(ServiceQueue):
                 job.served_cohort = cohort_id
                 job.bound_backend = binding.backend
                 job.request_fingerprint = raw_fingerprint
+                job.conversation_session_id = session_id
+                if self._session_affinity is not None and session_id is not None:
+                    self._session_affinity.remember(tenant, cohort_id, session_id, binding.ring.ring_id)
                 self._condition.notify_all()
                 return job, fresh
             except Exception:

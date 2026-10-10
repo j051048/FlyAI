@@ -105,7 +105,11 @@ class Gateway:
     def __init__(self, backend=None, auth=None, *, ring_pool=None, default_model=None,
                  max_queue=32, max_queued_tokens=131072,
                  max_connections=64, max_body=1048576, request_timeout=15.0, write_timeout=15.0,
-                 allow_unverified_start=False):
+                 allow_unverified_start=False, session_affinity=False):
+        if type(session_affinity) is not bool:
+            raise ValueError("session_affinity must be boolean")
+        if session_affinity and ring_pool is None:
+            raise ValueError("session affinity requires a ring pool")
         if ring_pool is not None:
             if backend is not None:
                 raise ValueError("provide a single backend or a ring_pool")
@@ -127,7 +131,8 @@ class Gateway:
         self.max_connections, self.max_body = max_connections, max_body
         self.request_timeout, self.write_timeout = request_timeout, write_timeout
         queue_cls = MultiRingQueue if ring_pool is not None else ServiceQueue
-        self.jobs = queue_cls(backend, auth.limits, max_queue=max_queue, max_queued_tokens=max_queued_tokens)
+        queue_options = {"session_affinity": session_affinity} if ring_pool is not None else {}
+        self.jobs = queue_cls(backend, auth.limits, max_queue=max_queue, max_queued_tokens=max_queued_tokens, **queue_options)
         self.jobs.start()
 
     def submit(self, tenant, body, *, idempotency_key=None):

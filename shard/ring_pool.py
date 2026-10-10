@@ -389,7 +389,9 @@ class RingPool:
                 return model, next(iter(cohorts))
             raise RingUnavailable("model requires a known unambiguous cohort or ready alias")
 
-    def acquire(self, model_id, cohort_id, *, estimated_tokens, region=None):
+    def acquire(self, model_id, cohort_id, *, estimated_tokens, region=None, preferred_ring_id=None):
+        if preferred_ring_id is not None and (not isinstance(preferred_ring_id, str) or not preferred_ring_id):
+            raise ValueError("preferred_ring_id must be a nonempty ring identity")
         with self._lock:
             if not self._accepting:
                 raise RingUnavailable("ring pool is draining")
@@ -399,8 +401,11 @@ class RingPool:
                 raise RingUnavailable("no READY leased ring for this model cohort")
             # Region is a preference, not an invented RTT. Compare estimated work
             # within the closest declared region; unknown/cross-region is fallback.
+            preferred = [r for r in candidates if r.ring_id == preferred_ring_id]
             local = [r for r in candidates if region is not None and r.region == region]
-            candidates = local or candidates
+            # Affinity is an admission preference under current cohort/lease
+            # checks. It never revives a draining ring or redirects a held job.
+            candidates = preferred or local or candidates
             ring = min(candidates, key=lambda r: (r.reserved_seconds + estimated_tokens * r.seconds_per_token,
                                                  r.bound_jobs, r.ring_id))
             cost = estimated_tokens * ring.seconds_per_token

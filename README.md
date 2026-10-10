@@ -4,7 +4,7 @@
 
 ## 当前版本（中文）
 
-文档核对日期：**2026-10-08**；本轮基于 [a6e96e3](https://github.com/j051048/FlyAI/commit/a6e96e36831d2d0a705be994515b5c5f6b275e0a)，包含本地权重准备与换环改造。
+文档核对日期：**2026-10-09**；本轮基于 [a99cb3c](https://github.com/j051048/FlyAI/commit/a99cb3c2274042d48373cf2abb09c518447843cf)，增加默认关闭的投机控制、全环状态缓存和有界专家预填充流水。
 FlyAI 基于 Shard 的分布式推理框架演进。上游项目为 [leyten/shard](https://github.com/leyten/shard)，
 其 c0mpute 集成背景和历史实验保留在仓库记录中。
 
@@ -23,10 +23,13 @@ GPU 身份、共享 RAM／锁页预算和实际链路决定放置。节点注册
 | GPT-OSS 服务 | 原 `specpipe` 运行时接入签名会话、认证 HTTP/SSE、租户队列和多环 | 当前生产适配器为 greedy text chat；单环一个串行 worker |
 | V4 服务 | DSpark、可选本地专家 RAM／GPU 缓存、受控预取、KV 工作区、查询分块预填充 | 每项优化有数值／资源门控；新增路径 GPU 速度线待验收 |
 | V4 权重准备 | 有界 HF 流式转换、按层/角色分发、局部分片完整哈希、磁盘/RAM 准备租约和原子发布 | 配置准备源后自动执行；只支持已声明的原 V4-Flash native ABI，真实集群仍须验收 |
+| V4 状态优化 | 请求边界选择校准投机配方、签名全环恢复、保序专家预填充 DMA 流水 | 默认关闭；完全相同前缀可复用，扩展前缀每请求完整参考预填充验证；GPU 收益待实测 |
 | 多环与恢复 | 多环并行、版本绑定、取消／期限、原请求重放和前缀核对 | 持续批处理、持久协调器 HA 和跨节点专家副本未作为生产能力提供 |
 | 收据 | 实际激活字节承诺、签名、nonce、层覆盖和相邻链核对 | 收据不是完整模型诚实计算的密码学证明；计算节点可见其处理的激活 |
 
-最近一轮相关 CPU／socket／HTTP 回归：**1620 通过、3 项环境条件跳过**；41 项 GPU 标记用例未纳入本轮。
+最近一轮相关 CPU／socket／HTTP 回归：**1839 通过、3 项环境条件跳过**；44 项 GPU 标记用例未纳入本轮。
+缓存遍历器收尾修正后，另跑相关专项回归：**137 通过**，4 项 GPU 标记用例未执行；两组结果不相加。
+新增两项 CUDA 缓存／图指针用例在本机因无 CUDA 条件跳过，不算 GPU 验收。
 这是所选回归集的结果，真实 MXFP4 GPU 执行和新增 V4 四卡／六卡持续性能需要集群重测。
 
 ### 使用当前入口
@@ -35,6 +38,7 @@ GPU 身份、共享 RAM／锁页预算和实际链路决定放置。节点注册
 * 开放注册、租约、精确校准和多环生命周期：[OPEN_INFERENCE_NETWORK](docs/OPEN_INFERENCE_NETWORK.md)。
 * V4 严格生产组环：[V4_CLUSTER_DEPLOY_GUIDE](docs/V4_CLUSTER_DEPLOY_GUIDE.md)。
 * V4 自检、strict SSH 部署与性能复测：[V4_OPERATIONS](docs/V4_OPERATIONS.md)。
+* 三项可选状态优化、配置与验证边界：[V4_STATEFUL_OPTIMIZATIONS](docs/V4_STATEFUL_OPTIMIZATIONS.md)。
 * 小磁盘节点、流式分片与请求边界换环：[WEIGHT_PREPARATION](docs/WEIGHT_PREPARATION.md)。
 * V4 固定速度线与原始证据：[V4_BENCHMARK](docs/V4_BENCHMARK.md)。
 * 全部当前规范、研究与历史记录：[DOCUMENTATION_INDEX](docs/DOCUMENTATION_INDEX.md)。
@@ -88,7 +92,7 @@ V4 新增路径继续以 **4×5090 ≥40、6×5090 ≥30 valid output tok/s**、
 
 ## Current version (English)
 
-Documentation reviewed **2026-10-08**, based on [a6e96e3](https://github.com/j051048/FlyAI/commit/a6e96e36831d2d0a705be994515b5c5f6b275e0a) plus the local artifact-preparation/replacement and P0–P2 operations changes.
+Documentation reviewed **2026-10-09**, based on [a99cb3c](https://github.com/j051048/FlyAI/commit/a99cb3c2274042d48373cf2abb09c518447843cf) plus opt-in request policy, full-ring state snapshots and bounded expert-prefill pipelining.
 FlyAI evolves the Shard inference framework. The [upstream repository](https://github.com/leyten/shard),
 c0mpute integration history and dated experiments remain attributed in the documentation.
 
@@ -106,6 +110,10 @@ constitute a cryptographic proof of honest model execution or conceal activation
 
 GPT-OSS retains its existing `phase0/specpipe.py` runtime with a new `engines/gpt_oss/` serving adapter.
 V4 retains its dedicated engine, DSpark and gated optional local RAM/expert-cache/KV optimizations.
+The [stateful optimizations](docs/V4_STATEFUL_OPTIMIZATIONS.md) select approved recipes at request boundaries,
+restore exact-repeat prefixes through signed all-stage barriers, and pipeline bounded local expert DMA.
+Extended-prefix reuse requires a full-prefill reference shadow for each request; this path does not claim
+a general multi-turn speedup. All three features remain disabled by default pending GPU acceptance.
 V4 native artifacts now have packing-independent model identity, bounded HF conversion, verified
 per-stage acquisition, shared disk/RAM preparation reservations and atomic publication. Configured
 same-cohort alternatives can replace failed rings at request boundaries; existing jobs retain their bindings.
@@ -121,7 +129,9 @@ model content identities, calibrated local stage templates and configured infere
 legacy CLI modes retain older experiments. Public control/HTTP listeners require TLS, while existing
 sidecars own peer transport and NAT handling.
 
-The latest selected CPU/socket/HTTP regression set passed **1620 tests with 3 environment-dependent skips**; 41 GPU-marked cases were deselected.
+The latest selected CPU/socket/HTTP regression set passed **1839 tests with 3 environment-dependent skips**; 44 GPU-marked cases were deselected.
+After the final bounded-iterator correction, **137 targeted tests passed**, with 4 GPU-marked cases deselected; these overlapping suites are not additive.
+Two additional CUDA cache/graph-pointer gates were conditionally skipped on this CPU-only runtime.
 This is local implementation evidence. Historical GPU numbers above retain their original workload,
 recipe and timing scope. Actual native MXFP4 GPU execution and new V4 four-card >=40 / six-card >=30 tok/s
 acceptance still require live cluster verification. Fixed-K adaptive depth is available; mixed-K experiments

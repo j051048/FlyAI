@@ -1,6 +1,6 @@
 # 当前文档导航与历史证据
 
-核对日期：2026-10-08；实现基线：`a6e96e3` 加本地权重准备/换环及 P0–P2 运行改造。本页区分操作合同、接口规范、
+核对日期：2026-10-09；当前工作区含权重准备/换环、P0–P2 运行改造及默认关闭的请求边界状态优化。本页区分操作合同、接口规范、
 有日期的实验记录和参考实现来源。历史性能数字按原实验条件保留；新版计时、
 会话或资源合同需要新的原始运行证据。
 
@@ -12,6 +12,7 @@
 | 部署 GPT-OSS、下载校验、严格会话与重测 | [GPT_OSS_PRODUCTION](GPT_OSS_PRODUCTION.md) |
 | 部署 V4 严格服务 | [V4_CLUSTER_DEPLOY_GUIDE](V4_CLUSTER_DEPLOY_GUIDE.md)、[V4_GATEWAY](V4_GATEWAY.md) |
 | V4 运行自检、strict SSH 部署、健康诊断和单变量复测 | [V4_OPERATIONS](V4_OPERATIONS.md) |
+| V4 有限投机配方、exact-repeat/shadow 状态缓存与有界专家 DMA 流水 | [V4_STATEFUL_OPTIMIZATIONS](V4_STATEFUL_OPTIMIZATIONS.md) |
 | 小磁盘节点、流式转换、权重准备与请求边界换环 | [WEIGHT_PREPARATION](WEIGHT_PREPARATION.md) |
 | 任意节点注册、区域组环、租约与多环 | [OPEN_INFERENCE_NETWORK](OPEN_INFERENCE_NETWORK.md) |
 | 资源准入与部署检查 | [RESOURCE_CONTRACT](RESOURCE_CONTRACT.md)、[DEPLOY_READINESS](DEPLOY_READINESS.md) |
@@ -25,9 +26,9 @@
 仍在 `phase0/specpipe.py`。V4 旧 `v4_gateway.py` 单环／静态环池入口和旧实验
 CLI 有各自兼容合同，不能仅更换命令名称就认为已经启用严格会话。
 
-本轮选定 CPU/socket/HTTP 回归为 1620 通过、3 项环境条件跳过，41 项 GPU 标记未选入。
-新增代码的 GPU 吞吐与长时间稳定性仍需实测。V4 四卡 >=40、六卡 >=30 valid
-output tok/s 仍是固定验收目标；`v4_acceptance.py` 的模拟结果不通过该硬件门槛。
+有日期的 CPU/socket/HTTP 验证属于各自选定范围，不能合并为当前全仓 CI 或 GPU 证据。
+新增代码的 CUDA 正确性、吞吐与长时间稳定性仍需实测。V4 四卡 >=40、六卡 >=30 committed
+decode tok/s 仍是固定验收目标；`v4_acceptance.py` 的模拟结果不通过该硬件门槛。
 
 ## 当前规范与操作指南
 
@@ -51,6 +52,7 @@ output tok/s 仍是固定验收目标；`v4_acceptance.py` 的模拟结果不通
 | [GPT_OSS_PRODUCTION](GPT_OSS_PRODUCTION.md) | GPT-OSS 严格部署、下载、测量和投机调优 |
 | [V4_CLUSTER_DEPLOY_GUIDE](V4_CLUSTER_DEPLOY_GUIDE.md) | V4 当前操作步骤 |
 | [V4_OPERATIONS](V4_OPERATIONS.md) | 共享运行初始化、caller-local 隧道、签名运行观察及独立链路探测 |
+| [V4_STATEFUL_OPTIMIZATIONS](V4_STATEFUL_OPTIMIZATIONS.md) | 默认关闭的有限请求配方、完整前缀状态缓存/shadow、专家搬运 FIFO 及证据范围 |
 | [V4_GATEWAY](V4_GATEWAY.md) | HTTP/SSE、租户/模型路由、不同入口合同 |
 | [V4_BENCHMARK](V4_BENCHMARK.md) | 固定协议、原始证据和 GPU 速度线 |
 | [V4_NEXT_PHASE](V4_NEXT_PHASE.md) | 当前 V4 集成与下一阶段验证 |

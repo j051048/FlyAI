@@ -51,6 +51,8 @@ def validate_runtime_observation(value):
         "graph_mode", "wire_mode", "transport", "versions", "phase"}
     if isinstance(value, dict) and "backend_identity" in value:
         keys.add("backend_identity")
+    if isinstance(value, dict) and "optimizations" in value:
+        keys.add("optimizations")
     if not isinstance(value, dict) or set(value) != keys or value.get("schema") != SCHEMA:
         raise ValueError("unknown runtime observation schema/fields")
     for name in ("node_id", "process_run_id", "kernel_backend", "hadamard_backend", "graph_mode", "wire_mode", "transport"):
@@ -121,5 +123,11 @@ def validate_runtime_observation(value):
         if value[field] != digest(body):
             raise ValueError(f"runtime observation {field} does not match its payload")
     # Reject non-JSON content and detach all caller-owned dictionaries before signing.
+    if "optimizations" in value:
+        optimizations = value["optimizations"]
+        if not isinstance(optimizations, dict) or set(optimizations) != {"prefill_expert_pipeline", "conversation_cache"}:
+            raise ValueError("unknown runtime optimization observations")
+        if any(not isinstance(item, dict) for item in optimizations.values()) or len(json.dumps(optimizations, allow_nan=False)) > 65536:
+            raise ValueError("bounded JSON runtime optimization observations required")
     json.dumps(value, allow_nan=False)
     return deepcopy(value)

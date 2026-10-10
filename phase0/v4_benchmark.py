@@ -47,6 +47,9 @@ CONTEXT = "Reference note: measure the actual result, preserve the inputs, and r
 # An explicit baseline recipe, not the engine's mutable implicit defaults. Operators must launch
 # their stages with these same values; --env-file can freeze a DIFFERENT experiment recipe.
 DEFAULT_ENV = {
+    "V4_PREFILL_EXPERT_PIPELINE": "0", "V4_PREFILL_EXPERT_DEPTH": "2", "V4_PREFILL_EXPERT_BATCH": "0",
+    "V4_CONVERSATION_CACHE_MIB": "0", "V4_CONVERSATION_CACHE_GPU_MIB": "0",
+    "V4_CONVERSATION_CACHE_ENTRIES": "4", "V4_CONVERSATION_CACHE_TTL_S": "300",
     "V4_KERNELS": "tilelang", "V4_DTYPE": "bfloat16", "V4_MAX_SEQ": "8192",
     "V4_HADAMARD": "auto",
     "V4_MAX_BATCH": "1", "V4_CUDA_GRAPH": "whole", "V4_GRAPH_MAX": "192",
@@ -458,7 +461,7 @@ def runtime_observation_errors(observation, node, protocol):
                            "vendor/deepseek_v4_ref/inference/model.py", "shard/pipeline_session.py", "shard/transport.py"}
         required_source |= {path for path in expected if path.startswith(("engines/deepseek_v4/v4_", "vendor/deepseek_v4_ref/"))
                             or path in {"shard/"+name+".py" for name in (
-                                "receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport")}}
+                                "receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport", "speculation_policy")}}
         if not required_source <= set(value["source_files"]):
             errors.append("observed source inventory omits core executed stage/protocol modules")
         if any(expected.get(path) != sha for path, sha in value["source_files"].items()):

@@ -436,6 +436,15 @@ def runtime_config_payload(stage):
                                 "cuda": getattr(getattr(torch_module, "version", None), "cuda", None)}
     from v4_runtime_init import hadamard_identity
     body["hadamard"] = hadamard_identity()
+    from v4_conversation_protocol import cache_config
+    body["conversation_cache"] = cache_config(stage)
+    body["prefill_expert_pipeline"] = (stage.prefill_pipeline_config() if hasattr(stage, "prefill_pipeline_config")
+                                        else {"enabled": False})
+    body["spec_depth"] = int(getattr(stage, "_spec_depth", 16))
+    drafter = getattr(stage, "_resource_drafter", None) or getattr(stage, "_runtime_draft", None)
+    tail = getattr(drafter, "tail", drafter)
+    body["dspark_loaded"] = tail is not None
+    body["dspark_block_size"] = getattr(tail, "block_size", None)
     # A calibration cannot silently survive an engine implementation change.
     directory = Path(__file__).resolve().parent
     body["engine_source_sha256"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -482,8 +491,16 @@ def placement_requirements_for_stage(stage, calibration=None, checkpoint_dir=Non
                    report["allocator"]["reserved_bytes"])
     if requirements.gpu.peak_bytes < observed:
         raise ResourceError("calibration budget is below actual GPU module/process allocator storage")
-    if requirements.host.peak_bytes < report["module_storage"]["host_bytes"]:
+    cache = report.get("conversation_cache_reservation")
+    if cache is None:
+        from v4_conversation_protocol import cache_config
+        if cache_config(stage)["enabled"]:
+            raise ResourceError("enabled conversation caching needs measured snapshot reservation evidence")
+        cache = {"remaining_host_reserved_bytes": 0, "restore_gpu_reserved_bytes": 0}
+    if requirements.host.peak_bytes < report["module_storage"]["host_bytes"] + cache["remaining_host_reserved_bytes"]:
         raise ResourceError("calibration budget is below actual host tensor storage")
+    if requirements.gpu.peak_bytes < observed + cache["restore_gpu_reserved_bytes"]:
+        raise ResourceError("calibration GPU budget omits the declared conversation restore reserve")
     if requirements.host.pinned_bytes < report["module_storage"]["host_pinned_bytes"]:
         raise ResourceError("calibration budget is below actual pinned host tensor storage")
     return requirements
@@ -572,8 +589,21 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
         tail = getattr(draft, "tail", draft)
         for key, value in vars(tail).items():
             walk_state(f"draft.{key}", value)
+    conversation = getattr(stage, "_conversation_cache", None)
+    if conversation is not None:
+        for name, tensor in conversation.snapshot_tensors():
+            record(f"conversation_cache.{name}", tensor, "conversation_cache")
     gpu_bytes = sum(entry["storage_bytes"] for entry in entries if entry["device"].startswith("cuda"))
     host_bytes = sum(entry["storage_bytes"] for entry in entries if entry["device"] == "cpu")
+    from v4_conversation_protocol import cache_config
+    declared_cache = cache_config(stage)
+    cached_host = sum(entry["storage_bytes"] for entry in entries
+                      if entry["kind"] == "conversation_cache" and entry["device"] == "cpu")
+    conversation_reserve = {"host_reserved_bytes": declared_cache["host_reserved_bytes"],
+        "remaining_host_reserved_bytes": max(0, declared_cache["host_reserved_bytes"] - cached_host),
+        "restore_gpu_reserved_bytes": declared_cache["restore_gpu_reserved_bytes"]}
+    conversation_reserve["hash_workspace"] = (conversation.hash_workspace_reservation()
+        if conversation is not None and hasattr(conversation, "hash_workspace_reservation") else None)
     totals = {}
     for entry in entries:
         key = ("gpu_" if entry["device"].startswith("cuda") else "host_") + entry["kind"] + "_bytes"
@@ -606,6 +636,8 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
             "module_storage": {"gpu_bytes": gpu_bytes, "host_bytes": host_bytes,
                                "host_pinned_bytes": sum(entry["storage_bytes"] for entry in entries if entry["pinned"]),
                                "by_kind": totals, "storages": entries},
+            "conversation_cache_reservation": conversation_reserve,
+            "prefill_expert_pipeline": stage.prefill_pipeline_status() if hasattr(stage, "prefill_pipeline_status") else None,
             "allocator": allocator,
             "unattributed_components": {"graph_bytes": None, "workspace_bytes": None,
                                          "activation_bytes": None, "cuda_context_bytes": None},
@@ -645,6 +677,7 @@ def measure_checkpoint(checkpoint_dir, lo, hi, *, head=False, tail=False, dspark
         if dspark:
             ring_drafter = _load_engine_module("v4_dspark_draft").ring_drafter
             drafter = ring_drafter(stage, str(Path(checkpoint_dir).resolve()))
+            stage.observe_runtime_drafter(drafter)
         torch.cuda.synchronize(device)
         load_stats = {"peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
                       "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
