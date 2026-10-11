@@ -11,6 +11,7 @@ import socket
 import ssl
 import threading
 import time
+from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -35,8 +36,10 @@ def _finite_json_float(value):
     return number
 try:
     from shard.service_queue import ServiceQueue, TenantLimits, AdmissionError, JobCancelled, JobExpired
+    from shard.job_journal import JournalError, JournalOwnerLost
 except ImportError:
     from service_queue import ServiceQueue, TenantLimits, AdmissionError, JobCancelled, JobExpired
+    from service_queue import JournalError, JournalOwnerLost
 
 class AuthRegistry:
     def __init__(self, keys, limits):
@@ -105,11 +108,14 @@ class Gateway:
     def __init__(self, backend=None, auth=None, *, ring_pool=None, default_model=None,
                  max_queue=32, max_queued_tokens=131072,
                  max_connections=64, max_body=1048576, request_timeout=15.0, write_timeout=15.0,
-                 allow_unverified_start=False, session_affinity=False):
+                 allow_unverified_start=False, session_affinity=False, job_journal=None,
+                 journal_owner_ttl_s=30.0, batching=None, scheduling=None):
         if type(session_affinity) is not bool:
             raise ValueError("session_affinity must be boolean")
         if session_affinity and ring_pool is None:
             raise ValueError("session affinity requires a ring pool")
+        if ring_pool is None and (batching is not None or scheduling is not None):
+            raise ValueError("token batching/scheduling requires a ring pool")
         if ring_pool is not None:
             if backend is not None:
                 raise ValueError("provide a single backend or a ring_pool")
@@ -130,8 +136,15 @@ class Gateway:
             raise ValueError("HTTP read/write timeouts must be finite and positive")
         self.max_connections, self.max_body = max_connections, max_body
         self.request_timeout, self.write_timeout = request_timeout, write_timeout
+        if job_journal is not None:
+            # Publishing briefly holds the durable owner lock. A slow client must
+            # not hold it across renewal/expiry or monopolize all token commits.
+            self.write_timeout = min(write_timeout, journal_owner_ttl_s / 6,
+                                     job_journal.busy_timeout_s / 2)
         queue_cls = MultiRingQueue if ring_pool is not None else ServiceQueue
-        queue_options = {"session_affinity": session_affinity} if ring_pool is not None else {}
+        queue_options = {"session_affinity": session_affinity, "batching": batching,
+                         "scheduling": scheduling} if ring_pool is not None else {}
+        queue_options.update(journal=job_journal, journal_owner_ttl_s=journal_owner_ttl_s)
         self.jobs = queue_cls(backend, auth.limits, max_queue=max_queue, max_queued_tokens=max_queued_tokens, **queue_options)
         self.jobs.start()
 
@@ -145,8 +158,8 @@ class Gateway:
     def server(self, host="127.0.0.1", port=0):
         return _BoundedServer((host, port), Handler, self)
 
-    def shutdown(self, *, drain=False, timeout=10.0):
-        return self.jobs.shutdown(drain=drain, timeout=timeout)
+    def shutdown(self, *, drain=False, timeout=10.0, preserve_pending=False):
+        return self.jobs.shutdown(drain=drain, timeout=timeout, preserve_pending=preserve_pending)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -166,11 +179,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, value, status=200):
         data = json.dumps(value, ensure_ascii=False, allow_nan=False).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers(); self.wfile.write(data)
+        try:
+            with self._publish_guard():
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers(); self.wfile.write(data)
+        except JournalOwnerLost:
+            self.close_connection = True
+
+    def _publish_guard(self, job=None):
+        job = job or getattr(self, "_response_job", None)
+        if job is not None:
+            return job.publish_guard()
+        queue = self.gateway.jobs
+        return queue.publish_guard()
 
     def _error(self, message, status=400, code="invalid_request_error"):
         self._json({"error": {"message": message, "type": code, "code": code}}, status)
@@ -203,8 +227,10 @@ class Handler(BaseHTTPRequestHandler):
                 job = self.gateway.jobs.get(tenant, path[len("/v1/jobs/"):-len("/receipts")])
                 if job is None:
                     return self._error("job not found", 404, "not_found")
+                self._response_job = job
                 return self._json(job.result["proof"]) if job.state == "completed" else self._error("job is not settled", 409, "not_settled")
             job = self.gateway.jobs.get(tenant, path[len("/v1/jobs/"):])
+            self._response_job = job
             return self._json(job.snapshot()) if job is not None else self._error("job not found", 404, "not_found")
         self._error("not found", 404, "not_found")
 
@@ -239,11 +265,15 @@ class Handler(BaseHTTPRequestHandler):
             job, _ = self.gateway.submit(tenant, body, idempotency_key=self.headers.get("Idempotency-Key"))
         except AdmissionError as error:
             return self._error(str(error), error.status, error.code)
+        except JournalError:
+            self.close_connection = True
+            return
         except (OSError, ValueError, TypeError, RecursionError):
             self.close_connection = True
             return self._error("invalid or incomplete request body", 400, "invalid_request_error")
         with job.changed:
             job.clients += 1
+        self._response_job = job
         try:
             if body.get("stream", False):
                 return self._stream(job)
@@ -263,12 +293,16 @@ class Handler(BaseHTTPRequestHandler):
                 "usage": self._usage(job), "shard": {"proof_verified": result["proof"]["verified"],
                     "proof_scope": result["proof"]["scope"], "recovery": result["recovery"],
                     **({"route": result["route"]} if "route" in result else {})}})
-        except (OSError, ValueError):
+        except (OSError, ValueError, JournalError):
             self.close_connection = True
         finally:
             with job.changed:
                 job.clients -= 1
-            self.gateway.jobs.cancel_if_unobserved(tenant, job.id)
+            try:
+                if not getattr(self, "_keep_recovery_pending", False):
+                    self.gateway.jobs.cancel_if_unobserved(tenant, job.id)
+            except JournalOwnerLost:
+                self.close_connection = True
 
     def _client_gone(self):
         if isinstance(self.connection, ssl.SSLSocket):
@@ -287,9 +321,17 @@ class Handler(BaseHTTPRequestHandler):
         return getattr(job, "served_model", self.gateway.backend.model_id)
 
     def _job_decode(self, job, tokens):
-        return getattr(job, "bound_backend", self.gateway.backend).decode(tokens)
+        backend = getattr(job, "bound_backend", self.gateway.backend)
+        if not callable(getattr(backend, "decode", None)):
+            raise ValueError("the original cohort tokenizer is unavailable")
+        return backend.decode(tokens)
 
     def _stream(self, job):
+        self._response_job = job
+        backend = getattr(job, "bound_backend", self.gateway.backend)
+        if not callable(getattr(backend, "decode", None)):
+            self._keep_recovery_pending = job.state == "recovering"
+            return self._error("the original cohort tokenizer is unavailable", 503, "cohort_decoder_unavailable")
         cursor = 0
         published_chars = 0
         last = self.headers.get("Last-Event-ID")
@@ -313,11 +355,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error("Last-Event-ID requires this job's token and published-character cursor", 409, "invalid_resume_cursor")
         published = self._job_decode(job, job.checkpoint()[:cursor])[:published_chars]
         self._published_chars = published_chars
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        self.end_headers(); self.close_connection = True
+        with self._publish_guard(job):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers(); self.close_connection = True
         self.connection.settimeout(self.gateway.write_timeout)
         self._chunk(job, {"role": "assistant"}, None, cursor)
         ping = time.monotonic()
@@ -348,7 +391,8 @@ class Handler(BaseHTTPRequestHandler):
             if self._client_gone():
                 return
             if time.monotonic() - ping >= 5:
-                self.wfile.write(b": keepalive\n\n"); self.wfile.flush(); ping = time.monotonic()
+                with self._publish_guard(job):
+                    self.wfile.write(b": keepalive\n\n"); self.wfile.flush(); ping = time.monotonic()
             with job.changed:
                 job.changed.wait(0.1)
 
@@ -360,4 +404,5 @@ class Handler(BaseHTTPRequestHandler):
     def _sse(self, data, cursor=None, job=None):
         prefix = f"id: {job.id}:{cursor}:{self._published_chars}\n" if job is not None else ""
         value = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, allow_nan=False)
-        self.wfile.write((prefix + "data: " + value + "\n\n").encode()); self.wfile.flush()
+        with self._publish_guard(job):
+            self.wfile.write((prefix + "data: " + value + "\n\n").encode()); self.wfile.flush()

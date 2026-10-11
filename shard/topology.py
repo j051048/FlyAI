@@ -518,7 +518,8 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 tail_floor=0, host_id=None, isolation="none", device_id=None,
                 host_layer_caps=None, host_memory_domain=None, tail_host_layer_caps=None,
                 node_layer_caps=None, tail_reserve_mb=0, objective="serial", cost_model=None,
-                hard_max_stages=None, allowed_spans=None, template_resources=None, template_cost_model=None):
+                hard_max_stages=None, allowed_spans=None, template_resources=None, template_cost_model=None,
+                ordering_costs=None):
     """The self-optimizer's pure core. From a candidate POOL, choose the subset + ring order +
     per-node layer split that MINIMIZES predicted request time, subject to:
       * VRAM feasibility — the chosen nodes must hold the whole model (+ KV),
@@ -725,17 +726,21 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 if a != b:
                     EL[a][b] = (1 + D) * L[a][b] + pf_a + D * dc_a
 
+    selection_scoring = False
     def _score(order, alloc, templates=None):
+        nonlocal selection_scoring
         if template_cost_model is not None and templates is not None:
             predicted = template_cost_model(order, alloc, templates)
+            selection_scoring = selection_scoring or "selection_score" in predicted
             step = predict_step_ms(order, alloc, L, c_out, c_in, layer_ms,
                                    up_mbps if aware else None, decode_bytes)
-            return predicted["predicted_request_ms"], step, 0.0
+            return predicted.get("selection_score", predicted["predicted_request_ms"]), step, 0.0
         if cost_model is not None:
             predicted = cost_model(order, alloc)
+            selection_scoring = selection_scoring or "selection_score" in predicted
             step = predict_step_ms(order, alloc, L, c_out, c_in, layer_ms,
                                    up_mbps if aware else None, decode_bytes)
-            return predicted["predicted_request_ms"], step, 0.0
+            return predicted.get("selection_score", predicted["predicted_request_ms"]), step, 0.0
         step = predict_step_ms(order, alloc, L, c_out, c_in, layer_ms,
                                up_mbps if aware else None, decode_bytes)
         if not aware:
@@ -829,7 +834,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         visit(0, [], {}, {}, {}, {}, {}, initial_width)
         if best is None and not truncated and initial_width < limit:
             visit(0, [], {}, {}, {}, {}, {}, limit)
-        if best is None:
+        if best is None or best[0] == INF or best[0] != best[0]:
             return None
         rank, order, alloc, chosen, step, pf = best
         spec = {"order": order, "blocks": {n: (chosen[n]["lo"], chosen[n]["hi"]) for n in order},
@@ -841,6 +846,9 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
             spec.update(request_ms=rank, prefill_ms=pf, roles={})
         if pin:
             spec["boundary"] = sorted(_boundary_nodes(order, alloc, n_layers, b_in, b_out))
+        if selection_scoring:
+            predicted=template_cost_model(order,alloc,chosen)
+            spec.update(selection_score=rank,request_ms=predicted["predicted_request_ms"])
         return spec
 
     def memory_limits(order):
@@ -914,7 +922,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         Exhaustive for ring-sized k (<=7 middles, 5040 orders); a heuristic single order above — rings
         are ~5-8 stages and the network funnels the pool to ~16 before calling, so the exhaustive path
         is the hot one and the k! is bounded; the fallback only guards a pathologically wide pool."""
-        Lm, om, im = (EL, Eout, Ein) if aware else (L, c_out, c_in)
+        Lm, om, im = ordering_costs if ordering_costs is not None else (EL, Eout, Ein) if aware else (L, c_out, c_in)
         heads = [require] if require is not None else [n for n in subset if n in trust]
         ends = {n for n in subset if n in trust}
         if k == 1:
@@ -969,7 +977,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                             break                                        # legacy latency-ordered first valid
                     continue
                 if isolation == "adjacent_host" or tail_host_layer_caps or tail_reserve_mb or cost_model is not None:
-                    matrices = (EL, Eout, Ein) if aware else (L, c_out, c_in)
+                    matrices = ordering_costs if ordering_costs is not None else (EL, Eout, Ein) if aware else (L, c_out, c_in)
                     # Tail reservations belong to its shared memory domain. Try
                     # another tail when the cheapest order cannot hold its pool;
                     # rejecting the whole subset would lose a valid deployment.
@@ -1014,7 +1022,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 rank, step, pf = _score(order, alloc)
                 if found is None or rank < found[0]:                     # ties: smaller k wins (k ascending, strict <)
                     found = (rank, order, alloc, k, step, pf)
-        return found
+        return found if found is not None and found[0] != INF and found[0] == found[0] else None
 
     # P1-4: Reject over-sharding. Restrict ring width to max_stages (default 6) unless model requires more.
     eff_max = max(k_min, int(max_stages) if max_stages is not None else 6)
@@ -1028,7 +1036,7 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         best = _search(kmax + 1, min(eff_max, len(usable)))      # -> widen up to eff_max first
     if best is None and eff_max < len(usable) and hard_max_stages is None:
         best = _search(eff_max + 1, len(usable))                 # ultimate fallback if pool truly needs wider ring
-    if best is None:
+    if best is None or best[0] == INF or best[0] != best[0]:
         return None
     rank, order, alloc, k, step, pf = best
     blocks, lo = {}, 0
@@ -1046,6 +1054,9 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         if relegate:
             spec["roles"] = _relegate(order, dropped, caps, subnet, up_mbps, layer_ms,
                                       trust if pin else None, {subnet[n] for n in b_nodes})
+    if selection_scoring:
+        predicted=cost_model(order,alloc)
+        spec.update(selection_score=rank,request_ms=predicted["predicted_request_ms"])
     return spec
 
 

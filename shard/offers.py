@@ -183,7 +183,7 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
         raise OfferError("unsupported or oversized offer")
     required = {"schema", "peer_id", "public_key", "node_id", "gpu_uuid", "memory_domain_id",
                 "endpoints", "resources", "models", "sequence", "issued_at", "ttl_s", "signature"}
-    allowed = required | {"region", "zone", "public_ip", "host_id", "lease_endpoint", "gpu_model"}
+    allowed = required | {"region", "zone", "public_ip", "host_id", "lease_endpoint", "gpu_model", "pricing", "failure_domains"}
     if not required <= set(body) or set(body) - allowed:
         raise OfferError("missing or unknown offer fields")
     _text(body["gpu_uuid"], "gpu_uuid")
@@ -191,6 +191,12 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
     for field in ("region", "zone", "public_ip", "host_id", "gpu_model", "lease_endpoint"):
         if body.get(field) is not None:
             _text(body[field], field, 2048)
+    try:
+        from .planning_cost import validate_pricing, validate_failure_domains
+        if body.get("pricing") is not None:validate_pricing(body["pricing"])
+        if body.get("failure_domains") is not None:validate_failure_domains(body["failure_domains"])
+    except (ValueError,TypeError) as error:
+        raise OfferError("invalid signed pricing/failure-domain metadata") from error
     if type(body["sequence"]) is not int or body["sequence"] < 1:
         raise OfferError("positive sequence required")
     stamp, ttl = _number(body["issued_at"], "issued_at"), _number(body["ttl_s"], "ttl_s", positive=True)
@@ -470,6 +476,8 @@ class OfferRegistry:
                               "pinnable_ram_mb": mib("pinnable_ram_bytes"),
                               "offer_sequence": offer["sequence"], "offer_expires_at": offer["issued_at"] + offer["ttl_s"],
                               "measurement_source": "signed_operator_report", "hardware_attested": False, **templates})
+                if offer.get("pricing") is not None:nodes[-1]["pricing"]=copy.deepcopy(offer["pricing"])
+                if offer.get("failure_domains") is not None:nodes[-1]["failure_domains"]=copy.deepcopy(offer["failure_domains"])
         return nodes
 
     def get(self, node_id):

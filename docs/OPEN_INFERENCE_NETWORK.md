@@ -1,6 +1,6 @@
 # Open inference network implementation
 
-Code audit: **2026-10-08, `c2ab623`**. Control/service contracts are distinct from
+Code audit: **2026-10-11, current working tree**. Control/service contracts are distinct from
 GPU throughput acceptance and remote hardware attestation.
 
 FlyAI accepts GPU contributors without an operator allowlist. Registration,
@@ -8,6 +8,13 @@ model execution eligibility, transport authentication and request privacy are
 separate contracts. Distinct colocated GPUs are permitted. Public IP is
 informational; region labels guide search and measured effective data channels
 constrain placement.
+
+Optional SLO planning, private owner-fenced job recovery, shortest-job aging,
+qualified token-step scheduling and pinned replay-auditor feedback are described
+in [V4_SERVICE_HARDENING](V4_SERVICE_HARDENING.md). Native V4/GPT-OSS still execute
+serially per ring; enabling token batching requires an actual independent-state
+backend and verified warmup contract. A private SQLite journal recovers original
+requests and prefixes; it is not cross-host consensus or transparent KV migration.
 
 ## Implemented components
 

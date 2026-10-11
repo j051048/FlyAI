@@ -29,6 +29,7 @@ from shard.service_queue import AdmissionError, Job
 
 class GPTOSSRingBackend:
     """Serialized greedy requests with original-prompt replay and complete receipts."""
+    supports_prefix_replay = True
     service_name = "gpt-oss-inference-gateway"
 
     def __init__(self, directory, plan, *, tokenizer=None, runtime=None, K=4, depth=2,
@@ -364,7 +365,7 @@ def main(argv=None):
     try:
         service.form_all()
         gateway = Gateway(auth=AuthRegistry.from_file(args.auth_file), ring_pool=service.pool,
-                          default_model=service.config.get("default_model"))
+                          default_model=service.config.get("default_model"), **service.gateway_options())
         server = gateway.server(args.host, args.port)
         if args.tls_cert:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

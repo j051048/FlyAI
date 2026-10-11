@@ -371,6 +371,7 @@ class ConversationRequest:
         self.eos_ids = set()
         self.shadow = None
         self.cancel_check = None
+        self.restore_binding = None
         self.record = {"enabled": enabled, "hit": False, "mode": "exact_repeat", "reason": "disabled" if not enabled else "miss"}
 
     def bind_tokens(self, prompt_ids, *, eos_ids=()):
@@ -426,6 +427,7 @@ class ConversationRequest:
             self.cancel_check()
 
     def after_reset(self, pipe, ret, send, recv, message):
+        self.restore_binding = None
         if not self.enabled:
             return
         self.job = {k: message[k] for k in ("job_id", "nonce", "swarm_id")}
@@ -460,6 +462,18 @@ class ConversationRequest:
                 reply = rows[-1]["tail_reply"]
                 if not isinstance(reply, dict) or "token" not in reply:
                     raise ValueError("cached prompt has no bound tail result")
+                cfg = pipe.config
+                stages = []
+                for row in rows:
+                    digest = row.get("state_digest")
+                    if (not isinstance(digest, str) or len(digest) != 64 or
+                            any(character not in "0123456789abcdef" for character in digest) or
+                            row.get("entry_id") != entry["entries"][str(row["stage"]) ]):
+                        raise ValueError("restored state acknowledgement lacks its exact entry/byte digest")
+                    stages.append({"stage": row["stage"], "pubkey": cfg.stage(row["stage"])["signer_pubkey"],
+                                   "entry_id": row["entry_id"], "state_digest": digest})
+                self.restore_binding = deepcopy({"transaction_id": tx, "prefix": self.prefix,
+                    "identity_sha256": hashlib.sha256(canonical(self.identity)).hexdigest(), "stages": stages})
                 self.pending_reply = {**reply, **self.job}
                 self.owner.entries.move_to_end(self.key)
                 self.record.update(hit=True, reason="all_stages_restored", transaction_id=tx)

@@ -55,6 +55,7 @@ class Ring:
     stopping: bool = False
     guard_stop: object = field(default_factory=threading.Event, repr=False)
     guard_thread: object = field(default=None, repr=False)
+    batch_contract_sha256: str | None = None
 
 
 @dataclass
@@ -234,6 +235,13 @@ class RingPool:
         started = time.monotonic()
         try:
             proof = ring.backend.warmup(timeout_s=timeout_s)
+            batch = getattr(ring.backend, "batch_contract", None)
+            if callable(batch):
+                from .continuous_batch import contract_digest
+                digest = contract_digest(batch())
+                if proof.get("batch_contract_sha256") != digest:
+                    raise RingUnavailable("batch contract requires verified warmup binding")
+                ring.batch_contract_sha256 = digest
             if invalid:
                 raise invalid[0]
             self._assert_guards(ring)
@@ -453,8 +461,20 @@ class RingPool:
         try:
             result = ring.backend.execute(job, emit, checked)
             checked()
-            if result.get("proof", {}).get("verified") is not True or result["proof"].get("scope") != "complete_final_attempt":
+            proof = result.get("proof", {})
+            validator = getattr(ring.backend, "verify_result_proof", None)
+            scope = proof.get("scope")
+            if proof.get("verified") is not True or scope not in (
+                    "complete_final_attempt", "fresh_suffix_with_signed_prefix_restore"):
                 raise RingUnavailable("complete final-attempt signed proof required")
+            if scope == "fresh_suffix_with_signed_prefix_restore" and not callable(validator):
+                raise RingUnavailable("authenticated prefix-restore verifier required")
+            if callable(validator):
+                try:
+                    if validator(job, result) is not True:
+                        raise RingUnavailable("backend execution evidence failed validation")
+                except Exception as error:
+                    raise RingUnavailable("backend execution evidence failed validation") from error
             self._assert_guards(ring)
             with self._lock:
                 if not ring.backend.ready()[0]:
@@ -472,6 +492,71 @@ class RingPool:
             raise
         finally:
             done.set(); watcher.join(0.2)
+            self._end(ring, works)
+
+    def execute_batch_step(self, bindings, jobs, *, max_step_tokens):
+        """One bounded backend step, under existing process/lease and proof rules."""
+        from .continuous_batch import backend_contract
+        if not jobs or len(bindings) != len(jobs) or len({job.id for job in jobs}) != len(jobs):
+            raise ValueError("distinct jobs and complete batch bindings required")
+        ring = bindings[0].ring
+        contract = backend_contract(ring)
+        if len(jobs) > contract["max_jobs"] or not 1 <= max_step_tokens <= contract["max_step_tokens"]:
+            raise ValueError("batch exceeds qualified job/step capacity")
+        with self._lock:
+            if any(b.ring is not ring or b.released for b in bindings) or ring.state not in (RingState.READY, RingState.DRAINING):
+                raise RingUnavailable("batch contains an invalid fixed ring binding")
+            ring.local_work += 1
+        works = self._begin(ring, "batch-" + str(time.time_ns()))
+        done, invalid = threading.Event(), []
+        watcher = threading.Thread(target=self._watch_guards, args=(ring, done, invalid), daemon=True)
+        watcher.start()
+        counts = {job.id: 0 for job in jobs}
+        def common():
+            if invalid:
+                raise invalid[0]
+            if time.time() >= ring.lease_expires_at:
+                raise RingUnavailable("batch ring lease expired")
+        def check(job):
+            common(); job.check_stop()
+        def emit(job, token):
+            check(job)
+            if counts[job.id] >= max_step_tokens:
+                raise RingUnavailable("backend exceeded its bounded token step")
+            job.commit(token); counts[job.id] += 1
+        try:
+            common()
+            results = ring.backend.advance_batch(jobs,
+                emit={job.id: (lambda token, job=job: emit(job, token)) for job in jobs},
+                cancel_check={job.id: (lambda job=job: check(job)) for job in jobs},
+                max_step_tokens=max_step_tokens)
+            common()
+            if not isinstance(results, dict) or set(results) != {job.id for job in jobs}:
+                raise RingUnavailable("batch step omits or substitutes job outcomes")
+            for job in jobs:
+                value = results[job.id]
+                if value is None or isinstance(value, Exception):
+                    continue
+                if not isinstance(value, dict) or value.get("tokens") != job.checkpoint():
+                    raise RingUnavailable("batch output differs from the committed per-job frontier")
+                proof = value.get("proof", {})
+                validator = getattr(ring.backend, "verify_result_proof", None)
+                if proof.get("verified") is not True or proof.get("scope") not in (
+                        "complete_final_attempt", "fresh_suffix_with_signed_prefix_restore") or not callable(validator):
+                    raise RingUnavailable("batched jobs require independent final-attempt proof verification")
+                if validator(job, value) is not True:
+                    raise RingUnavailable("batched per-job proof failed")
+                value["route"] = {"ring_id": ring.ring_id, "model_id": ring.model_id,
+                                  "cohort_id": ring.cohort_id, "region": ring.region}
+            self._assert_guards(ring)
+            if not ring.backend.ready()[0]:
+                raise RingUnavailable("batch completed on an unavailable backend")
+            return results
+        except Exception as error:
+            self.fail(ring.ring_id, type(error).__name__)
+            raise
+        finally:
+            done.set(); watcher.join(.2)
             self._end(ring, works)
 
     def fail(self, ring_id, reason="failed"):

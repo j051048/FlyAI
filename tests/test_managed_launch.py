@@ -97,6 +97,84 @@ def test_commit_failure_escalates_real_sigterm_ignoring_child_to_kill(tmp_path, 
     assert not launcher.status("ignore-term")["reserved"]
 
 
+def test_failure_cleanup_has_one_direct_child_reaper(tmp_path, monkeypatch):
+    """Popen owns the wait status even when psutil owns descendant discovery."""
+    import psutil
+    launcher = ManagedLauncher(tmp_path)
+    children = capture_child(monkeypatch)
+    original_wait = psutil.wait_procs
+    waited = []
+
+    def wait_descendants(processes, *args, **kwargs):
+        processes = list(processes)
+        assert children[0].pid not in [p.pid for p in processes]
+        waited.extend(p.pid for p in processes)
+        return original_wait(processes, *args, **kwargs)
+
+    monkeypatch.setattr(psutil, "wait_procs", wait_descendants)
+    original_db, _ = commit_failure(launcher, monkeypatch)
+    with pytest.raises(sqlite3.OperationalError, match="commit failure"):
+        launcher.start("one-reaper", [sys.executable, "-c", "import time; time.sleep(60)"], cleanup_timeout=.2)
+    assert children[0].returncode is not None
+    # Windows venv redirectors may have an actual interpreter descendant.
+    assert children[0].pid not in waited
+    monkeypatch.setattr(launcher, "_db", original_db)
+    assert not launcher.status("one-reaper")["reserved"]
+
+
+def test_failure_cleanup_reaps_supervisor_and_its_real_worker(tmp_path, monkeypatch):
+    """The supervisor's exit status is not the descendant worker's status."""
+    import psutil
+    import json
+    launcher = ManagedLauncher(tmp_path)
+    ready = tmp_path / "worker.json"
+    worker_code = "import time; time.sleep(60)"
+    supervisor = (
+        "import os,sys,subprocess,signal,time,pathlib,json\n"
+        f"worker=subprocess.Popen([sys.executable,'-c',{worker_code!r}])\n"
+        "def stop(signum,frame):\n"
+        # Waiting inside a signal handler would re-enter Popen's waitpid lock.
+        # Let the main wait reap the worker after its own SIGTERM instead.
+        "    pass\n"
+        "if os.name != 'nt': signal.signal(signal.SIGTERM,stop)\n"
+        f"pathlib.Path({str(ready)!r}).write_text(json.dumps({{'pid':worker.pid}}))\n"
+        "worker.wait()\n"
+    )
+    children = capture_child(monkeypatch)
+    worker_identity = []
+    original_wait = psutil.wait_procs
+    waited = []
+
+    def before_failure():
+        wait_file(ready)
+        pid = json.loads(ready.read_text())["pid"]
+        worker_identity.append((pid, psutil.Process(pid).create_time()))
+
+    def wait_descendants(processes, *args, **kwargs):
+        processes = list(processes)
+        assert children[0].pid not in [p.pid for p in processes]
+        waited.extend(p.pid for p in processes)
+        return original_wait(processes, *args, **kwargs)
+
+    monkeypatch.setattr(psutil, "wait_procs", wait_descendants)
+    original_db, _ = commit_failure(launcher, monkeypatch, before_failure=before_failure)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="commit failure"):
+            launcher.start("supervisor", [sys.executable, "-c", supervisor], cleanup_timeout=.5)
+        worker_pid, worker_birth = worker_identity[0]
+        assert children[0].poll() is not None
+        assert worker_pid in waited
+        assert launcher._process({"pid": worker_pid, "birth": worker_birth}) is None
+        if os.name != "nt":
+            # The worker took SIGTERM; the supervisor reaped it and exited cleanly.
+            assert children[0].returncode == 0
+        monkeypatch.setattr(launcher, "_db", original_db)
+        assert not launcher.status("supervisor")["reserved"]
+    finally:
+        monkeypatch.setattr(launcher, "_db", original_db)
+        launcher.recover("supervisor", timeout=2)
+
+
 def test_cleanup_unacknowledged_blocks_restart_and_explicit_recovery_finishes(tmp_path, monkeypatch):
     launcher = ManagedLauncher(tmp_path)
     children = capture_child(monkeypatch)

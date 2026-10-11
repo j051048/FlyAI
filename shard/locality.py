@@ -109,7 +109,11 @@ def shortlist_candidates(nodes, model, policy=None, measurements=None, *, now=No
 
 
 def number(value, name, *, minimum=0):
-    if type(value) not in (int, float) or not math.isfinite(value) or value < minimum:
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value) and value >= minimum
+    except OverflowError:
+        valid = False
+    if not valid:
         raise ValueError(f"{name} must be finite and >= {minimum}")
     return float(value)
 
@@ -123,7 +127,73 @@ def timestamp(value):
     return number(value, "measured_at")
 
 
-def link_snapshot(nodes, rtt=None, measurements=None, *, now=None, route_ids=None):
+def measurement_quality(value, kind):
+    """Optional observed statistics, sharing the parent trace's identity and TTL.
+
+    Unknown measurements remain None. A jitter statistic cannot manufacture a
+    percentile, and loss does not imply a transport-independent retransmit cost.
+    """
+    fields = ({"latency_p95_ms", "jitter_ms", "packet_loss_rate"} if kind == "link" else
+              {"frame_p95_ms", "prefill_p95_ms", "queue_p95_ms"})
+    if value is None:
+        return {name: None for name in fields}
+    if (not isinstance(value, dict) or value.get("schema") != f"shard-{kind}-quality/1" or
+            set(value) - {"schema", "sample_count", "window_s", *fields}):
+        raise ValueError(f"invalid {kind} quality schema/fields")
+    samples = value.get("sample_count")
+    if type(samples) is not int or not 2 <= samples <= 1_000_000_000:
+        raise ValueError("quality statistics need an explicit sample_count >=2")
+    number(value.get("window_s"), "quality window_s", minimum=1e-9)
+    result = {name: None if value.get(name) is None else number(value[name], name) for name in fields}
+    if result.get("packet_loss_rate") is not None and result["packet_loss_rate"] > 1:
+        raise ValueError("packet_loss_rate must be in [0,1]")
+    return {"schema": value["schema"], "sample_count": samples, "window_s": value["window_s"], **result}
+
+
+def _quality_edge_rank(edge, policy, now):
+    if policy is None:
+        return edge.get("hop_ms", edge["rtt_ms"])
+    quality = edge.get("quality", {})
+    # Routing still uses real directed propagation. Tail latency is a stress
+    # observation, not an inferred end-to-end p95 guarantee.
+    tail = quality.get("latency_p95_ms")
+    if tail is not None and edge.get("hop_policy") == "half_rtt_assumption":
+        tail /= 2
+    delay = max(edge.get("hop_ms", edge["rtt_ms"]), tail) if tail is not None else edge.get("hop_ms", edge["rtt_ms"])
+    values = {"jitter_ms": quality.get("jitter_ms"), "packet_loss_rate": quality.get("packet_loss_rate"),
+              "observation_age_s": max(0, now-edge["measured_at"])+quality.get("window_s",0) if edge.get("measured_at") is not None else None}
+    if policy["mode"] == "require_known":
+        # Choose an admissible observed channel before scoring its physical
+        # order; a cheap unknown channel must not hide a valid same-pair route.
+        for name,value in values.items():
+            if (policy["weights"].get(name,0) or name in policy["targets"]) and (
+                    value is None or name in policy["targets"] and value > policy["targets"][name]):
+                return float("inf")
+        if tail is None and any(policy["weights"].get(name,0) or name in policy["targets"] for name in ("ttft_ms","tpot_ms")):
+            return float("inf")
+    rank = delay / policy["normalizers"]["tpot_ms"]
+    for name, value in values.items():
+        weight = policy["weights"].get(name, 0) or (1.0 if name in policy["targets"] else 0.0)
+        if weight:
+            rank += weight*(value/policy["normalizers"][name] if value is not None else policy["unknown_penalty"])
+    if tail is None and any(policy["weights"].get(name, 0) or name in policy["targets"] for name in ("ttft_ms", "tpot_ms")):
+        rank += policy["unknown_penalty"]
+    return rank
+
+
+def ordering_costs(ids, snapshot, policy, *, coordinator):
+    """Heuristic order hints only; estimator retains actual measured mean hops."""
+    def cost(a,b):
+        if a == b:return 0.0
+        edge=snapshot["edges"].get((a,b))
+        if edge is None:return UNREACHABLE
+        mean=edge.get("hop_ms",edge["rtt_ms"])
+        if mean>=UNREACHABLE:return UNREACHABLE
+        return min(UNREACHABLE-1, _quality_edge_rank(edge,policy,snapshot["now"])*policy["normalizers"]["tpot_ms"])
+    return ([[cost(a,b) for b in ids] for a in ids], [cost(coordinator,nid) for nid in ids], [cost(nid,coordinator) for nid in ids])
+
+
+def link_snapshot(nodes, rtt=None, measurements=None, *, now=None, route_ids=None, quality_policy=None):
     """Sparse observations are authoritative; stale/missing links cannot become zero.
 
     Legacy dense matrices retain their existing RTT-as-hop-delay interpretation.
@@ -164,6 +234,8 @@ def link_snapshot(nodes, rtt=None, measurements=None, *, now=None, route_ids=Non
             ttl = number(row["ttl_s"], "ttl_s", minimum=1e-9)
             latency_kind, hop_policy = "legacy_rtt", "conservative_rtt"
             metadata = {}
+            if "quality" in row:
+                metadata["quality"] = measurement_quality(row["quality"], "link")
             if version2:
                 for field in ("route_id", "channel", "src_endpoint", "dst_endpoint", "dialer_id"):
                     if not isinstance(row.get(field), str) or not row[field].strip():
@@ -214,7 +286,7 @@ def link_snapshot(nodes, rtt=None, measurements=None, *, now=None, route_ids=Non
                 continue
             candidate = {"rtt_ms": latency, "hop_ms": hop, "bandwidth_mbps": bandwidth,
                          "source": "fresh_sparse", "measured_at": measured, "ttl_s": ttl, **metadata}
-            if pair not in edges or hop < edges[pair].get("hop_ms", edges[pair]["rtt_ms"]):
+            if pair not in edges or _quality_edge_rank(candidate, quality_policy, now) < _quality_edge_rank(edges[pair], quality_policy, now):
                 edges[pair] = candidate
         for i, source in enumerate(ids):
             for j, destination in enumerate(ids):

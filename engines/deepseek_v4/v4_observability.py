@@ -51,7 +51,10 @@ def source_inventory():
     files = list(engine.glob("v4_*.py"))
     vendor = root / "vendor" / "deepseek_v4_ref"
     files += list(vendor.rglob("*.py")) if vendor.is_dir() else []
-    for name in ("receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport", "speculation_policy"):
+    for name in ("receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport", "speculation_policy",
+                 "execution_proof", "job_journal", "service_queue", "http_gateway", "ring_pool", "ring_router",
+                 "continuous_batch", "node_quality", "locality", "planning_cost", "offers", "control_plane",
+                 "network_service", "plan", "topology"):
         path = root / "shard" / (name + ".py")
         if path.is_file():
             files.append(path)

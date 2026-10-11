@@ -107,29 +107,49 @@ class ManagedLauncher:
         return result
 
     @staticmethod
-    def _terminate_targets(targets, timeout):
-        """Birth-identity psutil objects protect signals against PID reuse."""
+    def _terminate_targets(targets, timeout, *, child=None):
+        """Signal birth-identified targets, with exactly one direct-child reaper.
+
+        psutil.wait_procs() uses waitpid() for our own children on POSIX. Letting
+        it reap a process still owned by Popen makes Popen's later wait() see
+        ECHILD and synthesize exit code zero, hiding a real SIGKILL. Signals still
+        use the birth-identified psutil objects; Popen alone waits its child.
+        """
         import psutil
         unique = {p.pid: p for p in targets}
         for process in list(unique.values()):
             try:
-                for child in process.children(recursive=True):
-                    unique.setdefault(child.pid, child)
+                for descendant in process.children(recursive=True):
+                    unique.setdefault(descendant.pid, descendant)
             except psutil.NoSuchProcess:
                 pass
         values = list(unique.values())
+
+        def wait_targets(pending):
+            deadline = time.monotonic() + timeout
+            alive = []
+            direct = next((p for p in pending if child is not None and p.pid == child.pid), None)
+            if direct is not None:
+                try:
+                    child.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    alive.append(direct)
+            others = [p for p in pending if direct is None or p.pid != direct.pid]
+            _, waiting = psutil.wait_procs(others, timeout=max(0, deadline - time.monotonic()))
+            return alive + waiting
+
         for process in reversed(values):
             try:
                 process.terminate()
             except psutil.NoSuchProcess:
                 pass
-        _, alive = psutil.wait_procs(values, timeout=timeout)
+        alive = wait_targets(values)
         for process in alive:
             try:
                 process.kill()
             except psutil.NoSuchProcess:
                 pass
-        _, alive = psutil.wait_procs(alive, timeout=timeout)
+        alive = wait_targets(alive)
         if alive:
             raise RuntimeError("owned process cleanup not acknowledged")
 
@@ -142,7 +162,7 @@ class ManagedLauncher:
                 targets.append(root)
             except psutil.NoSuchProcess:
                 pass
-        self._terminate_targets(targets, timeout)
+        self._terminate_targets(targets, timeout, child=process)
         # Reap the actual Popen child, including a process that ignored SIGTERM.
         try:
             process.wait(timeout=timeout)

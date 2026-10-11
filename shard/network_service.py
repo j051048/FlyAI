@@ -146,6 +146,14 @@ class OpenNetworkService:
         self.key = load_sidecar_key(self.local(self.config["controller_sidecar_key"]))
         self.registry = registry or OfferRegistry(self.local(self.config["registry_db"]))
         self.pool = pool or RingPool()
+        self.quality = None
+        quality = self.config.get("quality_policy")
+        if quality is not None:
+            from .node_quality import NodeQuality
+            if not isinstance(quality, dict) or set(quality) - {"validator_pubkeys", "max_nodes", "max_pending",
+                    "max_events", "case_ttl_s", "history_s", "failure_threshold", "quarantine_s"}:
+                raise ControlError("invalid locally trusted replay quality policy")
+            self.quality = NodeQuality(**quality)
         self.records = {row["ring_id"]: row for row in self.config["formations"]}
         if len(self.records) != len(self.config["formations"]):
             raise ControlError("duplicate formation ID")
@@ -173,11 +181,49 @@ class OpenNetworkService:
                     "running": False, "next_attempt": 0.0}
         self.controller = FormationController(self.registry, self.pool, {},
             requirements=self.requirements, backend_factory=self.backend,
-            agent_factory=agent_factory or self.agent)
+            agent_factory=agent_factory or self.agent, quality=self.quality)
+
+    def issue_replay_audit(self, node_id, cohort_id, receipt, *, input_sha256, execution_identity_sha256):
+        """Local operator/verifier seam; never a contributor-uploaded reputation score."""
+        if self.quality is None:
+            raise ControlError("replay audit policy is disabled")
+        offer = self.registry.get(node_id)
+        from .offers import ModelCohort
+        models = [ModelCohort.from_dict(row["cohort"]) for row in offer["models"]]
+        cohort = next((model for model in models if model.cohort_id == cohort_id), None)
+        if cohort is None:
+            raise ControlError("audit node is not registered for the exact model cohort")
+        if type(receipt.get("layer_end")) is not int or receipt["layer_end"] > cohort.n_layers:
+            raise ControlError("replay receipt layers exceed the pinned cohort")
+        return self.quality.issue(node_id, cohort_id, receipt, expected_pubkey=offer["public_key"],
+            numeric_contract=cohort.numeric_contract, input_sha256=input_sha256,
+            execution_identity_sha256=execution_identity_sha256)
+
+    def ingest_replay_audit(self, report):
+        if self.quality is None:
+            raise ControlError("replay audit policy is disabled")
+        return self.quality.ingest(report)
 
     def local(self, value):
         target = Path(value)
         return target if target.is_absolute() else self.path.parent / target
+
+    def gateway_options(self):
+        """Local serving policies; no contributor offer can enable durable state."""
+        result = {"session_affinity": self.config.get("session_affinity", False),
+                  "batching": self.config.get("batching"), "scheduling": self.config.get("scheduling")}
+        config = self.config.get("job_journal")
+        if config is not None:
+            from .job_journal import JobJournal
+            if not isinstance(config, dict) or "path" not in config or set(config) - {
+                    "path", "namespace", "max_jobs", "max_bytes", "max_payload_bytes", "max_tokens",
+                    "retention_s", "busy_timeout_s", "owner_ttl_s"}:
+                raise ControlError("invalid private job journal configuration")
+            options = dict(config)
+            path, ttl = options.pop("path"), options.pop("owner_ttl_s", 30)
+            result["job_journal"] = JobJournal(self.local(path), **options)
+            result["journal_owner_ttl_s"] = ttl
+        return result
 
     def agent(self, offer):
         address = offer["lease_endpoint"]
@@ -322,6 +368,7 @@ class OpenNetworkService:
         return self.controller.form(row["ring_id"], row["cohort"], profile,
             measurements=observation, locality=row.get("locality"),
             objective=row.get("objective", "pipeline"), workload=row.get("workload"),
+            **({"slo": row["slo"]} if row.get("slo") is not None else {}),
             ttl_s=row.get("lease_ttl_s", 120), warmup_timeout_s=row.get("warmup_timeout_s", 300), **extra)
 
     def form_with_alternatives(self, row):

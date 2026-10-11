@@ -11,15 +11,18 @@ Covers:
 """
 import json
 from pathlib import Path
+import shutil
 import struct
 import pytest
 
 from engines.deepseek_v4 import v4_resources as vr
+from shard import weight_artifacts as artifacts
 from shard.plan import V4_DUAL_RESOURCE_PROFILE, plan_ring
 from shard.resources import (
     NodeResources,
     PlacementRequirements,
     ResourceError,
+    STORAGE_PREPARE_SCHEMA,
     StorageRequirements,
     evaluate_fit,
 )
@@ -210,8 +213,29 @@ def _write_safetensors(path, tensors):
     path.write_bytes(struct.pack("<Q", len(blob)) + blob + bytes(cursor))
 
 
+def _selective_stage_pull(source, destination, catalog, pack, requirements):
+    """Fetch complete required files and publish their exact stage descriptor."""
+    destination.mkdir()
+    selected = artifacts.select_stage_artifacts(
+        catalog, pack, requirements.layer_start, requirements.layer_end,
+        head=requirements.head, tail=requirements.tail, dspark=requirements.dspark,
+    )
+    paths = set(requirements.files)
+    local_pack = {
+        **pack,
+        "files": [row for row in pack["files"] if row["path"] in paths],
+        "weight_map": {name: path for name, path in pack["weight_map"].items() if path in paths},
+        "offsets": {name: span for name, span in pack["offsets"].items()
+                    if pack["weight_map"][name] in paths},
+    }
+    for path in paths:
+        shutil.copyfile(source / path, destination / path)
+    artifacts.write_metadata(destination, catalog, local_pack, selected)
+    return selected
+
+
 def test_selective_pull_requirements_and_verification(tmp_path):
-    """Selective pull derives only required shard files and rejects corrupted files."""
+    """Published selective pulls bind complete files, assets and role dependencies."""
     ckpt_dir = tmp_path / "model_ckpt"
     ckpt_dir.mkdir()
     config = {
@@ -222,6 +246,7 @@ def test_selective_pull_requirements_and_verification(tmp_path):
         "n_mtp_layers": 3,
     }
     (ckpt_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (ckpt_dir / "tokenizer.json").write_text('{"fixture": true}', encoding="utf-8")
 
     # Shard 0: layers 0..10 and embedding
     t0 = {f"layers.{i}.attn.weight": ("BF16", [2, 2]) for i in range(11)}
@@ -243,29 +268,85 @@ def test_selective_pull_requirements_and_verification(tmp_path):
         t1[f"mtp.{i}.confidence_head.proj.weight"] = ("BF16", [1, 2])
     _write_safetensors(ckpt_dir / "model1-mp1.safetensors", t1)
 
-    inventory = vr.inspect_checkpoint(ckpt_dir)
-    # Stage 0 (head): lo=0, hi=11 -> only needs model0-mp1.safetensors
-    req_head = vr.derive_stage_storage_requirements(inventory, 0, 11, head=True, tail=False, dspark=False)
-    assert req_head.files == ("model0-mp1.safetensors",)
-    assert vr.verify_selective_pull(ckpt_dir, req_head) is True
-
-    # Middle stage: lo=15, hi=25 -> only needs model1-mp1.safetensors
-    req_mid = vr.derive_stage_storage_requirements(inventory, 15, 25, head=False, tail=False, dspark=False)
-    assert req_mid.files == ("model1-mp1.safetensors",)
-    assert vr.verify_selective_pull(ckpt_dir, req_mid) is True
-
-    # Tail stage with dspark requires embed.weight (in model0) and tail modules (in model1)
-    req_tail = vr.derive_stage_storage_requirements(inventory, 40, 43, head=False, tail=True, dspark=True)
-    assert req_tail.files == ("model0-mp1.safetensors", "model1-mp1.safetensors")
-    assert vr.verify_selective_pull(ckpt_dir, req_tail) is True
-
-    # Corrupted / missing file detection
-    missing_req = StorageRequirements(
-        model_id=vr.MODEL_ID,
-        layer_start=0,
-        layer_end=11,
-        storage_bytes=1000,
-        files=("model99-mp1.safetensors",),
+    # Header-only inventories are estimates, not evidence of the downloaded bytes.
+    legacy_req = vr.derive_stage_storage_requirements(
+        vr.inspect_checkpoint(ckpt_dir), 0, 11, head=True,
     )
-    with pytest.raises(ResourceError, match="missing selective shard file"):
-        vr.verify_selective_pull(ckpt_dir, missing_req)
+    with pytest.raises(ResourceError, match="legacy storage estimates lack payload hashes"):
+        vr.verify_selective_pull(ckpt_dir, legacy_req)
+
+    # Publication hashes actual tensor payloads, complete containers and encoder assets.
+    catalog, pack = artifacts.catalogue_directory(ckpt_dir, "fixture/v4-native-storage")
+    artifacts.write_metadata(ckpt_dir, catalog, pack)
+    complete = artifacts.verify_weight_pack(ckpt_dir)
+    assert complete["payload_integrity_verified"] is True
+    inventory = vr.inspect_checkpoint(ckpt_dir)
+    assert inventory["payload_integrity_verified"] is False  # Inventory remains a preview.
+
+    cases = (
+        ("head", 0, 11, True, False, False, {"model0-mp1.safetensors"}),
+        ("middle", 15, 25, False, False, False, {"model1-mp1.safetensors"}),
+        ("tail", 40, 43, False, True, False, {"model1-mp1.safetensors"}),
+        ("dspark_tail", 40, 43, False, True, True,
+         {"model0-mp1.safetensors", "model1-mp1.safetensors"}),
+    )
+    pulls = {}
+    for label, lo, hi, head, tail, dspark, weights in cases:
+        requirements = vr.derive_stage_storage_requirements(
+            inventory, lo, hi, head=head, tail=tail, dspark=dspark,
+            filesystem_id="fixture-filesystem",
+        )
+        assert requirements.schema == STORAGE_PREPARE_SCHEMA
+        assert requirements.model_id == catalog["model_id"]
+        assert requirements.checkpoint_id == catalog["checkpoint_id"]
+        assert requirements.manifest_sha256 == catalog["manifest_sha256"]
+        assert set(requirements.files) == weights | {"config.json", "tokenizer.json"}
+        # A middle stage must budget all of its source container, including tensors
+        # outside the assigned span; selected tensor byte sizes cannot replace it.
+        assert {row.path: row.size for row in requirements.file_records} == {
+            path: (ckpt_dir / path).stat().st_size for path in requirements.files
+        }
+        assert requirements.storage_bytes > sum(row.size for row in requirements.file_records)
+        assert all(row.sha256 == artifacts.hash_file(ckpt_dir / row.path)[0]
+                   for row in requirements.file_records)
+
+        destination = tmp_path / label
+        selected = _selective_stage_pull(ckpt_dir, destination, catalog, pack, requirements)
+        verified = vr.verify_selective_pull(destination, requirements)
+        assert verified["payload_integrity_verified"] is True
+        assert verified["verification_scope"] == "assigned stage payload hashes"
+        assert artifacts.verified_stage_artifact_descriptor(verified) == selected
+        assert set(path.name for path in destination.glob("*.safetensors")) == weights
+        names = set(selected["tensor_names"])
+        expected_names = {f"layers.{i}.attn.weight" for i in range(lo, hi)}
+        if head or dspark:
+            expected_names.add("embed.weight")
+        if tail:
+            expected_names.update({"norm.weight", "head.weight", "hc_head_fn", "hc_head_base", "hc_head_scale"})
+        if dspark:
+            expected_names.update(name for name in t1 if name.startswith("mtp."))
+        assert names == expected_names
+        pulls[label] = destination, requirements
+
+    middle, req_mid = pulls["middle"]
+    path = middle / "model1-mp1.safetensors"
+    original = path.read_bytes()
+    header_before = vr.read_safetensors_header(path)
+    changed = bytearray(original)
+    changed[-1] ^= 1  # A DSpark tensor outside the middle span, inside its fetched file.
+    path.write_bytes(changed)
+    assert vr.read_safetensors_header(path) == header_before
+    with pytest.raises(artifacts.ArtifactError, match="artifact payload hash mismatch"):
+        vr.verify_selective_pull(middle, req_mid)
+
+    path.write_bytes(original)
+    assert vr.verify_selective_pull(middle, req_mid)["payload_integrity_verified"] is True
+    path.unlink()
+    with pytest.raises((artifacts.ArtifactError, FileNotFoundError)):
+        vr.verify_selective_pull(middle, req_mid)
+
+    head, req_head = pulls["head"]
+    asset = head / "tokenizer.json"
+    asset.write_bytes(asset.read_bytes().replace(b"true", b"null"))
+    with pytest.raises(artifacts.ArtifactError, match="artifact payload hash mismatch"):
+        vr.verify_selective_pull(head, req_head)

@@ -190,6 +190,8 @@ def verify_coverage(receipts: list[dict], layer_count: int,
     swarm assigned it; passing it IS payment (pinned) mode and fails CLOSED: a signer absent from
     the map is rejected, and every assigned signer must produce exactly one receipt (set equality).
     In both modes a duplicate signer or a zero-work receipt (n_chunks missing/<=0) is rejected."""
+    if type(layer_count) is not int or layer_count < 1:
+        raise ReceiptError("positive integer layer count required")
     entries = []
     seen_pubkeys = set()
     for r in receipts:
@@ -197,11 +199,15 @@ def verify_coverage(receipts: list[dict], layer_count: int,
         if expected_nonce is not None and r.get("nonce") != expected_nonce:
             raise ReceiptError(f"receipt nonce {r.get('nonce')!r} != job nonce (stale or replayed receipt)")
         lo, hi = r["layer_start"], r["layer_end"]
-        if not (0 <= lo < hi <= layer_count):
+        if type(lo) is not int or type(hi) is not int or not (0 <= lo < hi <= layer_count):
             raise ReceiptError(f"receipt block [{lo}:{hi}] outside [0:{layer_count}]")
-        if not isinstance(r.get("n_chunks"), int) or r["n_chunks"] <= 0:
+        if type(r.get("n_chunks")) is not int or r["n_chunks"] <= 0:
             raise ReceiptError(f"receipt for [{lo}:{hi}] attests {r.get('n_chunks')!r} chunks (zero-work receipt)")
         pub = r["pubkey"]
+        for name in ("in_root", "out_root"):
+            root = r.get(name)
+            if not isinstance(root, str) or len(root) != 64 or any(c not in "0123456789abcdef" for c in root):
+                raise ReceiptError("activation roots must be lowercase SHA256 digests")
         if pub in seen_pubkeys:                      # one receipt per identity — a key signing two
             raise ReceiptError(f"duplicate signer {pub[:12]}..")  # blocks is double-crediting
         seen_pubkeys.add(pub)

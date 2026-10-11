@@ -1342,6 +1342,9 @@ class Stage:
         """Explicit storage scope/capacity; no assertion of constant-context KV."""
         return self._kv_runtime.status() if self._kv_runtime is not None else {"mode": "gpu_resident"}
 
+    def kv_transfer_status(self):
+        return self._kv_runtime.transfer_status() if self._kv_runtime is not None else {"mode": "gpu_resident"}
+
     def prefill_runtime_status(self):
         return {"mode": "query_chunks" if self._prefill_query_chunk else "reference",
                 "query_chunk_tokens": self._prefill_query_chunk,
@@ -1414,6 +1417,7 @@ class Stage:
         """Write a `_snapshot()` back in place. `_seek`'s rollback; unused on the greedy path."""
         if self._kv_runtime is not None:
             self._kv_runtime.order_current_stream()
+            self._kv_runtime.invalidate_workspace()
         win = self.args.window_size
         with torch.no_grad():
             n = len(self.layers)

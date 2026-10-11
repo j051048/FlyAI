@@ -12,7 +12,12 @@ import math
 from pathlib import Path
 import secrets
 import statistics
+import sys
 import time
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 try:
     import v4_benchmark as bench
@@ -108,6 +113,8 @@ def evaluate_soak(report, expected_protocol=None, expected_contract=None):
             missing.append("checkpoint/config/tokenizer/source verification absent")
         assignments = {node["signer_pubkey"]: (node["layer_start"], node["layer_end"])
                        for node in protocol["hardware"]}
+        hardware_by_signer = {node["signer_pubkey"]: node for node in protocol["hardware"]}
+        runtime_identities = {}
         nonces, jobs, slots = set(), set(), {}
         ttfts, gaps, rates = [], [], []
         observation_s, last_end = 0.0, 0.0
@@ -149,6 +156,18 @@ def evaluate_soak(report, expected_protocol=None, expected_contract=None):
                                 expected_nonce=nonce, check_chain=True)
                 if any(r["job_id"] != job_id or r["swarm_id"] != sample["swarm_id"] for r in receipts):
                     errors.append("receipt job/swarm binding differs")
+                for receipt in receipts:
+                    observation = receipt.get("runtime_observation")
+                    if observation is None:
+                        if protocol.get("evidence_contract", {}).get("runtime_observation_required", False):
+                            missing.append("signed effective runtime observation absent")
+                        continue
+                    errors.extend(bench.runtime_observation_errors(observation,
+                        hardware_by_signer[receipt["pubkey"]], protocol))
+                    identity = bench._runtime_identity(observation)
+                    previous = runtime_identities.setdefault(observation["node_id"], identity)
+                    if previous != identity:
+                        errors.append("effective runtime identity changed during the sustained campaign")
                 if protocol["env"].get("V4_RUNTIME_METRICS") == "1":
                     for r in receipts:
                         metrics = validate_runtime_metrics(r.get("runtime_metrics"))

@@ -340,6 +340,7 @@ def ram_dma_overhead_ms(node, model):
 
 def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolation=None,
                     head_choice=None, joint_roles=False, objective="serial", cost_model=None,
+                    ordering_costs=None,
                     hard_max_stages=None, coordinator_costs=None, coordinator_on_head=True):
     """Place a deployable sharded ring from announced capabilities + a measured RTT mesh.
 
@@ -587,6 +588,8 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
     extra = {"isolation": isolation, "host_id": host_map, "device_id": devices,
              "host_layer_caps": host_caps, "host_memory_domain": memory_map,
              "tail_host_layer_caps": tail_host_caps}
+    if ordering_costs is not None:
+        extra["ordering_costs"] = ordering_costs
     if exact_templates:
         extra.update(allowed_spans=allowed_spans, template_resources=template_resources, node_layer_caps=node_caps)
         if cost_model is not None:
@@ -781,15 +784,16 @@ def _plan_ring_core(nodes, rtt, model=None, *, slack=None, privacy=None, isolati
 
 def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolation=None,
               locality=None, objective="serial", workload=None, measurements=None, now=None,
-              diagnostics=None, coordinator_id=None, route_ids=None):
+              diagnostics=None, coordinator_id=None, route_ids=None, slo=None):
     """Backward-compatible entrypoint with locality tiers and prediction-only costs.
 
     A legacy metadata-free call retains its historical successful solve. New
     locality/sparse/trace calls jointly evaluate head roles within each tier;
     expansion happens only if every local candidate failed feasibility/SLO.
     """
-    from .locality import link_snapshot, candidate_tiers, shortlist_candidates
-    from .planning_cost import estimate, workload_spec
+    from .locality import link_snapshot, candidate_tiers, shortlist_candidates, ordering_costs
+    from .planning_cost import estimate, workload_spec, slo_spec
+    slo_policy = slo_spec(slo)
     if diagnostics is not None:
         if not isinstance(diagnostics, dict):
             raise ValueError("diagnostics must be a dictionary")
@@ -844,7 +848,7 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
             rtt = [[rtt[i][j] for j, _ in eligible] for i, _ in eligible]
         nodes = [node for _, node in eligible]
     legacy_dense = (not require_exact and not any("allowed_spans" in node for node in nodes) and
-                    coordinator_id is None and rtt is not None and measurements is None and locality is None and workload is None
+                    slo_policy is None and coordinator_id is None and rtt is not None and measurements is None and locality is None and workload is None
                     and objective == "serial" and not any(node.get("region") or node.get("region_id")
                     or node.get("stage_trace") for node in nodes))
     if legacy_dense:
@@ -858,7 +862,7 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
     nodes = [nodes[i] for i in selected]
     if rtt is not None and not legacy_dense:
         rtt = [[rtt[i][j] for j in selected] for i in selected]
-    snapshot = link_snapshot(nodes, rtt, measurements, now=now, route_ids=route_ids)
+    snapshot = link_snapshot(nodes, rtt, measurements, now=now, route_ids=route_ids, quality_policy=slo_policy)
     # A fresh measured frame already includes expert transfers. Its per-layer
     # average provides the heterogeneous allocation seed; the full stage trace
     # is still re-scored and labeled when reused for another layer range.
@@ -879,7 +883,8 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
     by_id = {node["id"]: i for i, node in enumerate(nodes)}
     attempts = []
     heads_truncated = False
-    use_cost = objective == "pipeline" or workload is not None or any(node.get("stage_trace") is not None for node in nodes)
+    use_cost = slo_policy is not None or objective == "pipeline" or workload is not None or any(node.get("stage_trace") is not None for node in nodes)
+    slo_rejections = {"unknown_metrics": set(), "exceeded_targets": set(), "candidates": 0}
     if isinstance(locality, dict) and locality.get("min_predicted_tok_s") is not None:
         from .locality import number
         number(locality["min_predicted_tok_s"], "min_predicted_tok_s", minimum=1e-9)
@@ -954,12 +959,20 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
                             trace = node.get("stage_trace")
                             if trace and trace.get("runtime_config_sha256") != row["runtime_config_sha256"] and work["frame_tokens"] == 1:
                                 node.pop("stage_trace")
-                    return estimate(order, allocation, timing, mesh, outgoing, incoming,
+                    prediction = estimate(order, allocation, timing, mesh, outgoing, incoming,
                                     scored_nodes, resolved or M25_PROFILE, workload,
-                                    edges=snapshot["edges"], now=snapshot["now"], objective=objective)
+                                    edges=snapshot["edges"], now=snapshot["now"], objective=objective,
+                                    slo=slo_policy, coordinator_id=coordinator_id)
+                    if slo_policy is not None and not prediction["slo"]["eligible"]:
+                        slo_rejections["candidates"] += 1
+                        for key in ("unknown_metrics", "exceeded_targets"):
+                            slo_rejections[key].update(prediction["slo"][key])
+                    return prediction
                 found = _plan_ring_core(subset, mesh, resolved, slack=slack, privacy=privacy,
                     isolation=isolation, head_choice=head, joint_roles=True, objective=objective,
                     cost_model=score if use_cost else None, hard_max_stages=hard_max,
+                    ordering_costs=ordering_costs([node["id"] for node in subset],snapshot,slo_policy,
+                        coordinator=coordinator_id if coordinator_id is not None else subset[head]["id"]) if slo_policy is not None else None,
                     coordinator_on_head=coordinator_id is None or subset[head]["id"] == coordinator_id,
                     coordinator_costs=([hop(coordinator_id, node["id"]) for node in subset],
                                        [hop(node["id"], coordinator_id) for node in subset]) if coordinator_id is not None else None)
@@ -977,7 +990,7 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
                                  if row["runtime_config_sha256"] == stage["runtime_config_sha256"] and (row["lo"], row["hi"]) == (stage["lo"], stage["hi"]))
                             for stage in found["stages"]}
                     prediction = score(order, allocation, context["timing"], context["outgoing"], context["incoming"], templates)
-                candidate_rank = prediction["predicted_request_ms"] if prediction else found.get("request_ms", found["step_ms"])
+                candidate_rank = prediction.get("selection_score",prediction["predicted_request_ms"]) if prediction else found.get("request_ms", found["step_ms"])
                 if policy.get("min_predicted_tok_s") is not None and (
                         not prediction or prediction["predicted_committed_tok_s"] < float(policy["min_predicted_tok_s"])):
                     continue
@@ -986,6 +999,9 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
                     best_used_joint = True
                     if prediction:
                         best["planning"] = prediction
+                        if slo_policy is not None:
+                            best["selection_score"] = candidate_rank
+                            best["request_ms"] = prediction["predicted_request_ms"]
         attempts.append({"tier": tier["name"], "candidate_pools": len(tier["pools"]), "feasible": best is not None})
         if best is None:
             continue
@@ -1041,11 +1057,14 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
                             next((key for key, value in PROFILES.items() if value == resolved), None))
         if diagnostics is not None:
             diagnostics.update(status="planned", search=prediction["search"], attempts=attempts)
+            if slo_policy is not None:diagnostics["slo"] = prediction["slo"]
         return best
     if diagnostics is not None:
         diagnostics.update(status="bounded_search_exhausted" if frontier["truncated"] or heads_truncated else "no_feasible_plan",
             reason="no plan in examined candidates under resource/locality/stage limits; widen explicit bounds or refresh observations",
             search={**frontier, "heads_truncated": heads_truncated}, attempts=attempts)
+        if slo_policy is not None:
+            diagnostics["slo_rejections"] = {key:sorted(value) if isinstance(value,set) else value for key,value in slo_rejections.items()}
     return None
 
 
@@ -1062,7 +1081,7 @@ def _main() -> int:
                          privacy=req.get("privacy"), isolation=req.get("isolation"),
                          locality=req.get("locality"), objective=req.get("objective", "serial"),
                          workload=req.get("workload"), measurements=req.get("measurements"), now=req.get("now"),
-                         coordinator_id=req.get("coordinator_id"), route_ids=req.get("route_ids"))
+                         coordinator_id=req.get("coordinator_id"), route_ids=req.get("route_ids"), slo=req.get("slo"))
     except KeyError as e:
         json.dump({"error": f"missing field: {e}"}, sys.stdout)
         return 2

@@ -54,6 +54,7 @@ except ImportError:
 
 class V4RingBackend:
     """One serial ring's connections. Numeric/receipt failures are never retried."""
+    supports_prefix_replay = True
     service_name = "v4-serial-gateway"
     def __init__(self, directory, head, tail, assignments, *, mode="pipelined", max_retries=1,
                  timeout=60.0, max_context=8192, swarm_id="v4-service", vp=None, tokenizer=None, pipeline_plan=None, coordinator_key=None,
@@ -279,7 +280,7 @@ class V4RingBackend:
                 self._close_channels(owner)
                 return
 
-    def _verify_receipts(self, result, nonce, attempt_id):
+    def _verify_receipts(self, result, nonce, attempt_id, conversation=None):
         try:
             from shard.receipt import verify_coverage, wire_receipt
         except ImportError:
@@ -290,10 +291,49 @@ class V4RingBackend:
                             expected_nonce=nonce, check_chain=True)
             if any(receipt.get("job_id") != attempt_id or receipt.get("swarm_id") != self.swarm_id for receipt in receipts):
                 raise ValueError("signed receipt belongs to another job/swarm")
+            if conversation is not None and conversation.record.get("hit"):
+                from shard.execution_proof import verify_prefix_restore
+                verify_prefix_restore(receipts, conversation.restore_binding, self.assignments)
+            elif any("conversation_restore" in receipt for receipt in receipts):
+                raise ValueError("unexpected restored-prefix receipt on a full-prefill request")
         except Exception as error:
             self._stats["receipt_failures"] += 1
             raise ReceiptValidationError("signed assignment/nonce/job/swarm/coverage/chain validation failed") from error
         return receipts
+
+    def _proof_binding(self, job, result):
+        proof = {k: v for k, v in result["proof"].items() if k != "validation_binding"}
+        body = json.dumps(["v4-result-validation/1", job.id, job.tenant, self.model_id,
+                           proof, result["tokens"]], sort_keys=True, separators=(",", ":"),
+                          allow_nan=False).encode()
+        return hmac.new(self._feature_secret, body, hashlib.sha256).hexdigest()
+
+    def verify_result_proof(self, job, result):
+        """Pool boundary: retain the proof scope and verify its actual evidence again."""
+        from shard.execution_proof import COMPLETE_SCOPE, RESTORED_SCOPE, verify_prefix_restore
+        proof = result.get("proof", {})
+        if proof.get("verified") is not True or proof.get("scope") not in (COMPLETE_SCOPE, RESTORED_SCOPE):
+            raise ReceiptValidationError("unsupported execution proof scope")
+        supplied = proof.get("validation_binding")
+        if not isinstance(supplied, str) or not hmac.compare_digest(supplied, self._proof_binding(job, result)):
+            raise ReceiptValidationError("result differs from the verified backend completion")
+        attempt = proof.get("attempt_id")
+        if not isinstance(attempt, str) or not attempt.startswith(job.id + "/attempt-"):
+            raise ReceiptValidationError("execution proof belongs to another admitted job")
+        nonce = proof.get("nonce")
+        if not isinstance(nonce, str) or len(nonce) != 64 or any(c not in "0123456789abcdef" for c in nonce):
+            raise ReceiptValidationError("fresh execution nonce required")
+        receipts = proof.get("receipts") or []
+        from shard.receipt import verify_coverage
+        verify_coverage(receipts, self.layers, expected_by_signer=self.assignments,
+                        expected_nonce=proof.get("nonce"), check_chain=True)
+        if any(r.get("job_id") != attempt or r.get("swarm_id") != self.swarm_id for r in receipts):
+            raise ReceiptValidationError("execution proof has another attempt/swarm")
+        if proof["scope"] == RESTORED_SCOPE:
+            verify_prefix_restore(receipts, proof.get("prefix_restore"), self.assignments)
+        elif "prefix_restore" in proof or any("conversation_restore" in r for r in receipts):
+            raise ReceiptValidationError("restored prefix cannot be reported as complete new execution")
+        return True
 
     def execute(self, job, emit, cancel_check):
         with self._io_lock:
@@ -390,7 +430,7 @@ class V4RingBackend:
                 cancel_check()
                 if not result.get("ok") or result.get("tokens") != job.checkpoint() or seen != len(job.checkpoint()):
                     raise ReplayMismatch("coordinator result differs from the committed callback frontier")
-                receipts = self._verify_receipts(result, nonce, attempt_id)
+                receipts = self._verify_receipts(result, nonce, attempt_id, conversation)
                 self._last_ok = time.monotonic()
                 optimization = {}
                 if conversation is not None:
@@ -421,6 +461,9 @@ class V4RingBackend:
                                  "strategy": "original_request_replay_with_prefix_check", "transport_failures": failures}}
                 if optimization:
                     response["optimizations"] = optimization
+                if conversation is not None and conversation.record.get("hit"):
+                    response["proof"]["prefix_restore"] = conversation.restore_binding
+                response["proof"]["validation_binding"] = self._proof_binding(job, response)
                 return response
             except (OSError, EOFError) as error:
                 self._close_channels(owner)

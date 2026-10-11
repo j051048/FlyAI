@@ -1,6 +1,6 @@
 # 当前文档导航与历史证据
 
-核对日期：2026-10-09；当前工作区含权重准备/换环、P0–P2 运行改造及默认关闭的请求边界状态优化。本页区分操作合同、接口规范、
+核对日期：2026-10-11；当前工作区含权重准备/换环、状态优化、恢复证明修复、可选持久作业日志、SLO/风险规划与请求 aging 调度。本页区分操作合同、接口规范、
 有日期的实验记录和参考实现来源。历史性能数字按原实验条件保留；新版计时、
 会话或资源合同需要新的原始运行证据。
 
@@ -13,6 +13,7 @@
 | 部署 V4 严格服务 | [V4_CLUSTER_DEPLOY_GUIDE](V4_CLUSTER_DEPLOY_GUIDE.md)、[V4_GATEWAY](V4_GATEWAY.md) |
 | V4 运行自检、strict SSH 部署、健康诊断和单变量复测 | [V4_OPERATIONS](V4_OPERATIONS.md) |
 | V4 有限投机配方、exact-repeat/shadow 状态缓存与有界专家 DMA 流水 | [V4_STATEFUL_OPTIMIZATIONS](V4_STATEFUL_OPTIMIZATIONS.md) |
+| 服务恢复、SLO/风险、调度/质量边界及真实发布门槛 | [V4_SERVICE_HARDENING](V4_SERVICE_HARDENING.md) |
 | 小磁盘节点、流式转换、权重准备与请求边界换环 | [WEIGHT_PREPARATION](WEIGHT_PREPARATION.md) |
 | 任意节点注册、区域组环、租约与多环 | [OPEN_INFERENCE_NETWORK](OPEN_INFERENCE_NETWORK.md) |
 | 资源准入与部署检查 | [RESOURCE_CONTRACT](RESOURCE_CONTRACT.md)、[DEPLOY_READINESS](DEPLOY_READINESS.md) |
@@ -53,6 +54,7 @@ decode tok/s 仍是固定验收目标；`v4_acceptance.py` 的模拟结果不通
 | [V4_CLUSTER_DEPLOY_GUIDE](V4_CLUSTER_DEPLOY_GUIDE.md) | V4 当前操作步骤 |
 | [V4_OPERATIONS](V4_OPERATIONS.md) | 共享运行初始化、caller-local 隧道、签名运行观察及独立链路探测 |
 | [V4_STATEFUL_OPTIMIZATIONS](V4_STATEFUL_OPTIMIZATIONS.md) | 默认关闭的有限请求配方、完整前缀状态缓存/shadow、专家搬运 FIFO 及证据范围 |
+| [V4_SERVICE_HARDENING](V4_SERVICE_HARDENING.md) | 私有 SQLite 同 cohort 恢复、SSE 游标、SLO/风险、shortest-with-aging、qualified token-step 框架与本地复算边界；真实 4/6+soak+CUDA 发布 gate |
 | [V4_GATEWAY](V4_GATEWAY.md) | HTTP/SSE、租户/模型路由、不同入口合同 |
 | [V4_BENCHMARK](V4_BENCHMARK.md) | 固定协议、原始证据和 GPU 速度线 |
 | [V4_NEXT_PHASE](V4_NEXT_PHASE.md) | 当前 V4 集成与下一阶段验证 |

@@ -1,6 +1,6 @@
 # FlyAI / Shard — implementation status
 
-Reviewed 2026-10-09 against `a99cb3c` plus opt-in request policy, full-ring snapshots and bounded expert-prefill pipelining. Commands and documentation are indexed in
+Reviewed 2026-10-11 against the current working tree, including service hardening, optional durable jobs and SLO/risk planning. Commands and documentation are indexed in
 [DOCUMENTATION_INDEX](docs/DOCUMENTATION_INDEX.md). The dated journal below records earlier experiments;
 its `DONE`, `NOW` and speed labels describe those sessions, not current cluster readiness.
 
@@ -10,16 +10,18 @@ its `DONE`, `NOW` and speed labels describe those sessions, not current cluster 
 |---|---|
 | JOIN | Open signed GPU offers, cohort compatibility, TTL/sequence replay protection and verified model files. Sidecars retain identity/transport/NAT handling. |
 | WEIGHTS | Native V4 logical tensor catalogues, bounded streaming conversion, hash-verified stage artifacts, shared preparation disk/RAM leases and atomic publication. Configured same-cohort candidates support request-boundary replacement; source/calibration configuration and real GPU acceptance remain required. See [weight preparation](docs/WEIGHT_PREPARATION.md). |
-| FORM | Regional/directed-route search, heterogeneous exact calibrated spans, shared host budgets, prepare/commit/renew/release leases and resident-process fencing. Inference routes are supplied by the existing deployment/sidecar layer. |
-| SERVE | GPT-OSS and V4 open-network service adapters, signed warmup, authenticated HTTP/SSE, one serial worker per ring and parallel separate rings. No continuous batching or durable coordinator HA claim. |
-| PROVE | Fresh signed receipts, actual activation commitments, full layer coverage and chain checks; local challenge primitives. These do not prove every participant computed honestly. |
+| FORM | Regional/directed-route search, exact calibrated spans and resident-process leases; opt-in TTFT/TPOT/cost/quality/shared-failure-domain scoring. Missing metrics stay unknown; component-p95 stress predictions are not SLO acceptance. |
+| SERVE | V4/GPT-OSS authenticated HTTP/SSE, serial workers per ring, parallel rings and opt-in shortest-with-aging scheduling. Private SQLite journals enable owner-fenced same-cohort original-request replay and prefix/SSE recovery, not distributed coordinator HA. The default-off token-step framework requires a qualified backend that native V4/GPT-OSS do not currently provide. |
+| PROVE | Fresh signed activation commitments, coverage/chain checks and authenticated prefix-restore scope; local challenge primitives and pinned replay-auditor feedback. These do not provide hardware attestation or prove every participant computed honestly. |
 | PAY | Consuming-network integration, outside this engine's implementation/verification scope. |
 | V4 OPERATIONS | Shared Hadamard/alias initialization, isolated CPU selftest, strict caller-local SSH deployment, signed runtime declarations and raw measurement/controlled A/B tooling. See [V4 operations](docs/V4_OPERATIONS.md); actual GPU and WAN acceptance remain separate. |
 | V4 STATEFUL OPTIMIZATIONS | Default-off approved request-boundary recipes, tenant/cohort/version/lease-bound all-stage state snapshots, optional session affinity and bounded prefill expert DMA. Exact-repeat reuse has fresh suffix receipts; extended prefixes retain per-request full-prefill reference validation. See [configuration and limits](docs/V4_STATEFUL_OPTIMIZATIONS.md); GPU performance remains unverified. |
+| SERVICE HARDENING | Gateway/pool restore-proof binding, valid-frontier KV copies and bounded logical-byte hashing; internal greedy NativeTrace continuation remains outside ordinary new-chat incrementality. Release tooling requires frozen 4/6-card runs, sustained observations and actual CUDA gates. See [operations and boundaries](docs/V4_SERVICE_HARDENING.md). |
 
-Latest selected local CPU/socket/HTTP regression: **1839 passed, 3 environment-dependent skips, 44 GPU-marked cases deselected**.
-After the final bounded-iterator correction, **137 targeted tests passed**, with 4 GPU-marked cases deselected; overlapping suites are not additive.
-Two additional CUDA cache/graph-pointer gates were conditionally skipped on this CPU-only runtime.
+Current selected CPU/socket/HTTP regression: **1813 passed, 8 environment-dependent skips, 66 GPU-marked cases deselected**. Following the supplied CI report, a separate deployment/resource set passed **218 tests with 1 POSIX skip on Windows**; the launcher/lifecycle suite passed **51 tests on WSL Ubuntu 22.04 / Python 3.10**. These sets are not additive and do not replace full GitHub Python 3.12 CI or GPU acceptance.
+The CI failures were repaired without loosening payload integrity: the selective-pull fixture now publishes actual artifact catalogues and verifies full payloads. Process-registration cleanup preserves the real POSIX exit status by assigning Popen a single direct-child reaper; unknown cleanup continues to hold reservations.
+Previous-build selected regression recorded 1839 passes followed by 137 overlapping targeted passes; those are historical evidence.
+Two additional CUDA cache/graph-pointer gates were conditionally skipped on that earlier CPU-only build. Historical records do not replace the current selected regression above or actual GPU acceptance.
 Actual native MXFP4 GPU execution and new V4 four/six-card acceptance remain pending live verification.
 The targets remain **4x5090 >=40 / 6x5090 >=30 valid output tok/s**, using the frozen benchmark and raw evidence.
 

@@ -1,6 +1,6 @@
 # V4 runtime and service hardening
 
-Current runtime/service entrypoints below were rechecked against the working tree on 2026-10-09.
+Current runtime/service entrypoints below were rechecked against the working tree on 2026-10-11.
 The requested runtime paths are implemented, while real four/six RTX 5090 acceptance
 is still pending an explicitly provisioned actual cluster (owned or rented). Local CPU,
 real-socket and reference-model regressions are not GPU throughput measurements.
@@ -16,6 +16,10 @@ whole-ring exact-repeat prompt snapshots with optional per-request extended-pref
 reference shadow, and bounded local expert DMA lookahead during RAM-mode prefill.
 Their concrete settings and proof limits are in
 [V4_STATEFUL_OPTIMIZATIONS.md](V4_STATEFUL_OPTIMIZATIONS.md).
+The next service work is in [V4_SERVICE_HARDENING.md](V4_SERVICE_HARDENING.md):
+verified prefix-restore proof admission, opt-in private SQLite job recovery,
+SLO/risk placement, queued shortest-job aging and explicitly qualified token-step
+backend scheduling. V4/GPT-OSS do not yet implement native continuous batching.
 
 ## Execution paths and limits
 
@@ -25,7 +29,7 @@ Their concrete settings and proof limits are in
 | KV working set | Stage keeps windows/Compressor recurrences resident, archives compressed histories in pinned RAM, and reuses one bounded per-layer GPU workspace | Each layer still reads its entire valid compressed prefix; quotas limit supported context and add PCIe traffic |
 | Prefill queries | Attention and Indexer queries are chunked while projection, Compressor, HC and MoE shapes remain unchanged | First real shape runs a reference-shadow output/state byte gate and still needs reference scratch; mismatch refuses the request |
 | Hardware evidence | Frozen speed suite plus sustained same-prompt greedy controls, raw signatures, monotonic campaign intervals and declared SLOs | Timing and physical inventory are coordinator/operator provenance, not remote attestation |
-| Online service | Shared authenticated HTTP, global tenant limits/idempotency, one serial worker per READY ring, version-sticky routing, cancellation/SSE and replay recovery | Rings execute concurrently; history is memory-only; no continuous batching, durable coordinator HA or external billing |
+| Online service | Shared authenticated HTTP, global tenant limits/idempotency, one serial worker per READY V4/GPT-OSS ring, version-sticky routing, cancellation/SSE, optional private SQLite original-request recovery | Rings execute concurrently; qualified token-step backends have a separate bounded contract; no native V4/GPT-OSS continuous batching, distributed coordinator consensus or external billing |
 | Connection ownership | Signed challenge HELLO pins both identities, role/index/spans/cohort, purpose and execution plan; signed head grant binds forward/return and fences old owners | Compatible stage/controller keys and actual reachable tail endpoint are required; strict mode refuses the old return relay |
 | Request policy | One approved greedy/pipelined recipe is selected before each request from actual selected-stage capabilities | No trained-block/weight/runtime mutation within a request; tenant/generation/config scope, finite probe/history budget and actual committed feedback |
 | Prompt state cache | All stages prepare then commit a node-local snapshot of complete valid KV/recurrences/taps/MTP state | Exact token-prefix/mode/horizon/tenant/version/fence matching; extended shadow still runs the full original prefill every request |

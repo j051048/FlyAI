@@ -48,7 +48,7 @@ def serve_open_config(config_path, *, auth_file, bind="127.0.0.1", port=8000,
         service.form_all()
         gateway = Gateway(auth=AuthRegistry.from_file(auth_file), ring_pool=service.pool,
                           default_model=service.config.get("default_model"),
-                          session_affinity=service.config.get("session_affinity", False))
+                          **service.gateway_options())
         if bind not in {"127.0.0.1", "localhost", "::1"} and not (tls_cert and tls_key):
             raise ControlError("public inference listener requires TLS")
         server = gateway.server(bind, port)

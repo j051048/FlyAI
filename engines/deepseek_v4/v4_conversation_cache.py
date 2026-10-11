@@ -179,26 +179,27 @@ def _python_bytes(value, seen=None):
     return size
 
 
-def _copy_tree(value, *, pin=False, memo=None, devices=None, restore=False):
+def _copy_tree(value, *, pin=False, memo=None, devices=None, restore=False, non_blocking=False):
     memo = {} if memo is None else memo
     if torch.is_tensor(value):
         if id(value) not in memo:
             target = devices.get(id(value), "cpu") if restore else "cpu"
             copy = torch.empty_like(value, device=target,
                                     pin_memory=bool(pin and str(target) == "cpu"))
-            copy.copy_(value.detach())
+            copy.copy_(value.detach(), non_blocking=non_blocking)
             memo[id(value)] = copy
             if devices is not None and not restore:
                 devices[id(copy)] = str(value.device)
         return memo[id(value)]
     if isinstance(value, dict):
-        return {k: _copy_tree(v, pin=pin, memo=memo, devices=devices, restore=restore)
+        return {k: _copy_tree(v, pin=pin, memo=memo, devices=devices, restore=restore, non_blocking=non_blocking)
                 for k, v in value.items()}
     if isinstance(value, deque):
-        return deque((_copy_tree(v, pin=pin, memo=memo, devices=devices, restore=restore)
+        return deque((_copy_tree(v, pin=pin, memo=memo, devices=devices, restore=restore, non_blocking=non_blocking)
                       for v in value), maxlen=value.maxlen)
     if isinstance(value, (list, tuple)):
-        return type(value)(_copy_tree(v, pin=pin, memo=memo, devices=devices, restore=restore) for v in value)
+        return type(value)(_copy_tree(v, pin=pin, memo=memo, devices=devices, restore=restore,
+                                     non_blocking=non_blocking) for v in value)
     if value is None or type(value) in (bool, int, float, str):
         return value
     raise ConversationCacheError(f"unsupported state metadata: {type(value).__name__}")
@@ -210,7 +211,9 @@ def _logical_rows(value):
     itertools.product materializes its input ranges; Tensor iteration unbinds
     an entire dimension. Indexed recursion retains only one view per dimension.
     """
-    if value.dim() <= 1:
+    if value.is_contiguous():
+        yield value.reshape(-1)
+    elif value.dim() <= 1:
         yield value
     else:
         for index in range(value.shape[0]):
@@ -320,22 +323,27 @@ def _drafter_tail(drafter):
     return getattr(drafter, "tail", drafter)
 
 
-def _buffers(stage, drafter):
+def _buffers(stage, drafter, *, frontier=None, synchronize=True):
     runtime = getattr(stage, "_kv_runtime", None)
     if runtime is not None:
         if runtime._active is not None:
             raise ConversationCacheError("KV workspace is active; drain before snapshot/restore")
-        runtime.synchronize_host()
+        if synchronize:
+            runtime.synchronize_host()
     result = OrderedDict()
     for i, layer in enumerate(stage.layers):
         attn = layer.attn
         entry = runtime.entries.get(id(attn)) if runtime is not None else None
         result[f"main.{i}.kv"] = entry["ring"] if entry is not None else attn.kv_cache
+        rows = frontier // attn.compress_ratio if frontier is not None and attn.compress_ratio else None
+        if entry is None and rows is not None:
+            result[f"main.{i}.kv"] = attn.kv_cache[:, :attn.window_size + rows]
         if entry is not None:
-            result[f"main.{i}.history"] = entry["history"]
+            result[f"main.{i}.history"] = entry["history"] if rows is None else entry["history"][:, :rows]
         indexer = getattr(attn, "indexer", None)
         if indexer is not None:
-            result[f"main.{i}.index"] = entry["index_history"] if entry is not None else indexer.kv_cache
+            value = entry["index_history"] if entry is not None else indexer.kv_cache
+            result[f"main.{i}.index"] = value if rows is None else value[:, :rows]
         for name, owner in (("attention", attn), ("indexer", indexer)):
             compressor = getattr(owner, "compressor", None)
             if compressor is not None:
@@ -444,7 +452,7 @@ class StageConversationCache:
                 self.invalidate()
             self.drafter = drafter
 
-    def _boundary(self, frontier=None):
+    def _boundary(self, frontier=None, *, state_frontier=None):
         if getattr(self.stage, "_replaying", False):
             raise ConversationCacheError("cannot capture or restore during rollback replay")
         if frontier is not None and (type(frontier) is not int or frontier != self.stage._pos):
@@ -452,7 +460,7 @@ class StageConversationCache:
         device = torch.device(self.stage.device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-        return _buffers(self.stage, self.drafter)
+        return _buffers(self.stage, self.drafter, frontier=state_frontier)
 
     def _prune(self):
         for key, entry in tuple(self._entries.items()):
@@ -500,7 +508,7 @@ class StageConversationCache:
             raise ConversationCacheError("cached tail reply may not contain signatures or job metadata")
         with self._lock:
             self._prune()
-            buffers = self._boundary(committed_frontier)
+            buffers = self._boundary(committed_frontier, state_frontier=committed_frontier)
             metadata = _metadata(self.stage, self.drafter)
             stamp = _model_stamp(self.stage, self.drafter)
             signatures = {name: _signature(value) for name, value in buffers.items()}
@@ -519,8 +527,16 @@ class StageConversationCache:
             self._room(identity.tenant, host, tensor_bytes if self.pinned else 0)
             self._ensure_hash_workspace()
             devices, memo = {}, {}
-            saved = _copy_tree(buffers, pin=self.pinned, memo=memo)
-            meta = _copy_tree(metadata, pin=self.pinned, memo=memo, devices=devices)
+            try:
+                saved = _copy_tree(buffers, pin=self.pinned, memo=memo, non_blocking=self.pinned)
+                meta = _copy_tree(metadata, pin=self.pinned, memo=memo, devices=devices, non_blocking=self.pinned)
+            finally:
+                # Keep both source tree and every allocated destination in scope
+                # until queued D2H completes, including a partial allocation failure.
+                if self.pinned and torch.device(self.stage.device).type == "cuda":
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream(self.stage.device))
+                    event.synchronize()
             if stamp != _model_stamp(self.stage, self.drafter):
                 raise ConversationCacheError("weights changed while snapshotting")
             self._generation += 1
@@ -565,7 +581,7 @@ class StageConversationCache:
             "prefix": entry.prefix.to_dict() if isinstance(entry.prefix, PrefixBinding) else entry.prefix})
         if state_digest != entry.state_digest or content_digest != entry.content_digest:
             raise ConversationCacheError("cached state content was modified")
-        buffers = self._boundary()
+        buffers = self._boundary(state_frontier=_prefix_count(entry.prefix))
         if self.clock() >= entry.expires or _model_stamp(self.stage, self.drafter) != entry.model_stamp:
             raise ConversationCacheError("expired checkpoint or changed model parameters")
         if {k: _signature(t) for k, t in buffers.items()} != entry.signatures:
@@ -587,11 +603,15 @@ class StageConversationCache:
             token, entry = self._ticket(ticket)
             try:
                 buffers = self._validate_entry(entry)
+                runtime = getattr(self.stage, "_kv_runtime", None)
+                if runtime is not None:
+                    runtime.invalidate_workspace()
                 # Allocate dynamic rollback/tap objects *before* touching buffers.
-                metadata = _copy_tree(entry.metadata, devices=entry.metadata_devices, restore=True)
+                metadata = _copy_tree(entry.metadata, devices=entry.metadata_devices, restore=True,
+                                      non_blocking=self.pinned)
                 with torch.no_grad():
                     for name, target in buffers.items():
-                        target.copy_(entry.buffers[name])
+                        target.copy_(entry.buffers[name], non_blocking=self.pinned)
                 for name, value in metadata["main"].items():
                     setattr(self.stage, name, value)
                 tail = _drafter_tail(self.drafter)
@@ -600,8 +620,8 @@ class StageConversationCache:
                         setattr(tail, name, value)
                     for name, value in metadata.get("drafter", {}).items():
                         setattr(self.drafter, name, value)
-                self._boundary(_prefix_count(entry.prefix))
-                state_digest = self._state_digest({"buffers": _buffers(self.stage, self.drafter),
+                restored = self._boundary(_prefix_count(entry.prefix), state_frontier=_prefix_count(entry.prefix))
+                state_digest = self._state_digest({"buffers": restored,
                     "metadata": _metadata(self.stage, self.drafter), "tail_reply": entry.tail_reply})
                 if state_digest != entry.state_digest:
                     raise ConversationCacheError("restored state byte hash differs from checkpoint")

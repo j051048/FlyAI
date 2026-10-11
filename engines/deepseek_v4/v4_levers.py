@@ -954,6 +954,7 @@ ENGINE_MODULES = (
     "v4_expert_cache.py", "v4_hybrid.py", "v4_chunked_prefill.py", "v4_wire_codec.py",
     "v4_kv_runtime.py", "v4_privacy.py", "v4_gateway.py",
     "v4_runtime_init.py", "v4_observability.py", "v4_artifact_contract.py", "v4_tokenizer.py",
+    "v4_native_trace.py",
     "v4_prefill_expert_pipeline.py", "v4_conversation_cache.py", "v4_conversation_protocol.py", "v4_request_features.py",
 )
 

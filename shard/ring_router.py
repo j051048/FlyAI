@@ -37,6 +37,10 @@ class RingRouter:
     def models(self):
         return self.pool.models()
 
+    def abort(self):
+        for ring in self.pool.rings():
+            ring.backend.abort()
+
 
 class SessionAffinity:
     """Tenant/cohort scoped, bounded hints for *new* ring admissions."""
@@ -77,17 +81,80 @@ class SessionAffinity:
 class MultiRingQueue(ServiceQueue):
     """Shares quota/idempotency/history globally; serial execution is per ring."""
     def __init__(self, router, tenants, *, session_affinity=False, affinity_max_entries=1024,
-                 affinity_ttl_s=300.0, **options):
+                 affinity_ttl_s=300.0, batching=None, scheduling=None, **options):
         if type(session_affinity) is not bool:
             raise ValueError("session_affinity must be an explicit boolean")
-        super().__init__(router, tenants, **options)
         self.router = router
+        if options.get("journal") is not None:
+            if options.get("recovery_resolver") is not None:
+                raise ValueError("multi-ring recovery uses the pinned cohort resolver")
+            options["recovery_resolver"] = self._resolve_recovered_job
+        from .continuous_batch import batching_options, backend_contract
+        self._batching = batching_options(batching)
+        if self._batching["enabled"]:
+            for ring in router.pool.rings():
+                if ring.state == RingState.READY:
+                    backend_contract(ring)
+        scheduling = scheduling or {}
+        if not isinstance(scheduling, dict) or set(scheduling) - {"policy", "aging_s"}:
+            raise ValueError("unknown scheduling options")
+        import math
+        self._scheduling = scheduling.get("policy", "fifo")
+        self._aging_s = scheduling.get("aging_s", 10.0)
+        if self._scheduling not in ("fifo", "shortest_with_aging") or type(self._aging_s) not in (int, float) or not math.isfinite(self._aging_s) or self._aging_s <= 0:
+            raise ValueError("invalid finite scheduling policy")
+        affinity = (SessionAffinity(max_entries=affinity_max_entries, ttl_s=affinity_ttl_s,
+            clock=options.get("clock", time.monotonic)) if session_affinity else None)
+        super().__init__(router, tenants, **options)
         self._ring_workers = {}
         self._running_by_ring = {}
-        self._session_affinity = (SessionAffinity(max_entries=affinity_max_entries, ttl_s=affinity_ttl_s,
-            clock=self.clock) if session_affinity else None)
+        self._session_affinity = affinity
+        for job in self._jobs.values():
+            context = self._durable_context(job) or {}
+            if context:
+                job.request_fingerprint = context.get("request_fingerprint", job.fingerprint)
+                job.served_model, job.served_cohort = context.get("model_id"), context.get("cohort_id")
+                if job.terminal:
+                    self._bind_terminal_decoder(job)
+
+    def _bind_terminal_decoder(self, job):
+        for ring in self.router.pool.rings():
+            if ring.model_id == job.served_model and ring.cohort_id == job.served_cohort:
+                job.bound_backend = ring.backend
+                return
+
+    def _resolve_recovered_job(self, record):
+        context = record["context"]
+        try:
+            model, cohort = self.router.pool.resolve(context["model_id"], context["cohort_id"])
+            binding = self.router.pool.acquire(model, cohort, estimated_tokens=record["prompt"] + record["maximum"])
+        except RingUnavailable:
+            return None
+        try:
+            body = dict(context["original_request"], model=model)
+            for name in ("shard_cohort", "shard_region", "shard_session_id"):
+                body.pop(name, None)
+            payload, prompt, maximum, _ = binding.backend.prepare(body)
+            if payload != record["payload"] or prompt != record["prompt"] or maximum != record["maximum"]:
+                raise ValueError("recovery preparation differs from the persisted request")
+            return {"payload": payload, "prompt_tokens": prompt, "max_new": maximum,
+                "bind": {"ring_binding": binding, "bound_backend": binding.backend,
+                    "served_model": model, "served_cohort": cohort,
+                    "request_fingerprint": context["request_fingerprint"],
+                    "conversation_session_id": context.get("session_id")},
+                "cleanup": lambda: self.router.pool.release(binding)}
+        except Exception:
+            self.router.pool.release(binding)
+            raise
+
+    def _journal_fenced(self, error):
+        # The replacement owner retains the durable pending row. This process
+        # can only stop its local execution and release verified local bindings.
+        self._preserve_pending = True
+        super()._journal_fenced(error)
 
     def start(self):
+        self.recover_pending()
         with self._condition:
             if self._worker is not None:
                 return
@@ -104,6 +171,8 @@ class MultiRingQueue(ServiceQueue):
                     if not worker.is_alive():
                         self._ring_workers.pop(ring_id, None)
                 for ring in self.router.pool.rings():
+                    if ring.state == RingState.FAILED and not ring.bound_jobs:
+                        continue
                     if ring.state != RingState.STOPPED and ring.ring_id not in self._ring_workers:
                         worker = threading.Thread(target=self._run_ring, args=(ring,),
                                                   name="ring-" + ring.ring_id, daemon=True)
@@ -133,6 +202,8 @@ class MultiRingQueue(ServiceQueue):
                 if job.request_fingerprint != raw_fingerprint:
                     raise AdmissionError("idempotency key names another request", status=409, code="idempotency_conflict")
                 self._counts["deduplicated"] += 1
+                if job.terminal:
+                    self._bind_terminal_decoder(job)
                 return job, False
             model = request.get("model", self.router.model_id)
             cohort, region = request.get("shard_cohort"), request.get("shard_region")
@@ -160,9 +231,17 @@ class MultiRingQueue(ServiceQueue):
                 prepared_body.pop("shard_cohort", None); prepared_body.pop("shard_region", None)
                 prepared_body.pop("shard_session_id", None)
                 payload, count, maximum, timeout_s = binding.backend.prepare(prepared_body)
+                if self._batching["enabled"]:
+                    from .continuous_batch import backend_contract
+                    contract = backend_contract(binding.ring)
+                    if count > contract["max_prompt_tokens"] or maximum > contract["max_new_tokens"] or count + maximum > contract["max_context_tokens"]:
+                        raise AdmissionError("prompt exceeds qualified batch state capacity", status=400, code="context_length_exceeded")
                 self.router.pool.update_estimate(binding, count + maximum)
                 job, fresh = super().submit(tenant, payload, prompt_tokens=count, max_new=maximum,
-                                           timeout_s=timeout_s, idempotency_key=idempotency_key)
+                    timeout_s=timeout_s, idempotency_key=idempotency_key,
+                    durable_context={"model_id": model_id, "cohort_id": cohort_id,
+                        "original_request": request, "request_fingerprint": raw_fingerprint,
+                        "session_id": session_id})
                 # The worker cannot see the newly enqueued job until this shared
                 # admission lock is released. Backend/tokenizer remain fixed forever.
                 job.ring_binding = binding
@@ -183,8 +262,12 @@ class MultiRingQueue(ServiceQueue):
         for _ in range(len(self._round)):
             tenant = self._round.popleft()
             queue = self._queues[tenant]
-            job = next((item for item in queue if not item.terminal and
-                        item.ring_binding.ring is ring), None)
+            candidates = [item for item in queue if not item.terminal and item.ring_binding.ring is ring]
+            job = candidates[0] if candidates else None
+            if candidates and self._scheduling == "shortest_with_aging":
+                aged = [item for item in candidates if self.clock() - item.created_mono >= self._aging_s]
+                job = min(aged, key=lambda item: item.created_mono) if aged else min(candidates,
+                    key=lambda item: (item.prompt_tokens + item.max_new, item.created_mono))
             if job is None:
                 if queue:
                     self._round.append(tenant)
@@ -195,23 +278,34 @@ class MultiRingQueue(ServiceQueue):
             if self.clock() >= job.deadline:
                 self._finish(job, "expired", error="job deadline exceeded", code="deadline_exceeded")
                 continue
+            from .job_journal import JournalConflict, JournalOwnerLost
+            try:
+                self._mark_running(job)
+            except JournalConflict as error:
+                self._finish(job, "failed", error=str(error), code="recovery_attempt_limit")
+                continue
+            except JournalOwnerLost as error:
+                self._journal_fenced(error)
+                return None
             self._queued_count -= 1
             self._queued_tokens -= job.prompt_tokens + job.max_new
-            with job.changed:
-                job.state = "running"
-                job.changed.notify_all()
             return job
         return None
 
     def _finish(self, job, state, **options):
         already_terminal = job.terminal
-        super()._finish(job, state, **options)
-        if not already_terminal and hasattr(job, "ring_binding"):
-            elapsed = self.clock() - job.execution_started if hasattr(job, "execution_started") else None
-            self.router.pool.release(job.ring_binding, elapsed_s=elapsed,
-                                     tokens=job.prompt_tokens + len(job.tokens) if state == "completed" else None)
+        try:
+            super()._finish(job, state, **options)
+        finally:
+            if not already_terminal and hasattr(job, "ring_binding"):
+                elapsed = self.clock() - job.execution_started if hasattr(job, "execution_started") else None
+                self.router.pool.release(job.ring_binding, elapsed_s=elapsed,
+                    tokens=job.prompt_tokens + len(job.tokens) if job.state == "completed" else None)
 
     def _run_ring(self, ring):
+        if self._batching["enabled"]:
+            from .continuous_batch import ContinuousRingWorker
+            return ContinuousRingWorker(self, ring, self._batching).run()
         ring_id = ring.ring_id
         while True:
             with self._condition:
@@ -251,7 +345,11 @@ class MultiRingQueue(ServiceQueue):
             finally:
                 with self._condition:
                     self._running_by_ring.pop(ring_id, None)
-                    self._prune(self.clock())
+                    from .job_journal import JournalOwnerLost
+                    try:
+                        self._prune(self.clock())
+                    except JournalOwnerLost as error:
+                        self._journal_fenced(error)
                     self._condition.notify_all()
 
     def metrics(self, tenant=None):
@@ -259,16 +357,28 @@ class MultiRingQueue(ServiceQueue):
             body = super().metrics(tenant)
             body.update(mode="parallel_serial_rings", running=len(self._running_by_ring),
                         ring_workers=len(self._ring_workers))
+            if self._batching["enabled"]:
+                body["mode"] = "qualified_token_batches"
+                body["running"] = sum(len(value) if isinstance(value, tuple) else 1 for value in self._running_by_ring.values())
+            body["scheduling_policy"] = self._scheduling
             return body
 
-    def shutdown(self, *, drain=False, timeout=10.0):
+    def shutdown(self, *, drain=False, timeout=10.0, preserve_pending=False):
+        preserve_pending = preserve_pending or (self.journal is not None and self._journal_failed is not None)
+        if type(preserve_pending) is not bool or (preserve_pending and self.journal is None):
+            raise ValueError("preserve_pending requires an explicitly configured journal")
+        self._preserve_pending = preserve_pending
         end = time.monotonic() + timeout
         with self._condition:
             self._accepting = False
             self._stopping = True
-            if not drain:
-                for job in list(self._jobs.values()):
+            if preserve_pending:
+                for job in self._jobs.values():
                     if not job.terminal:
+                        job.cancelled.set()
+            elif not drain:
+                for job in list(self._jobs.values()):
+                    if not job.terminal and not preserve_pending:
                         self.cancel(job.tenant, job.id)
             self._condition.notify_all()
         self.router.pool.shutdown()  # no new bindings; retained jobs keep their rings
@@ -291,7 +401,22 @@ class MultiRingQueue(ServiceQueue):
                 worker.join(min(timeout, 2.0))
         if self._sweeper:
             self._sweeper.join(min(timeout, 1.0))
-        return not any(worker.is_alive() for worker in self._ring_workers.values())
+        stopped = not any(worker.is_alive() for worker in self._ring_workers.values())
+        if stopped and preserve_pending:
+            for job in self._jobs.values():
+                if hasattr(job, "ring_binding"):
+                    self.router.pool.release(job.ring_binding)
+        if stopped and self.journal is not None:
+            self._journal_stop.set()
+            if self._journal_thread is not None:
+                self._journal_thread.join(min(timeout, 1))
+            from .job_journal import JournalOwnerLost
+            try:
+                self.journal.release_owner(self._journal_owner)
+            except JournalOwnerLost:
+                pass
+            self.journal.checkpoint()
+        return stopped
 
     def _ring_backend(self, ring_id):
         return next(r.backend for r in self.router.pool.rings() if r.ring_id == ring_id)

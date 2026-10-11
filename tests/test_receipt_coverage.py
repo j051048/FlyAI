@@ -37,6 +37,21 @@ def test_full_tiling_passes():
     verify_coverage(receipts, N_LAYERS)  # must not raise
 
 
+@pytest.mark.parametrize("changes", [{"n_chunks": True}, {"layer_start": False},
+    {"layer_end": 62.0}, {"in_root": "not-a-content-digest"}, {"out_root": "F" * 64}])
+def test_valid_signature_does_not_authorize_malformed_coverage(changes):
+    import base64
+    from shard.receipt import _canonical
+    key = gen_key()
+    signer = ReceiptSigner(key, "ring", "job", 0, N_LAYERS)
+    signer.observe(b"input", b"output")
+    value = signer.finalize()
+    value.update(changes)
+    value["sig"] = base64.b64encode(key.sign(_canonical(value))).decode()
+    with pytest.raises(ReceiptError):
+        verify_coverage([value], N_LAYERS)
+
+
 def test_truncated_ring_fails_against_true_depth():
     """THE hole: a ring that never attested layers 40..62. Against the self-referential target
     (max(layer_end)=40) it tiles 'fully'; against the true depth it must fail."""

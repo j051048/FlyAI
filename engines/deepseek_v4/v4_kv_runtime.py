@@ -78,6 +78,7 @@ class V4KVRuntime:
         self.gpu_budget_bytes, self.host_budget_bytes = gpu_budget_bytes, host_budget_bytes
         self._lock = threading.RLock()
         self._active, self._event, self._stream_id = None, None, None
+        self._resident_prefix = None
         element = torch.empty((), dtype=dtype, device="cpu").element_size()
         self.element_size = element
         self.fixed_bytes = 0
@@ -225,6 +226,18 @@ class V4KVRuntime:
         for row in range(batch):
             target[row].copy_(source[row], non_blocking=not self.reference)
 
+    def invalidate_workspace(self):
+        """Cold restore/seek fence: a shared workset must not outlive its state."""
+        with self._lock:
+            if self._active is not None:
+                raise RuntimeError("cannot invalidate an active KV workspace")
+            self._resident_prefix = None
+
+    def _prefix_stamp(self, entry, rows, batch):
+        return (id(entry["attention"]), rows, batch, self.workspace._version,
+                entry["history"]._version,
+                entry["index_history"]._version if entry["index_history"] is not None else None)
+
     @contextmanager
     def layer(self, attn, start_pos, tokens, batch=None):
         batch = self.args.max_batch_size if batch is None else batch
@@ -249,12 +262,19 @@ class V4KVRuntime:
             entry = self.entries[id(attn)]
             stream = self._ordered_stream()
             rows = (start_pos + tokens) // attn.compress_ratio
+            # Newly completed rows are written by Compressor before their first
+            # read, including replay. Prefill constructs every valid row itself.
+            # Materialize only the already-valid prefix; retain the full operand
+            # shape, so Indexer and attention arithmetic are unchanged.
+            previous_rows = 0 if start_pos == 0 else start_pos // attn.compress_ratio
+            reuse = self._resident_prefix == self._prefix_stamp(entry, rows, batch)
             count = self.args.max_batch_size * (attn.window_size + rows) * attn.head_dim
             kv = self.workspace[:count].view(self.args.max_batch_size, attn.window_size + rows, attn.head_dim)
             kv[:, :attn.window_size].copy_(entry["ring"])
-            if rows:
-                self._copy_host_rows(kv[:, attn.window_size:], entry["history"][:, :rows], batch)
-                self.h2d_bytes += batch * rows * attn.head_dim * self.element_size if not self.reference else 0
+            if previous_rows and not reuse:
+                self._copy_host_rows(kv[:, attn.window_size:attn.window_size + previous_rows],
+                                     entry["history"][:, :previous_rows], batch)
+                self.h2d_bytes += batch * previous_rows * attn.head_dim * self.element_size if not self.reference else 0
             attn.kv_cache = kv
             attn.compressor.kv_cache = kv[:, attn.window_size:]
             attn.compressor.freqs_cis = attn.freqs_cis
@@ -262,9 +282,9 @@ class V4KVRuntime:
             if indexer is not None:
                 index = self.workspace[count:count + self.args.max_batch_size * rows * indexer.head_dim].view(
                     self.args.max_batch_size, rows, indexer.head_dim)
-                if rows:
-                    self._copy_host_rows(index, entry["index_history"][:, :rows], batch)
-                    self.h2d_bytes += batch * rows * indexer.head_dim * self.element_size if not self.reference else 0
+                if previous_rows and not reuse:
+                    self._copy_host_rows(index[:, :previous_rows], entry["index_history"][:, :previous_rows], batch)
+                    self.h2d_bytes += batch * previous_rows * indexer.head_dim * self.element_size if not self.reference else 0
                 indexer.kv_cache = index
                 indexer.freqs_cis = attn.freqs_cis
                 indexer.compressor.kv_cache = index
@@ -296,15 +316,21 @@ class V4KVRuntime:
                 self._record_current_stream(stream)
                 self._active = None
                 self.layer_calls += int(succeeded)
+                self.prefix_rows_loaded += previous_rows if succeeded and not reuse else 0
+                self.prefix_rows_reused += previous_rows if succeeded and reuse else 0
+                self.new_rows_not_loaded += rows - previous_rows if succeeded else 0
+                self._resident_prefix = self._prefix_stamp(entry, rows, batch) if succeeded else None
 
     def reset_stats(self):
         self.h2d_bytes = self.d2h_bytes = self.layer_calls = 0
+        self.prefix_rows_loaded = self.prefix_rows_reused = self.new_rows_not_loaded = 0
 
     def reset(self):
         with self._lock:
             if self._active is not None:
                 raise RuntimeError("cannot reset an active KV workspace")
             self.synchronize_host()
+            self._resident_prefix = None
             for entry in self.entries.values():
                 attn = entry["attention"]
                 attn.kv_cache = entry["ring"]
@@ -343,3 +369,11 @@ class V4KVRuntime:
                 "max_supported_tokens": lo, "layer_calls": self.layer_calls,
                 "h2d_bytes": self.h2d_bytes, "d2h_bytes": self.d2h_bytes,
                 "scope": "KV storage only; excludes RoPE, activations and kernel temporaries"}
+
+    def transfer_status(self):
+        """Additional diagnostics, separate from the existing signed KV schema."""
+        return {"schema": "v4-kv-transfer/1", "reference": self.reference,
+                "prefix_rows_loaded": self.prefix_rows_loaded, "prefix_rows_reused": self.prefix_rows_reused,
+                "new_rows_not_loaded": self.new_rows_not_loaded,
+                "contract": "existing-valid-prefix-only; unchanged owner/layout/history/workspace versions",
+                "hardware_verified": False}

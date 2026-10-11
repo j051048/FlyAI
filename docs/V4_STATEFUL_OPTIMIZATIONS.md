@@ -1,6 +1,6 @@
 # V4 请求边界与预填充状态优化
 
-核对日期：2026-10-09，按当前工作区代码。三个功能都默认关闭，适用于现有原生
+核对日期：2026-10-11，按当前工作区代码。三个功能都默认关闭，适用于现有原生
 43 层 DeepSeek-V4-Flash 引擎。没有新的 GPU 吞吐结论，也不声明支持 V4.1 权重。
 
 | 功能 | 生效位置 | 当前保证与限制 |
@@ -126,6 +126,9 @@ GPU quota 为恢复 taps/rollback/MTP 动态元数据预留，并非在 GPU 中�
 
 [v4_conversation_cache.py](../engines/deepseek_v4/v4_conversation_cache.py) 保存全部有效 main
 KV/Indexer 历史、Compressor 递归状态、taps、rollback 元数据，以及已加载 MTP 的 KV/前沿。
+压缩 KV/Indexer 只保存当前可读的完整有效前缀，不复制未使用的 max_seq 尾部；窗口与递归状态
+仍完整保留。分层 KV 只搬运进入该层时已有效的历史，新行由原 Compressor 写入；版本/布局
+不变时可以复用当前工作区。seek/reset/restore/异常会失效复用，完整恢复字节核对仍执行。
 它不把只含窗口和递归状态的 rollback snapshot 当作完整前缀快照。
 [v4_conversation_protocol.py](../engines/deepseek_v4/v4_conversation_protocol.py) 在排空且已提交的
 prompt 边界执行全 stage prepare，再执行 commit。固定缓冲原位恢复；存储/权重改变、过期、
@@ -157,9 +160,17 @@ exact repeat 只跳过同一匹配前缀的预填充，恢复缓存的首 token 
 缓存恢复不重用旧收据。每次作业仍使用新 nonce/job、当前 signer 与完整层覆盖核验；
 新的签名收据可带 `conversation_restore` 声明，chunks 只计算本次真正执行的新 forward。
 命中响应的 `proof.scope` 是 `fresh_suffix_with_signed_prefix_restore`。
+多环管理器会通过后端验证器核对当前作业完成绑定、全部恢复事务和新签名后缀，不再把合法
+命中误拒为失败环；未知范围、缺节点、不同状态摘要及伪造签名仍拒绝。
 这证明新的 suffix 收据及签名的前缀恢复声明已按合同校验，不证明该前缀刚刚重新执行、
 缓存状态由诚实算术产生，或物理 GPU 已远程认证。不得把它记成完整新执行前缀的成本或证据。
 边界见 [V4_TRUST_BOUNDARIES](V4_TRUST_BOUNDARIES.md)。
+
+内部 [v4_native_trace.py](../engines/deepseek_v4/v4_native_trace.py) 提供有限 greedy 单 token
+轨迹检查点：数值对照是同一 prefill 后不中断的逐 token 执行，绑定原 token 轨迹与固定 horizon。
+它不启用普通新聊天的增量 prefill，也不跳过上述 extended_shadow；没有公共 HTTP/wire
+能力声明。私有作业重放、token batching 后端门槛和组合发布见
+[V4_SERVICE_HARDENING](V4_SERVICE_HARDENING.md)。
 
 ## 4. 有界专家 DMA 预填充流水
 

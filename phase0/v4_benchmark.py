@@ -240,7 +240,7 @@ def source_identity(root: Path = ROOT) -> dict:
     paths = set()
     for directory in (root / "engines" / "deepseek_v4", root / "vendor" / "deepseek_v4_ref", root / "shard"):
         paths.update(directory.rglob("*.py"))
-    for name in ("phase0/wire.py", "phase0/v4_benchmark.py", "phase0/v4_soak.py"):
+    for name in ("phase0/wire.py", "phase0/v4_benchmark.py", "phase0/v4_soak.py", "phase0/v4_release.py"):
         if (root / name).is_file():
             paths.add(root / name)
     files = [{"name": p.relative_to(root).as_posix(), "sha256": file_digest(p)} for p in sorted(paths)]
@@ -461,7 +461,10 @@ def runtime_observation_errors(observation, node, protocol):
                            "vendor/deepseek_v4_ref/inference/model.py", "shard/pipeline_session.py", "shard/transport.py"}
         required_source |= {path for path in expected if path.startswith(("engines/deepseek_v4/v4_", "vendor/deepseek_v4_ref/"))
                             or path in {"shard/"+name+".py" for name in (
-                                "receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport", "speculation_policy")}}
+                                "receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport", "speculation_policy",
+                                "execution_proof", "job_journal", "service_queue", "http_gateway", "ring_pool", "ring_router",
+                                "continuous_batch", "node_quality", "locality", "planning_cost", "offers", "control_plane",
+                                "network_service", "plan", "topology")}}
         if not required_source <= set(value["source_files"]):
             errors.append("observed source inventory omits core executed stage/protocol modules")
         if any(expected.get(path) != sha for path, sha in value["source_files"].items()):

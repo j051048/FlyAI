@@ -537,10 +537,11 @@ class FormationController:
     Global locks cover only state snapshots, never network or model operations.
     """
     def __init__(self, registry, ring_pool, agents, *, requirements, backend_factory,
-                 clock=time.time, maintain=True, agent_factory=None):
+                 clock=time.time, maintain=True, agent_factory=None, quality=None):
         self.registry, self.pool, self.agents = registry, ring_pool, dict(agents)
         self.requirements, self.backend_factory, self.clock = requirements, backend_factory, clock
         self.agent_factory = agent_factory
+        self.quality = quality
         self._lock = threading.RLock()
         self._formations = {}
         self._closed = False
@@ -555,7 +556,7 @@ class FormationController:
             self.tick(asynchronous=True)
 
     def form(self, ring_id, cohort, profile, *, rtt=None, measurements=None, locality=None,
-             objective="serial", workload=None, ttl_s=120, warmup_timeout_s=60, coordinator_id=None, route_ids=None):
+             objective="serial", workload=None, ttl_s=120, warmup_timeout_s=60, coordinator_id=None, route_ids=None, slo=None):
         from .plan import plan_ring
         from .leases import LeaseRequest, LeaseResources
         from .resources import PlacementRequirements
@@ -587,7 +588,8 @@ class FormationController:
                                 self.agents[node["id"]] = client
                         except (ValueError, KeyError, OSError):
                             continue  # Registered nodes without a usable endpoint stay in the pool.
-            nodes = [n for n in nodes if n["gpu_uuid"] not in busy and n["id"] in self.agents]
+            nodes = [n for n in nodes if n["gpu_uuid"] not in busy and n["id"] in self.agents and
+                     (self.quality is None or self.quality.permits(n["id"], cid))]
             if rtt is not None:
                 # Caller dense matrices align to the complete cohort snapshot.
                 positions = [all_ids.index(n["id"]) for n in nodes]
@@ -596,6 +598,7 @@ class FormationController:
             plan = plan_ring(nodes, rtt, profile, locality=locality or {"mode": "prefer_local"},
                              objective=objective, workload=workload, measurements=measurements, now=self.clock(),
                              diagnostics=diagnostics, **({"coordinator_id": coordinator_id} if coordinator_id is not None else {}),
+                             **({"slo": slo} if slo is not None else {}),
                              **({"route_ids": route_ids} if route_ids is not None else {}))
             if plan is None:
                 # Prove this is a capacity refusal, not an invalid cohort,
@@ -629,6 +632,7 @@ class FormationController:
                                 filesystem["available_disk_bytes"] = max(filesystem["available_disk_bytes"], total_disk)
                     possible = plan_ring(relaxed, rtt, profile, locality=locality or {"mode": "prefer_local"},
                         objective=objective, workload=workload, measurements=measurements, now=self.clock(),
+                        **({"slo": slo} if slo is not None else {}),
                         **({"coordinator_id": coordinator_id} if coordinator_id is not None else {}),
                         **({"route_ids": route_ids} if route_ids is not None else {}))
                     if possible is not None:

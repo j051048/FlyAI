@@ -1,12 +1,16 @@
 # V4 运行自检、strict 部署与性能复测
 
-2026-10-09，按当前工作区运行时与服务接线。适用原生 43 层 V4-Flash，
+2026-10-11，按当前工作区运行时与服务接线。适用原生 43 层 V4-Flash，
 不是 V4.1 的兼容声明，也不代表新的 5090 集群成绩。
 
 CPU 数值、真实本地 socket/HTTP/签名回归各有独立范围；不是全仓 CI 或 GPU 吞吐证明。
 GPU Hadamard、图重捕获/state 对照、状态缓存与专家 DMA 流水仍需要实际设备验收。
 本轮请求边界优化的配置和证据范围见
 [V4_STATEFUL_OPTIMIZATIONS](V4_STATEFUL_OPTIMIZATIONS.md)。
+私有作业日志、短请求调度、SLO 组环及组合发布门槛见
+[V4_SERVICE_HARDENING](V4_SERVICE_HARDENING.md)。GPU 发布还需同时通过真实 kernel、
+缓存/图指针、native 单 token 轨迹、四卡/六卡固定基准与持续运行合同；使用
+`python phase0/v4_release.py --help` 查看 freeze/gpu-check/verify，CPU 不产生 GPU PASS。
 
 ## 1. 统一运行时初始化
 
