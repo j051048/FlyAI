@@ -32,6 +32,30 @@ def _finite_positive(value, name):
         raise ValueError(f"{name} must be finite and positive")
 
 
+def _artifact_verification_findings(report, protocol):
+    """Keep the frozen benchmark's native catalogue/local payload scopes intact.
+
+    A coordinator's authenticated global cohort and local model assets do not
+    claim to contain every stage's weight bytes. Signed stage/job/runtime
+    verification remains the responsibility of each campaign evaluator.
+    """
+    errors, missing = [], []
+    evidence = report.get("artifact_verification", {})
+    logical = protocol.get("checkpoint", {}).get("identity_kind") == "logical-tensor-catalogue"
+    required = (("global_catalog_verified", "authenticated_cohort_verified") if logical else
+                ("checkpoint_bytes_verified",)) + ("config_bytes_verified", "tokenizer_bytes_verified", "engine_source_verified")
+    if not all(evidence.get(name) is True for name in required):
+        missing.append("frozen checkpoint/config/tokenizer/source verification absent")
+    if logical:
+        scope = evidence.get("local_weight_scope")
+        if (evidence.get("checkpoint_id") != protocol["checkpoint"]["checkpoint_id"] or scope not in (
+                "complete packed payload hashes", "assigned stage payload hashes", "pinned catalogue and local model assets only")):
+            missing.append("local/global artifact verification scope absent or invalid")
+        if scope != "complete packed payload hashes" and evidence.get("checkpoint_bytes_verified") is True:
+            errors.append("partial/coordinator assets falsely claim complete local checkpoint verification")
+    return errors, missing
+
+
 def run_soak(adapter, protocol, *, cycles=25, duration_s=3600, ttft_p95_s=30,
              token_gap_p95_s=.25, max_idle_gap_s=10, clock=time.perf_counter, on_update=None):
     bench.require_protocol(protocol)
@@ -260,9 +284,9 @@ def evaluate_lifecycle(report, expected_protocol=None, expected_contract=None):
                     errors.append("forced rejection did not exercise repeated speculative rewinds")
         if report.get("backend") != "live_ring" or bench.protocol_errors(protocol):
             missing.append("CPU/test lifecycle evidence cannot qualify production hardware")
-        if not all(report.get("artifact_verification", {}).get(k) is True for k in
-                ("checkpoint_bytes_verified", "config_bytes_verified", "tokenizer_bytes_verified", "engine_source_verified")):
-            missing.append("frozen model/tokenizer/source verification absent")
+        artifact_errors, artifact_missing = _artifact_verification_findings(report, protocol)
+        errors.extend(artifact_errors)
+        missing.extend(artifact_missing)
         return {"status": "failed" if errors else "unverified" if missing else "passed",
             "errors": errors, "missing_evidence": missing, "cases": len(cases),
             "scope": "functional lifecycle matrix only; no speed or GPU execution attestation"}
@@ -296,9 +320,9 @@ def evaluate_soak(report, expected_protocol=None, expected_contract=None):
             errors.append("declared continuous duration not attained")
         if report.get("backend") != "live_ring":
             missing.append("CPU/mock campaign cannot qualify hardware acceptance")
-        if not all(report.get("artifact_verification", {}).get(k) is True for k in
-                   ("checkpoint_bytes_verified", "config_bytes_verified", "tokenizer_bytes_verified", "engine_source_verified")):
-            missing.append("checkpoint/config/tokenizer/source verification absent")
+        artifact_errors, artifact_missing = _artifact_verification_findings(report, protocol)
+        errors.extend(artifact_errors)
+        missing.extend(artifact_missing)
         assignments = {node["signer_pubkey"]: (node["layer_start"], node["layer_end"])
                        for node in protocol["hardware"]}
         hardware_by_signer = {node["signer_pubkey"]: node for node in protocol["hardware"]}

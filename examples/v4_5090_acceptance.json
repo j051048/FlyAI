@@ -1,0 +1,48 @@
+{
+  "schema": "flyai-v4-5090-campaign-config/1",
+  "ring": {
+    "schema": "flyai-v4-acceptance-ring-config/1",
+    "ring_id": "acceptance-5090-6",
+    "model_dir": "/data/models/deepseek-v4-native",
+    "model_id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "python": "/opt/flyai-venv/bin/python",
+    "catalogue_if_missing": false,
+    "environment": {
+      "V4_EXECUTION_PROFILE": "resident-whole",
+      "V4_MAX_SEQ": "8192",
+      "V4_PREFILL_QUERY_CHUNK": "128"
+    },
+    "stages": [
+      {"gpu_index": 0, "lo": 0, "hi": 7, "port": 29610, "node_id": "local-gpu-0"},
+      {"gpu_index": 1, "lo": 7, "hi": 15, "port": 29611, "node_id": "local-gpu-1"},
+      {"gpu_index": 2, "lo": 15, "hi": 23, "port": 29612, "node_id": "local-gpu-2"},
+      {"gpu_index": 3, "lo": 23, "hi": 31, "port": 29613, "node_id": "local-gpu-3"},
+      {"gpu_index": 4, "lo": 31, "hi": 39, "port": 29614, "node_id": "local-gpu-4"},
+      {"gpu_index": 5, "lo": 39, "hi": 43, "port": 29615, "node_id": "local-gpu-5"}
+    ],
+    "resource_probe": {
+      "prefill_tokens": 512,
+      "decode_tokens": 16,
+      "max_age_s": 21600,
+      "headroom_bytes": 2147483648
+    },
+    "timeouts": {"startup_s": 1800, "warmup_s": 600, "measure_s": 3600}
+  },
+  "numeric_gpu_index": 6,
+  "gpu_gate_index": 7,
+  "soak": {
+    "cycles": 25,
+    "duration_s": 3600,
+    "ttft_p95_s": 30,
+    "token_gap_p95_s": 0.25,
+    "max_idle_gap_s": 10
+  },
+  "timeouts": {
+    "numeric_s": 14400,
+    "gpu_gate_s": 3600,
+    "benchmark_s": 14400,
+    "job_s": 600,
+    "soak_s": 21600,
+    "lifecycle_s": 14400
+  }
+}

@@ -1,6 +1,6 @@
 # 当前文档导航与历史证据
 
-核对日期：2026-10-11；当前工作区含权重准备/换环、状态优化、恢复证明修复、可选持久作业日志、SLO/风险规划与请求 aging 调度。本页区分操作合同、接口规范、
+核对日期：2026-10-12；当前工作区含权重准备/换环、状态优化、恢复证明修复、可选持久作业日志、SLO/风险规划与请求 aging 调度。本页区分操作合同、接口规范、
 有日期的实验记录和参考实现来源。历史性能数字按原实验条件保留；新版计时、
 会话或资源合同需要新的原始运行证据。
 
@@ -16,6 +16,7 @@
 | 服务恢复、SLO/风险、调度/质量边界及真实发布门槛 | [V4_SERVICE_HARDENING](V4_SERVICE_HARDENING.md) |
 | P0–P2 执行、成本路由、原生请求、增量前缀及经济重组 | [V4_PERFORMANCE_EXECUTION](V4_PERFORMANCE_EXECUTION.md) |
 | 多卡宿主、命名配方、数值诊断、原生内核探针及四策略验收 | [V4_MULTIGPU_EXECUTION](V4_MULTIGPU_EXECUTION.md) |
+| 租用 5090 后交给 OpenClaw 的完整脚本、冻结计划与证据回收 | [V4_5090_ACCEPTANCE](V4_5090_ACCEPTANCE.md) |
 | 小磁盘节点、流式转换、权重准备与请求边界换环 | [WEIGHT_PREPARATION](WEIGHT_PREPARATION.md) |
 | 任意节点注册、区域组环、租约与多环 | [OPEN_INFERENCE_NETWORK](OPEN_INFERENCE_NETWORK.md) |
 | 资源准入与部署检查 | [RESOURCE_CONTRACT](RESOURCE_CONTRACT.md)、[DEPLOY_READINESS](DEPLOY_READINESS.md) |
