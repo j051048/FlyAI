@@ -156,6 +156,82 @@ def measure(devices, *, host_id, directory=".", sample_bytes=64 * 1024**2,
             "reservation": False, **summarize_transfers(rows, elapsed, sample_bytes, repeats)}
 
 
+def measure_topology(devices, *, host_id, sample_bytes=1024**2, repeats=10,
+                     max_pairs=64, ttl_s=300):
+    """Bounded sequential device-copy probes, separate from engine wire timings.
+
+    Tensor.copy_ may use a driver-selected staging path. Even when peer access is
+    available, these timings do not qualify CUDA IPC or a production backend.
+    No CPU/NUMA affinity or GPU/system configuration is changed.
+    """
+    from .host_topology import observe_linux_topology, validate_topology_report
+    if (not isinstance(host_id, str) or not host_id.strip() or not devices or len(devices) > 16 or
+            any(type(index) is not int or index < 0 for index in devices) or len(set(devices)) != len(devices)):
+        raise ValueError("explicit host identity and 1..16 distinct local GPU indices required")
+    _positive_int(sample_bytes, "pair sample_bytes")
+    _positive_int(repeats, "pair repeats")
+    _positive_int(max_pairs, "max_pairs")
+    if sample_bytes > 16 * 1024**2 or repeats > 100 or max_pairs > 64:
+        raise ValueError("pair probe exceeds bounded transfer/repeat/pair limits")
+    if type(ttl_s) not in (int, float) or not math.isfinite(ttl_s) or not 0 < ttl_s <= 86400:
+        raise ValueError("topology TTL must be within one day")
+    import torch
+    if not torch.cuda.is_available() or any(index >= torch.cuda.device_count() for index in devices):
+        raise RuntimeError("CUDA pair measurement requires the requested physical GPUs")
+    tensors, metadata = {}, []
+    for index in devices:
+        with torch.cuda.device(index):
+            free, _ = torch.cuda.mem_get_info(index)
+            if sample_bytes > free * .1:
+                raise RuntimeError("pair buffer exceeds 10% of currently available device VRAM")
+            prop = torch.cuda.get_device_properties(index)
+            uuid = str(getattr(prop, "uuid", ""))
+            if not uuid:
+                raise RuntimeError("physical GPU UUID observations required")
+            tensors[index] = torch.full((sample_bytes,), index % 251, dtype=torch.uint8, device=f"cuda:{index}")
+            torch.cuda.synchronize(index)
+            metadata.append(dict(local_index=index, gpu_uuid=uuid, gpu_name=prop.name))
+    uuid_by_index = {row["local_index"]: row["gpu_uuid"] for row in metadata}
+    if len(set(uuid_by_index.values())) != len(devices):
+        raise ValueError("different local indices refer to the same physical GPU")
+    pairs, total_pairs = [], len(devices) * (len(devices) - 1)
+    for source in devices:
+        for target in devices:
+            if source == target or len(pairs) >= max_pairs:
+                continue
+            peer = bool(torch.cuda.can_device_access_peer(source, target))
+            marker = (len(pairs) * 17) % 251
+            with torch.cuda.device(source):
+                tensors[source].fill_(marker)
+                torch.cuda.synchronize(source)
+            with torch.cuda.device(target):
+                tensors[target].fill_(marker + 1)
+                torch.cuda.synchronize(target)
+                tensors[target].copy_(tensors[source], non_blocking=True)
+                torch.cuda.synchronize(target)
+                torch.cuda.synchronize(source)
+                if not torch.equal(tensors[target].cpu(), tensors[source].cpu()):
+                    raise RuntimeError("device-copy probe produced different bytes")
+                samples = []
+                for _ in range(repeats):
+                    started = time.perf_counter()
+                    tensors[target].copy_(tensors[source], non_blocking=True)
+                    torch.cuda.synchronize(target)
+                    torch.cuda.synchronize(source)
+                    samples.append((time.perf_counter() - started) * 1000)
+            pairs.append(dict(src_gpu_uuid=uuid_by_index[source], dst_gpu_uuid=uuid_by_index[target],
+                peer_access=peer, copy_api="torch.Tensor.copy_", scope="device_copy_not_engine_wire",
+                sample_bytes=sample_bytes, samples_ms=samples,
+                mean_gb_s=sample_bytes / (sum(samples) / len(samples) / 1000) / 1e9))
+    report = dict(schema="shard-host-topology/1", host_id=host_id,
+        measured_at=datetime.now(timezone.utc).isoformat(), ttl_s=ttl_s,
+        identity_scope="operator-declared host; locally observed physical GPU UUIDs",
+        devices=observe_linux_topology(metadata), pairs=pairs, pairs_truncated=len(pairs) < total_pairs,
+        affinity_applied=False, concurrent=False, torch=torch.__version__, cuda=torch.version.cuda,
+        scope="read-only PCI/NUMA adjacency and sequential device copies; not production transport qualification")
+    return validate_topology_report(report)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--devices", required=True, help="comma-separated local CUDA indices")
@@ -166,15 +242,27 @@ def main(argv=None):
     parser.add_argument("--pin-budget-mib", type=int, default=0,
                         help="actually allocate this host-wide locked-memory budget; never inferred from RAM")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--topology-out", help="also run bounded GPU-pair probes and write a separate topology report")
+    parser.add_argument("--pair-sample-mib", type=int, default=1)
+    parser.add_argument("--pair-repeats", type=int, default=10)
+    parser.add_argument("--max-pairs", type=int, default=64)
     args = parser.parse_args(argv)
     try:
+        from pathlib import Path
+        output = Path(args.out)
+        topology_output = Path(args.topology_out) if args.topology_out else None
+        if topology_output is not None and topology_output.resolve() == output.resolve():
+            raise ValueError("I/O and topology reports must use separate output paths")
         report = measure([int(x) for x in args.devices.split(",")], host_id=args.host_id,
                          directory=args.dir, sample_bytes=args.sample_mib * 1024**2,
                          repeats=args.repeats, pin_budget_bytes=args.pin_budget_mib * 1024**2)
-        from pathlib import Path
-        output = Path(args.out)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        if topology_output is not None:
+            topology = measure_topology([int(x) for x in args.devices.split(",")], host_id=args.host_id,
+                sample_bytes=args.pair_sample_mib * 1024**2, repeats=args.pair_repeats, max_pairs=args.max_pairs)
+            topology_output.parent.mkdir(parents=True, exist_ok=True)
+            topology_output.write_text(json.dumps(topology, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         print(json.dumps({"ok": True, "report": str(output.resolve())}))
         return 0
     except (ValueError, RuntimeError, OSError) as exc:

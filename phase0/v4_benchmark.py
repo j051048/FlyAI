@@ -24,9 +24,12 @@ from datetime import datetime, timezone
 from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 PROTOCOL_SCHEMA = "flyai-v4-benchmark-protocol/1"
 REPORT_SCHEMA = "flyai-v4-benchmark-report/1"
 NETWORK_SCHEMA = "flyai-v4-network-comparison/1"
+ROUND_EXPERIMENT_SCHEMA = "flyai-v4-round-prefix-experiment/1"
 MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash-0731"
 MODEL_IDS = frozenset((MODEL_ID, "deepseek-ai/DeepSeek-V4-Flash"))
 WORKLOADS = ("code", "math", "prose", "agentic")
@@ -46,26 +49,8 @@ CONTEXT = "Reference note: measure the actual result, preserve the inputs, and r
 
 # An explicit baseline recipe, not the engine's mutable implicit defaults. Operators must launch
 # their stages with these same values; --env-file can freeze a DIFFERENT experiment recipe.
-DEFAULT_ENV = {
-    "V4_PREFILL_EXPERT_PIPELINE": "0", "V4_PREFILL_EXPERT_DEPTH": "2", "V4_PREFILL_EXPERT_BATCH": "0",
-    "V4_CONVERSATION_CACHE_MIB": "0", "V4_CONVERSATION_CACHE_GPU_MIB": "0",
-    "V4_CONVERSATION_CACHE_ENTRIES": "4", "V4_CONVERSATION_CACHE_TTL_S": "300",
-    "V4_KERNELS": "tilelang", "V4_DTYPE": "bfloat16", "V4_MAX_SEQ": "8192",
-    "V4_HADAMARD": "auto",
-    "V4_MAX_BATCH": "1", "V4_CUDA_GRAPH": "whole", "V4_GRAPH_MAX": "192",
-    "V4_MOE_GROUPED": "1", "V4_MOE_DECODE": "1", "V4_MOE_MULTI": "1",
-    "V4_MOE_MULTI_MAX": "32", "V4_MOE_IN_GRAPH": "1", "V4_FP8_GEMV": "1",
-    "V4_FP8_SHARED": "1", "V4_DSPARK_FAST": "0", "V4_DSPARK_GRAPH": "0",
-    "V4_DSPARK_MOE": "1", "V4_DSPARK_BLOCK": "8", "V4_DRAFT_TOP2": "0",
-    "V4_PIPELINED_SPEC": "1", "V4_SPEC_DEPTH": "16", "V4_LAZY_DRAFT": "1",
-    "V4_REFILL_FLOOR": "1", "V4_DSPARK_CONF_GATE": "0", "V4_DSPARK_CONF_THRESH": "0",
-    "V4_DSPARK_CONF_MIN": "1", "V4_FP8_WIRE": "0", "V4_REF_SLIM": "0",
-    "V4_REF_SLIM_NOQAT": "0", "V4_FAST_VERIFY": "0", "V4_FAST_VERIFY_MAX": "16",
-    "V4_KEEPWARM": "0", "V4_KEEPWARM_MS": "150", "V4_TIMING": "0",
-    "V4_TIMING_EVERY": "0", "V4_RUNTIME_METRICS": "1", "V4_LEVERS_STRICT": "1",
-    "V4_EXPERT_PLACEMENT": "gpu", "V4_EXPERT_CACHE_SLOTS": "0",
-    "V4_EXPERT_CACHE_MIB": "0", "V4_EXPERT_CACHE_RESERVE_MIB": "2048",
-}
+from engines.deepseek_v4.v4_execution_profiles import baseline_environment
+DEFAULT_ENV = baseline_environment()
 HISTORICAL = {
     "source": "docs/receipts/v4-flash-matrix-20260802.json",
     "date": "2026-08-02", "stages": 6, "gpu": "RTX 5090 32 GB",
@@ -240,7 +225,8 @@ def source_identity(root: Path = ROOT) -> dict:
     paths = set()
     for directory in (root / "engines" / "deepseek_v4", root / "vendor" / "deepseek_v4_ref", root / "shard"):
         paths.update(directory.rglob("*.py"))
-    for name in ("phase0/wire.py", "phase0/v4_benchmark.py", "phase0/v4_soak.py", "phase0/v4_release.py"):
+    for name in ("phase0/wire.py", "phase0/ngram_draft.py", "phase0/v4_benchmark.py", "phase0/v4_soak.py", "phase0/v4_release.py",
+                 "phase0/v4_profile_report.py", "phase0/v4_ring_economics.py", "phase0/v4_round_calibration.py"):
         if (root / name).is_file():
             paths.add(root / name)
     files = [{"name": p.relative_to(root).as_posix(), "sha256": file_digest(p)} for p in sorted(paths)]
@@ -372,10 +358,15 @@ def protocol_errors(p: dict) -> list[str]:
                 or run.get("warm_reps") != 3 or run.get("warmup_reps") != 1
                 or run.get("temperature") != 0.0 or run.get("seed") != 0
                 or run.get("eos_policy") != "fixed_length_ignore_eos"
-                or run.get("mode") not in ("greedy", "dspark", "pipelined")):
+                or run.get("mode") not in ("greedy", "spec", "dspark", "pipelined")):
             errors.append("run context/generation/warmup/sampling protocol absent or invalid")
         if run.get("speed_metric") != "complete_suite_median_warm_committed_decode_tok_s":
             errors.append("acceptance speed metric absent or unsupported")
+        if run.get("mode") == "spec" and (not _integer(run.get("ngram_k"), 1) or
+                run["ngram_k"] > 64 or not _integer(run.get("ngram_order"), 1) or run["ngram_order"] > 16):
+            errors.append("spec mode requires frozen bounded ngram draft width and lookup order")
+        if run.get("mode") != "spec" and any(k in run for k in ("ngram_k", "ngram_order")):
+            errors.append("ngram parameters belong only to spec mode")
         prompts = p.get("prompts", [])
         if len(prompts) != 4 or [x.get("workload") for x in prompts] != list(WORKLOADS):
             errors.append("complete ordered code/math/prose/agentic prompt set is required")
@@ -391,6 +382,16 @@ def protocol_errors(p: dict) -> list[str]:
             errors.append("explicit V4 kernel/graph/quantization environment is incomplete")
         if env.get("V4_KERNELS") != "tilelang" or env.get("V4_MAX_BATCH") != "1":
             errors.append("hardware acceptance requires GPU tilelang kernels and batch one")
+        experiment = p.get("round_experiment")
+        if experiment is not None:
+            if (not isinstance(experiment, dict) or set(experiment) != {"schema", "draft_prefix_cap", "loaded_block_size"}
+                    or experiment.get("schema") != ROUND_EXPERIMENT_SCHEMA
+                    or not _integer(experiment.get("loaded_block_size"), 1) or experiment["loaded_block_size"] > 64
+                    or not _integer(experiment.get("draft_prefix_cap"))
+                    or experiment["draft_prefix_cap"] > min(experiment["loaded_block_size"], int(env.get("V4_SPEC_DEPTH", 0))-1)
+                    or int(env.get("V4_DSPARK_BLOCK", 0)) != experiment["loaded_block_size"]
+                    or int(env.get("V4_REFILL_FLOOR", 0)) != 1 or run.get("mode") != "pipelined"):
+                errors.append("round prefix experiment requires fixed loaded width, depth, floor=1 and a bounded cap")
         if env.get("V4_EXPERT_PLACEMENT") not in ("gpu", "ram"):
             errors.append("expert placement must explicitly identify GPU or local RAM pools")
         if any(int(env.get(key, "-1")) < 0 for key in
@@ -628,6 +629,7 @@ class LiveRingAdapter:
         self.vp = importlib.import_module("v4_pipe")
         self.timeout, self.swarm_id, self.layer_count = timeout, swarm_id, protocol["layer_count"]
         self.protocol = protocol
+        self.head, self.tail, self.retry_s = head, tail, retry_s
         session_options = {}
         if deployment_plan is not None:
             from shard.pipeline_plan import load_plan, validate_plan
@@ -656,25 +658,52 @@ class LiveRingAdapter:
             self.swarm_id = plan["ring_id"]
         if protocol["checkpoint"].get("identity_kind") == "logical-tensor-catalogue" and not session_options:
             raise BenchmarkError("logical catalogue benchmarks require a strict deployment plan")
+        self.session_options = session_options
         self.pipe, self.ret = self.vp.connect_ring(head, tail, timeout=timeout,
                                                   token=self.vp.SWARM_TOKEN, retry_s=retry_s, **session_options)
         if protocol["checkpoint"].get("identity_kind") == "logical-tensor-catalogue":
             self.artifact_verification["authenticated_cohort_verified"] = bool(session_options)
 
-    def generate(self, prompt_ids, max_new, *, mode, nonce, job_id, on_token):
+    def generate(self, prompt_ids, max_new, *, mode, nonce, job_id, on_token,
+                 cancel_check=None, drafter=None, ngram_k=None, ngram_order=None):
         self._job_id = job_id
-        methods = {"greedy": self.vp.coordinate, "dspark": self.vp.coordinate_dspark,
-                   "pipelined": self.vp.coordinate_dspark_pipelined}
+        methods = {"greedy": "coordinate", "dspark": "coordinate_dspark",
+                   "spec": "coordinate_spec", "pipelined": "coordinate_dspark_pipelined"}
         kw = dict(eos_ids=(), nonce=nonce, swarm_id=self.swarm_id, job_id=job_id,
                   layer_count=self.layer_count, receipts=False, timeout=self.timeout,
-                  on_token=on_token, strict_job_binding=True)
+                  on_token=on_token, strict_job_binding=True, cancel_check=cancel_check)
         if mode == "greedy":
             kw.update(temp=0.0, seed=0)
+        elif mode == "spec":
+            # Import explicitly: coordinate_spec's repeat-token fallback is a
+            # useful deployment fallback, but is not a frozen n-gram experiment.
+            from phase0.ngram_draft import NgramDrafter
+            if os.environ.get("NGRAM_MARGIN"):
+                raise BenchmarkError("NGRAM_MARGIN is not part of the frozen spec recipe; unset it")
+            order = self.protocol["run"]["ngram_order"] if ngram_order is None else ngram_order
+            width = self.protocol["run"]["ngram_k"] if ngram_k is None else ngram_k
+            if not _integer(width, 1) or width > 64 or not _integer(order, 1) or order > 16:
+                raise BenchmarkError("spec draft width/order outside the frozen bounds")
+            kw.update(K=width, ng=order,
+                      drafter=drafter if drafter is not None else NgramDrafter(ng=order, margin=0, adaptive=False))
         elif mode == "pipelined":
             kw.update(depth=int(self.protocol["env"]["V4_SPEC_DEPTH"]),
                       lazy=self.protocol["env"]["V4_LAZY_DRAFT"] not in ("", "0"),
                       floor=int(self.protocol["env"]["V4_REFILL_FLOOR"]))
-        return methods[mode](self.pipe, self.ret, prompt_ids, max_new, **kw)
+            if self.protocol.get("round_experiment") is not None:
+                experiment = self.protocol["round_experiment"]
+                kw.update(draft_prefix_cap=experiment["draft_prefix_cap"],
+                          draft_block_limit=experiment["loaded_block_size"])
+        return getattr(self.vp, methods[mode])(self.pipe, self.ret, prompt_ids, max_new, **kw)
+
+    def reconnect(self):
+        """Acquire fresh strict channels; the next job must cross its reset barrier."""
+        if not self.session_options.get("session_config"):
+            raise BenchmarkError("lifecycle qualification requires strict authenticated sessions")
+        self.close()
+        self.pipe, self.ret = self.vp.connect_ring(self.head, self.tail, timeout=self.timeout,
+            token=self.vp.SWARM_TOKEN, retry_s=self.retry_s, **self.session_options)
+        return dict(self.pipe.grant)
 
     def sweep(self, nonce):
         assignment = {node["signer_pubkey"]: (node["layer_start"], node["layer_end"])
@@ -821,6 +850,16 @@ def evaluate_report(report: dict, expected_protocol: dict | None = None) -> dict
                 wanted_mode = "greedy" if s["phase"] == "greedy_control" else protocol["run"]["mode"]
                 if s.get("mode") != wanted_mode:
                     failed.append(f"{label}: coordinator mode differs from frozen protocol")
+                if protocol.get("round_experiment") is not None and wanted_mode == "pipelined":
+                    experiment = protocol["round_experiment"]
+                    actual = s.get("coordinator_stats", {})
+                    if (type(actual.get("draft_prefix_cap")) is not int
+                            or type(actual.get("loaded_block_limit")) is not int
+                            or actual.get("predictive_dprev_disabled") is not True
+                            or (actual.get("draft_prefix_cap"), actual.get("loaded_block_limit"),
+                            actual.get("predictive_dprev_disabled")) != (
+                            experiment["draft_prefix_cap"], experiment["loaded_block_size"], True)):
+                        failed.append(f"{label}: actual round prefix differs from frozen experiment")
                 if s.get("tokens") != greedy.get("tokens"):
                     failed.append(f"{label}: committed token IDs differ from same-ring greedy control")
                 nonce, job_id = s.get("nonce"), s.get("job_id")
@@ -932,14 +971,20 @@ def compare_reports(before: dict, after: dict, *, vary=None) -> dict:
     if protocol_errors(p) or protocol_errors(q):
         return {"status":"unverified", "reason":"comparison protocol invalid", "before":old, "after":new}
     # Core model, context length, and prompt recipe must match, allowing intentional runtime cache/knob evolution
-    same_recipe = (all(p.get(k) == q.get(k) for k in ("model_id", "prompts", "run"))
+    strategy_keys = {"mode", "ngram_k", "ngram_order"}
+    same_run = ({k:v for k,v in p.get("run", {}).items() if vary != "mode" or k not in strategy_keys} ==
+                {k:v for k,v in q.get("run", {}).items() if vary != "mode" or k not in strategy_keys})
+    same_recipe = (same_run and all(p.get(k) == q.get(k) for k in ("model_id", "prompts"))
                    and _checkpoint_identity(p.get("checkpoint", {})) == _checkpoint_identity(q.get("checkpoint", {}))
                    and p.get("env", {}).get("V4_MAX_SEQ") == q.get("env", {}).get("V4_MAX_SEQ"))
     if not same_recipe:
         return {"status": "unverified", "reason": "model/prompt/context/run recipe differs",
                 "before": old, "after": new}
-    if vary is not None and (not isinstance(vary, str) or vary != "source" and vary != "network" and not re.fullmatch(r"env:V4_[A-Z0-9_]+", vary)):
-        return {"status":"unverified", "reason":"vary must be source, network or env:V4_FLAG", "before":old, "after":new}
+    if vary == "mode" and ({k:v for k,v in p.items() if k not in {"sha256", "run", "source", "hardware", "checkpoint"}} !=
+                           {k:v for k,v in q.items() if k not in {"sha256", "run", "source", "hardware", "checkpoint"}}):
+        return {"status":"unverified", "reason":"non-strategy frozen controls differ", "before":old, "after":new}
+    if vary is not None and (not isinstance(vary, str) or vary not in ("mode", "source", "network", "round:draft_prefix_cap") and not re.fullmatch(r"env:V4_[A-Z0-9_]+", vary)):
+        return {"status":"unverified", "reason":"vary must be mode, source, network, round:draft_prefix_cap or env:V4_FLAG", "before":old, "after":new}
     source_changed = p.get("source", {}).get("sha256") != q.get("source", {}).get("sha256")
     ignored = {"process_run_id", "stage_env_sha256", "engine_source_sha256"}
     if vary == "source" or isinstance(vary, str) and vary.startswith("env:"):
@@ -955,6 +1000,15 @@ def compare_reports(before: dict, after: dict, *, vary=None) -> dict:
     env_changes = sorted(key for key in set(p.get("env", {})) | set(q.get("env", {})) if p.get("env", {}).get(key) != q.get("env", {}).get(key))
     network_changed = p.get("network_comparison") != q.get("network_comparison")
     actual_changes = (["source"] if source_changed else []) + (["network"] if network_changed else []) + ["env:"+key for key in env_changes]
+    if p.get("run") != q.get("run"):
+        actual_changes.append("mode")
+    if p.get("round_experiment") != q.get("round_experiment"):
+        left, right = p.get("round_experiment"), q.get("round_experiment")
+        if (not isinstance(left, dict) or not isinstance(right, dict)
+                or {k:v for k,v in left.items() if k != "draft_prefix_cap"} !=
+                   {k:v for k,v in right.items() if k != "draft_prefix_cap"}):
+            return {"status": "unverified", "reason": "round experiment identity differs beyond prefix cap", "before": old, "after": new}
+        actual_changes.append("round:draft_prefix_cap")
     reason = None
     if hardware_changed or before.get("backend") != after.get("backend"):
         reason = "hardware/software assignment or backend differs; not a controlled single-variable comparison"
@@ -1028,6 +1082,8 @@ def compare_reports(before: dict, after: dict, *, vary=None) -> dict:
     return {"status": status,
             "workload_speed_ratios": ratios, "before": old, "after": new,
             "declared_variable": vary, "changes": actual_changes,
+            "strategy_recipes": {"before": {k:v for k,v in p["run"].items() if k in strategy_keys},
+                                 "after": {k:v for k,v in q["run"].items() if k in strategy_keys}},
             "frozen_controls": {"before": {"source":p.get("source"), "hardware":p.get("hardware"), "env":p.get("env"), "network":p.get("network_comparison")},
                                 "after": {"source":q.get("source"), "hardware":q.get("hardware"), "env":q.get("env"), "network":q.get("network_comparison")}},
             "source_changed": p.get("source") != q.get("source"),
@@ -1070,8 +1126,12 @@ def _prepare(args):
         "prompts": prompts,
         "evidence_contract": {"coordinator_diagnostics_required": True, "runtime_observation_required": True},
         **({"network_comparison": _read(args.network)} if getattr(args, "network", None) else {}),
+        **({"round_experiment": {"schema": ROUND_EXPERIMENT_SCHEMA,
+            "draft_prefix_cap": args.draft_prefix_cap, "loaded_block_size": int(env["V4_DSPARK_BLOCK"])}}
+            if getattr(args, "draft_prefix_cap", None) is not None else {}),
         "run": {"prompt_tokens": args.prompt_tokens, "max_new": args.max_new,
                 "warm_reps": 3, "warmup_reps": 1, "mode": args.mode,
+                **({"ngram_k": args.ngram_k, "ngram_order": args.ngram_order} if args.mode == "spec" else {}),
                 "temperature": 0.0, "seed": 0, "eos_policy": "fixed_length_ignore_eos",
                 "speed_metric": "complete_suite_median_warm_committed_decode_tok_s"},
     })
@@ -1097,7 +1157,12 @@ def main(argv=None) -> int:
     prep.add_argument("--network", help="frozen public route/latency comparison contract JSON; required for controlled A/B")
     prep.add_argument("--prompt-tokens", type=int, default=512)
     prep.add_argument("--max-new", type=int, default=512)
-    prep.add_argument("--mode", choices=("greedy", "dspark", "pipelined"), default="pipelined")
+    prep.add_argument("--mode", choices=("greedy", "spec", "dspark", "pipelined"), default="pipelined",
+                      help="spec is the frozen model-free n-gram proposer")
+    prep.add_argument("--ngram-k", type=int, default=4)
+    prep.add_argument("--ngram-order", type=int, default=3)
+    prep.add_argument("--draft-prefix-cap", type=int,
+                      help="freeze a static unsent-prefix experiment; loaded V4_DSPARK_BLOCK must be explicit")
     prep.add_argument("--out", required=True)
     live = sub.add_parser("run", help="drive an existing ring; never launches/stops/rents GPU stages")
     live.add_argument("--protocol", required=True)
@@ -1116,7 +1181,7 @@ def main(argv=None) -> int:
     compare = sub.add_parser("compare", help="compare before/after only with matching benchmark recipe")
     compare.add_argument("before")
     compare.add_argument("after")
-    compare.add_argument("--vary", help="one predeclared change: source, network, or env:V4_FLAG; omitted means identical controls")
+    compare.add_argument("--vary", help="one predeclared change: mode, source, network, round:draft_prefix_cap or env:V4_FLAG")
     args = parser.parse_args(argv)
     try:
         if args.command == "inventory":

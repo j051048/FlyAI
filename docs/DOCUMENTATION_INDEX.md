@@ -14,6 +14,8 @@
 | V4 运行自检、strict SSH 部署、健康诊断和单变量复测 | [V4_OPERATIONS](V4_OPERATIONS.md) |
 | V4 有限投机配方、exact-repeat/shadow 状态缓存与有界专家 DMA 流水 | [V4_STATEFUL_OPTIMIZATIONS](V4_STATEFUL_OPTIMIZATIONS.md) |
 | 服务恢复、SLO/风险、调度/质量边界及真实发布门槛 | [V4_SERVICE_HARDENING](V4_SERVICE_HARDENING.md) |
+| P0–P2 执行、成本路由、原生请求、增量前缀及经济重组 | [V4_PERFORMANCE_EXECUTION](V4_PERFORMANCE_EXECUTION.md) |
+| 多卡宿主、命名配方、数值诊断、原生内核探针及四策略验收 | [V4_MULTIGPU_EXECUTION](V4_MULTIGPU_EXECUTION.md) |
 | 小磁盘节点、流式转换、权重准备与请求边界换环 | [WEIGHT_PREPARATION](WEIGHT_PREPARATION.md) |
 | 任意节点注册、区域组环、租约与多环 | [OPEN_INFERENCE_NETWORK](OPEN_INFERENCE_NETWORK.md) |
 | 资源准入与部署检查 | [RESOURCE_CONTRACT](RESOURCE_CONTRACT.md)、[DEPLOY_READINESS](DEPLOY_READINESS.md) |
@@ -28,6 +30,9 @@
 CLI 有各自兼容合同，不能仅更换命令名称就认为已经启用严格会话。
 
 有日期的 CPU/socket/HTTP 验证属于各自选定范围，不能合并为当前全仓 CI 或 GPU 证据。
+当前六项多卡 P0–P2 相关123文件组合为2081 passed / 11 skipped / 80 GPU deselected；前一轮
+111文件1903通过属于重叠历史范围，独立专项
+不累加，Windows全仓的既有平台失败不被隐藏为通过。范围见 [执行改造](V4_PERFORMANCE_EXECUTION.md)。
 新增代码的 CUDA 正确性、吞吐与长时间稳定性仍需实测。V4 四卡 >=40、六卡 >=30 committed
 decode tok/s 仍是固定验收目标；`v4_acceptance.py` 的模拟结果不通过该硬件门槛。
 

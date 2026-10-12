@@ -76,6 +76,13 @@ observations and controls below. Multiple undeclared changes remain unverified.
 
 ## Cold requests and parity controls
 
+The suite also supports coordinator n-gram `--mode spec` with frozen `--ngram-k`
+and `--ngram-order`. `compare --vary mode` permits only the strategy and these
+strategy parameters to change; source, environment, hardware, network, inputs
+and cross-report greedy token parity remain required. Lifecycle fault injection
+is a separate `v4_soak.py lifecycle` report, never part of throughput statistics.
+See [multi-GPU execution](V4_MULTIGPU_EXECUTION.md) for the named recipes and gates.
+
 The candidate runs **before** the same-workload greedy control. A control cannot accidentally warm
 the first candidate request. Job resets clear sequence/KV/rollback state using the existing ring
 contract; they do not claim to evict future GPU expert caches or clear compilation caches.

@@ -146,6 +146,7 @@ def _v4():
 # the widened width against the trained width, same prompts). Opt-in, default OFF, tail-only; the
 # coordinator adapts to whatever length the reply carries and needs no flag.
 V4_DSPARK_BLOCK = int(os.environ.get("V4_DSPARK_BLOCK", "0") or 0)
+V4_DSPARK_RESULT_BUFFER = os.environ.get("V4_DSPARK_RESULT_BUFFER", "0") not in ("", "0")
 
 # THE TREE GATE (V4_DRAFT_TOP2). Branching speculation — several candidate continuations from one
 # tap — is priced in docs/V4_TREE_VERDICT.md at +18.3% x beta for the best buildable shape, where
@@ -592,6 +593,7 @@ class RingDrafter:
 
     def __init__(self, tail):
         self.tail = tail                                   # a DSparkTail (its 4-method contract)
+        self._result_buffer = None
         self._done = False
         # PIPELINED mode (v4_pipe.coordinate_dspark_pipelined), armed per JOB by the reset's
         # `pipelined` flag. `_cfront` is the position of the last frame this tail judged COMMITTED and
@@ -648,9 +650,9 @@ class RingDrafter:
         # and `main[:, :n+1]` are those positions' taps. Feeding the whole chunk instead passes every
         # check the drafter can make and drafts off a history the ring rejected.
         blk, conf = self.tail.advance_and_draft([committed], main[:, :n + 1], start_pos=start_pos)
-        r = {"draft": blk[0].tolist(), "n": n,
-             "conf": [round(c, 4) for c in conf[0].float().tolist()]}
-        if V4_DRAFT_TOP2:
+        r = self._pack_result(blk, conf)
+        r["n"] = n
+        if V4_DRAFT_TOP2 and not V4_DSPARK_RESULT_BUFFER:
             d2 = second_choices(self.tail)                 # None on a sampling drafter: send nothing
             if d2 is not None:
                 r["d2"] = d2
@@ -754,15 +756,29 @@ class RingDrafter:
             t._pos = start_pos
             return {"acc": True}
         blk, conf = self.tail.advance_and_draft([[m]], main, start_pos=start_pos)
-        draft = blk[0].tolist()
+        r = self._pack_result(blk, conf)
+        draft = r["draft"]
         self._last = (start_pos, draft)
-        r = {"acc": True, "draft": draft,
-             "conf": [round(c, 4) for c in conf[0].float().tolist()]}
-        if V4_DRAFT_TOP2:
+        r["acc"] = True
+        if V4_DRAFT_TOP2 and not V4_DSPARK_RESULT_BUFFER:
             d2 = second_choices(self.tail)                 # None on a sampling drafter: send nothing
             if d2 is not None:
                 r["d2"] = d2
         return r
+
+    def _pack_result(self, blk, conf):
+        if not V4_DSPARK_RESULT_BUFFER:
+            return {"draft": blk[0].tolist(), "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+        if self._result_buffer is None:
+            from v4_draft_results import DraftResultBuffer
+            self._result_buffer = DraftResultBuffer()
+        runner = None
+        if V4_DRAFT_TOP2 and self.tail.last_spec is not None and self.tail.temperature == 0.0:
+            runner = self.tail.last_spec[1][0].topk(2, dim=-1).indices[:, 1]
+        return self._result_buffer.pack(blk[0], conf[0], runner)
+
+    def result_buffer_stats(self):
+        return self._result_buffer.stats() if self._result_buffer is not None else {"mode": "disabled", "calls": 0}
 
 
 def _fast():

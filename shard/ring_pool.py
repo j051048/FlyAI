@@ -56,6 +56,8 @@ class Ring:
     guard_stop: object = field(default_factory=threading.Event, repr=False)
     guard_thread: object = field(default=None, repr=False)
     batch_contract_sha256: str | None = None
+    routing_costs: object = None
+    admission_held: bool = False
 
 
 @dataclass
@@ -63,6 +65,7 @@ class RingBinding:
     ring: Ring
     estimated_seconds: float
     released: bool = False
+    admission: dict = field(default_factory=dict)
 
     @property
     def backend(self):
@@ -80,6 +83,22 @@ class RingPool:
         self.max_rings = max_rings
         self.max_history = max_history
         self._reconciliation = {}
+        self._admission_holds = set()
+
+    def hold_admission(self, ring_id):
+        """Quarantine a locally planned replacement before registration/warmup."""
+        if not isinstance(ring_id, str) or not ring_id or len(ring_id) > 128:
+            raise ValueError("bounded nonempty ring_id required")
+        with self._lock:
+            if ring_id in self._rings or len(self._admission_holds) >= self.max_rings:
+                raise RingUnavailable("candidate is already registered or hold capacity reached")
+            self._admission_holds.add(ring_id)
+
+    def clear_pending_hold(self, ring_id):
+        # Registered rings remain held until atomic publication, even if cleanup
+        # fails. Removing an unused reservation never opens an unapproved route.
+        with self._lock:
+            self._admission_holds.discard(ring_id)
 
     def record_reconciliation(self, policy_id, status):
         """Bounded public lifecycle state; contains no filesystem/provider secrets."""
@@ -108,6 +127,10 @@ class RingPool:
             if any(r.backend is backend and r.state != RingState.STOPPED for r in self._rings.values()):
                 raise ValueError("one backend connection owner cannot belong to multiple rings")
             ring = Ring(ring_id, backend, model_id, cohort_id, ids, region, on_stopped=on_stopped)
+            from .routing_cost import RoutingCosts
+            ring.routing_costs = RoutingCosts()
+            ring.admission_held = ring_id in self._admission_holds
+            self._admission_holds.discard(ring_id)
             self._rings[ring_id] = ring
             return ring
 
@@ -317,8 +340,8 @@ class RingPool:
                 ring.backend.abort()  # actively interrupt a blocked send/recv
                 return
 
-    def _eligible(self, ring):
-        if ring.state != RingState.READY or not ring.signed_warmup:
+    def _eligible(self, ring, *, publication=False):
+        if ring.state != RingState.READY or not ring.signed_warmup or (ring.admission_held and not publication):
             return False
         try:
             if ring.lease_expires_at <= time.time():
@@ -358,7 +381,7 @@ class RingPool:
             if not self._accepting or ring_id not in self._rings:
                 raise RingUnavailable("replacement pool is closed or ring is unknown")
             new = self._rings[ring_id]
-            if not self._eligible(new):
+            if not self._eligible(new, publication=True):
                 raise RingUnavailable("replacement must finish signed warmup before publication")
             old = [self._rings[key] for key in retired]
             if any((ring.model_id, ring.cohort_id) != (new.model_id, new.cohort_id) for ring in old):
@@ -367,6 +390,7 @@ class RingPool:
                 raise RingUnavailable("replacement cannot silently change an existing alias cohort")
             for name in names:
                 self._aliases[name] = (new.model_id, new.cohort_id)
+            new.admission_held = False
             for ring in old:
                 ring.replacement_ring_id = new.ring_id
                 if ring.state != RingState.STOPPED:
@@ -397,6 +421,50 @@ class RingPool:
                 return model, next(iter(cohorts))
             raise RingUnavailable("model requires a known unambiguous cohort or ready alias")
 
+    def routing_candidates(self, model_id, cohort_id):
+        """Take a bounded READY snapshot; preparation does not hold this lock."""
+        with self._lock:
+            if not self._accepting:
+                raise RingUnavailable("ring pool is draining")
+            return tuple(r for r in self._rings.values() if r.model_id == model_id
+                         and r.cohort_id == cohort_id and self._eligible(r))
+
+    def acquire_prepared(self, model_id, cohort_id, prepared, *, tenant, request_fingerprint,
+                         region=None, preferred_ring_id=None):
+        """Admission uses exact prepared shapes; final lease/READY check is atomic.
+
+        Each value is (ring object, backend.prepare result). Holding the actual
+        object prevents an admission prepared against a recycled identity.
+        """
+        costs = {}
+        for ring_id, (ring, request) in prepared.items():
+            payload, count, maximum, _ = request
+            if ring.model_id != model_id or ring.cohort_id != cohort_id or ring.ring_id != ring_id:
+                raise ValueError("prepared request belongs to another ring cohort")
+            costs[ring_id] = ring.routing_costs.estimate(ring.backend, cohort=cohort_id,
+                payload=payload, prompt_tokens=count, max_new_tokens=maximum,
+                fallback_s_per_token=ring.seconds_per_token, tenant=tenant,
+                request_fingerprint=request_fingerprint)
+        with self._lock:
+            if not self._accepting:
+                raise RingUnavailable("ring pool is draining")
+            candidates = [ring for ring, _ in prepared.values()
+                          if self._rings.get(ring.ring_id) is ring and self._eligible(ring)]
+            if not candidates:
+                raise RingUnavailable("no READY leased ring accepts this prepared request")
+            local = [r for r in candidates if region is not None and r.region == region]
+            candidates = local or candidates
+            ring = min(candidates, key=lambda r: (r.reserved_seconds + costs[r.ring_id]["service_s"],
+                r.ring_id != preferred_ring_id, r.bound_jobs, r.ring_id))
+            cost = costs[ring.ring_id]
+            decision = {**cost, "queue_s": ring.reserved_seconds,
+                        "expected_completion_s": ring.reserved_seconds + cost["service_s"],
+                        "region_policy": "local_first" if local else "available_fallback",
+                        "affinity": "tie_break_only", "candidates": len(candidates)}
+            ring.bound_jobs += 1
+            ring.reserved_seconds += cost["service_s"]
+            return RingBinding(ring, cost["service_s"], admission=decision)
+
     def acquire(self, model_id, cohort_id, *, estimated_tokens, region=None, preferred_ring_id=None):
         if preferred_ring_id is not None and (not isinstance(preferred_ring_id, str) or not preferred_ring_id):
             raise ValueError("preferred_ring_id must be a nonempty ring identity")
@@ -409,13 +477,12 @@ class RingPool:
                 raise RingUnavailable("no READY leased ring for this model cohort")
             # Region is a preference, not an invented RTT. Compare estimated work
             # within the closest declared region; unknown/cross-region is fallback.
-            preferred = [r for r in candidates if r.ring_id == preferred_ring_id]
             local = [r for r in candidates if region is not None and r.region == region]
             # Affinity is an admission preference under current cohort/lease
             # checks. It never revives a draining ring or redirects a held job.
-            candidates = preferred or local or candidates
+            candidates = local or candidates
             ring = min(candidates, key=lambda r: (r.reserved_seconds + estimated_tokens * r.seconds_per_token,
-                                                 r.bound_jobs, r.ring_id))
+                                                 r.ring_id != preferred_ring_id, r.bound_jobs, r.ring_id))
             cost = estimated_tokens * ring.seconds_per_token
             ring.bound_jobs += 1; ring.reserved_seconds += cost
             return RingBinding(ring, cost)
@@ -446,6 +513,7 @@ class RingPool:
             if binding.released or ring.state in (RingState.FAILED, RingState.STOPPED):
                 raise RingUnavailable("bound ring is no longer executable")
             ring.local_work += 1
+        started = time.perf_counter()
         works = self._begin(ring, job.id)
         done, invalid = threading.Event(), []
         watcher = threading.Thread(target=self._watch_guards, args=(ring, done, invalid), daemon=True)
@@ -458,8 +526,30 @@ class RingPool:
             # revocation; a local expiry check keeps per-token hooks free of RPC.
             if time.time() >= ring.lease_expires_at:
                 raise RingUnavailable("bound ring lease expired")
+        offsets = []
+        prior_tokens = len(job.checkpoint())
+        def observed_emit(token):
+            value = emit(token)
+            offsets.append(time.perf_counter() - started)
+            return value
+        def observed_many(tokens):
+            # This is an already-settled callback, like observed_emit. Preserve
+            # that prefix across racing cancellation; Job.commit_many still
+            # fences durable ownership. Final result/lease checks remain below.
+            if not isinstance(tokens, (list, tuple)) or not 1 <= len(tokens) <= 64:
+                raise ValueError("bounded settled token group required")
+            commit_many = getattr(emit, "commit_many", None)
+            if not callable(commit_many) and getattr(emit, "__self__", None) is job:
+                commit_many = getattr(job, "commit_many", None)
+            if callable(commit_many):
+                value = commit_many(tokens)
+                offsets.extend([time.perf_counter() - started] * len(tokens))
+                return value
+            for token in tokens:
+                observed_emit(token)
+        observed_emit.commit_many = observed_many
         try:
-            result = ring.backend.execute(job, emit, checked)
+            result = ring.backend.execute(job, observed_emit, checked)
             checked()
             proof = result.get("proof", {})
             validator = getattr(ring.backend, "verify_result_proof", None)
@@ -483,8 +573,21 @@ class RingPool:
                 if ring.state == RingState.WARMING:
                     ring.state, ring.reason = RingState.READY, "signed_job_reverified"
                 ring.signed_warmup = True
+                ring.routing_costs.note_completion(job.payload, job.prompt_tokens, job.max_new)
+                if len(offsets) >= 2 and not prior_tokens:
+                    # Only authenticated completions feed the service predictor;
+                    # a restored/replayed trajectory cannot teach cold prefill.
+                    from .routing_cost import runtime_identity
+                    recovery = result.get("recovery", {})
+                    if not recovery.get("replayed_committed_tokens", 0) and recovery.get("attempts", 1) == 1:
+                        ring.routing_costs.observe(payload=job.payload, prompt_tokens=job.prompt_tokens,
+                            token_count=len(offsets), first_s=offsets[0], last_s=offsets[-1],
+                            elapsed_s=time.perf_counter() - started,
+                            identity=runtime_identity(ring.backend, ring.cohort_id),
+                            cache_hit=scope == "fresh_suffix_with_signed_prefix_restore")
             result["route"] = {"ring_id": ring.ring_id, "model_id": ring.model_id,
-                               "cohort_id": ring.cohort_id, "region": ring.region}
+                               "cohort_id": ring.cohort_id, "region": ring.region,
+                               "admission": binding.admission}
             return result
         except Exception as error:
             if isinstance(error, RingUnavailable) or not ring.backend.ready()[0]:
@@ -524,10 +627,25 @@ class RingPool:
             if counts[job.id] >= max_step_tokens:
                 raise RingUnavailable("backend exceeded its bounded token step")
             job.commit(token); counts[job.id] += 1
+        def emit_many(job, tokens):
+            check(job)
+            if not isinstance(tokens, (list, tuple)) or not 1 <= len(tokens) <= 64:
+                raise ValueError("bounded settled token group required")
+            if counts[job.id] + len(tokens) > max_step_tokens:
+                raise RingUnavailable("backend exceeded its bounded token step")
+            job.commit_many(tokens)
+            counts[job.id] += len(tokens)
+        emit.emit_many = emit_many
+        emitters = {}
+        for job in jobs:
+            def emit_one(token, job=job):
+                return emit(job, token)
+            emit_one.commit_many = lambda tokens, job=job: emit_many(job, tokens)
+            emitters[job.id] = emit_one
         try:
             common()
             results = ring.backend.advance_batch(jobs,
-                emit={job.id: (lambda token, job=job: emit(job, token)) for job in jobs},
+                emit=emitters,
                 cancel_check={job.id: (lambda job=job: check(job)) for job in jobs},
                 max_step_tokens=max_step_tokens)
             common()
@@ -628,6 +746,7 @@ class RingPool:
                                 for name, value in self._aliases.items()},
                     "rings": [{"ring_id": r.ring_id, "model_id": r.model_id, "cohort_id": r.cohort_id,
                                "region": r.region, "state": r.state.value, "bound_jobs": r.bound_jobs,
+                               "admission_held": r.admission_held,
                                "estimated_backlog_s": r.reserved_seconds, "reason": r.reason,
                                **({"replacement_ring_id": r.replacement_ring_id}
                                   if r.replacement_ring_id is not None else {})}

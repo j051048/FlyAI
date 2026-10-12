@@ -7,6 +7,7 @@ MODEL_IDS = frozenset(("deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4
 RUNTIME_ABI = "deepseek-v4-native/1"
 WIRE_VERSION = "shard-pipeline-session/1"
 NUMERIC_CONTRACT = "greedy-native-fp4-fp8/1"
+TOKENWISE_NUMERIC_CONTRACT = "v4-native-tokenwise-greedy/1"
 QUANTIZATION = "fp4-fp8"
 
 
@@ -26,8 +27,9 @@ def validate_native_config(config, *, model_id, runtime_abi):
 
 def validate_native_cohort(cohort, config):
     supported = {"runtime_abi": RUNTIME_ABI, "wire_version": WIRE_VERSION,
-                 "numeric_contract": NUMERIC_CONTRACT, "quantization": QUANTIZATION}
-    if any(cohort.get(name) != value for name, value in supported.items()):
+                 "quantization": QUANTIZATION}
+    if (any(cohort.get(name) != value for name, value in supported.items()) or
+            cohort.get("numeric_contract") not in (NUMERIC_CONTRACT, TOKENWISE_NUMERIC_CONTRACT)):
         raise ValueError("unsupported V4 cohort ABI/wire/numeric/quantization declaration")
     validate_native_config(config, model_id=cohort.get("model_id"), runtime_abi=cohort["runtime_abi"])
     if type(cohort.get("n_layers")) is not int or cohort["n_layers"] != config["n_layers"]:

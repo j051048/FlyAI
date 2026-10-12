@@ -237,6 +237,12 @@ def configured_stage_factory(ledger_path, stages, *, weight_preparer=None):
                 or any(cfg.get(k) != assignment[k] for k in ("lo", "hi", "head", "tail"))):
             raise ValueError("local template differs from measured runtime contract")
         env = {**os.environ, **row.get("environment", {})}
+        profile_environment = row.get("environment")
+        if env.get("V4_EXECUTION_PROFILE"):
+            from engines.deepseek_v4.v4_execution_profiles import expanded_environment
+            env = expanded_environment(env)
+            profile_environment = {**dict(profile_environment or {}),
+                                   **{k: v for k, v in env.items() if k.startswith("V4_")}}
         def v4_flags(values):
             return {k: v for k, v in values.items() if k.startswith("V4_") and k not in {"V4_DIR", "V4_DEV"}}
         if v4_flags(env) != v4_flags(cfg.get("environment", {})):
@@ -267,7 +273,7 @@ def configured_stage_factory(ledger_path, stages, *, weight_preparer=None):
             # Values remain argv elements; no shell interprets these strings.
             return [arg.format_map(local_assignment) for arg in row["argv"]]
         return LeasedProcessRunner(guard, ledger_path=ledger_path, command_factory=command,
-                                   environment=row.get("environment"), runtime_config=cfg,
+                                   environment=profile_environment, runtime_config=cfg,
                                    weight_preparer=weight_preparer)
     factory.weight_preparer = weight_preparer
     return factory

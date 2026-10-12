@@ -23,13 +23,23 @@ from phase0 import v4_benchmark as B, v4_soak as S
 
 GPU_FILES = ("tests/test_v4_runtime_init.py", "tests/test_v4_hybrid_gpu.py",
     "tests/test_v4_conversation_cache_gpu.py", "tests/test_v4_prefill_expert_pipeline.py",
-    "tests/test_v4_native_trace.py", "tests/test_v4_kv_runtime.py")
+    "tests/test_v4_native_trace.py", "tests/test_v4_kv_runtime.py",
+    "tests/test_v4_kernel_tuning.py", "tests/test_v4_draft_results.py", "tests/test_v4_native_lanes.py",
+    "tests/test_v4_numeric_diagnostics.py", "tests/test_v4_island_coverage.py",
+    "tests/test_v4_kernel_capability.py", "tests/test_receive_buffers.py")
 REQUIRED_CASES = ("test_actual_cuda_hadamard_smoke_and_graph_capture",
     "test_original_tilelang_grouped_fp4_matches_full_resident_reference",
     "test_cuda_actual_v4_snapshot_restores_same_continuation_and_state_bytes",
     "test_native_cuda_graph_reads_restored_fixed_kv_without_recapture",
     "test_original_tilelang_fp4_prefill_pipeline_preserves_exact_expert_math",
-    "test_actual_cuda_native_trace_restores_and_executes_original_single_token_math")
+    "test_actual_cuda_native_trace_restores_and_executes_original_single_token_math",
+    "test_actual_fp8_tuning_reprobes_original_kernel_and_graph",
+    "test_cuda_one_copy_reuses_buffers_without_changing_result_bytes",
+    "test_actual_cuda_native_lane_interleaving_preserves_original_v4_math",
+    "test_cuda_actual_whole_graph_matches_its_eager_twin_and_rejection",
+    "test_actual_island_capture_reports_three_per_layer_after_decode",
+    "test_actual_native_gpu_kernel_smoke_and_graph_replay",
+    "test_pinned_pool_tensor_stays_pinned_until_cuda_copy_finishes")
 
 
 def digest(value):
@@ -84,19 +94,29 @@ def run_gpu_gate(junit_path, *, timeout_s=1800):
         return report
     path = Path(junit_path).resolve()
     if path.exists(): raise ValueError("use a fresh JUnit artifact path; stale evidence cannot be reused")
-    env = {**os.environ, "V4_KERNELS": "cpu", "V4_HADAMARD": "torch", "V4_CUDA_GRAPH": "0",
+    env = {**{k:v for k,v in os.environ.items() if not k.startswith("V4_")
+              and k != "FLYAI_NATIVE_PROBE_PROCESS_TOKEN"},
+           "V4_KERNELS": "cpu", "V4_HADAMARD": "torch", "V4_CUDA_GRAPH": "0",
            "V4_EXPERT_PLACEMENT": "gpu", "V4_KV_PLACEMENT": "gpu", "V4_CONVERSATION_CACHE_MIB": "0",
            "V4_PREFILL_EXPERT_PIPELINE": "0", "V4_LEVERS_STRICT": "0", "V4_REF_SLIM": "0",
            "V4_REF_SLIM_NOQAT": "0", "V4_MOE_IN_GRAPH": "0", "V4_DSPARK_MOE": "0"}
+    env.update(V4_FP8_AUTOTUNE="0", V4_DSPARK_RESULT_BUFFER="0", V4_NATIVE_LANES="0")
     started = time.perf_counter()
-    try:
-        completed = subprocess.run([sys.executable, "-m", "pytest", "-m", "gpu", "-q", *GPU_FILES,
-                                   "--junitxml", str(path)], cwd=ROOT, env=env,
-                                  capture_output=True, text=True, timeout=timeout_s)
-        report["exit_code"] = completed.returncode
-        report["log_tail"] = (completed.stdout + completed.stderr)[-32000:]
-    except subprocess.TimeoutExpired:
-        report.update(status="failed", reason="bounded CUDA gate timed out")
+    from engines.deepseek_v4.v4_native_capability import _run_isolated
+    # Nothing imports CUDA before the owned process group/job is established.
+    # The same bounded tree supervisor also contains native compiler children.
+    worker = ("import json,os,sys,runpy; data=json.load(sys.stdin); "
+              "os.chdir(data['cwd']); "
+              "[os.environ.pop(k) for k in list(os.environ) if k.startswith('V4_')]; "
+              "os.environ.update(data['environment']); sys.argv=data['argv']; "
+              "runpy.run_module('pytest',run_name='__main__')")
+    execution = _run_isolated([sys.executable, "-c", worker], json.dumps({"cwd": str(ROOT), "environment": env,
+        "argv": ["pytest", "-m", "gpu", "-q", *GPU_FILES, "--junitxml", str(path)]}), timeout_s)
+    report["exit_code"] = execution["returncode"]
+    report["log_tail"] = execution["tail"][-32000:]
+    report["process_cleanup"] = execution["cleanup"]
+    if execution["timeout"]:
+        report.update(status="failed", reason="bounded CUDA gate timed out; owned compiler tree cleanup checked")
     report["elapsed_s"] = time.perf_counter() - started
     if path.is_file():
         raw = path.read_bytes()
@@ -115,6 +135,8 @@ def evaluate_gpu_gate(report):
     if not isinstance(report, dict) or report.get("schema") != "flyai-v4-gpu-gate/1":
         return {"status": "failed", "errors": ["unknown GPU gate schema"], "missing_evidence": []}
     hardware = report.get("hardware", {})
+    if report.get("process_cleanup", {}).get("confirmed") is not True:
+        missing.append("owned GPU/compile process tree cleanup unconfirmed")
     if hardware.get("idle") is not True: missing.append("dedicated idle CUDA device evidence absent")
     capability = hardware.get("capability")
     if (hardware.get("available") is not True or not isinstance(capability, list) or len(capability) != 2

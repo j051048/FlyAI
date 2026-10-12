@@ -214,7 +214,13 @@ class JobJournal:
         conn = None
         try:
             wal = Path(str(self.path) + "-wal")
-            if wal.exists() and wal.stat().st_size > self.max_bytes * 2 + (8 << 20):
+            try:
+                wal_bytes = wal.stat().st_size
+            except FileNotFoundError:
+                # SQLite removes an empty WAL when its last connection closes.
+                # Concurrent removal is normal, not coordinator ownership loss.
+                wal_bytes = 0
+            if wal_bytes > self.max_bytes * 2 + (8 << 20):
                 raise JournalCapacity("journal WAL exceeded bounded safety capacity")
             # Never silently recreate a deleted journal while retaining an old
             # in-memory owner handle; recovery needs the original file authority.
@@ -413,18 +419,29 @@ class JobJournal:
             conn.execute("UPDATE jobs SET state='running',seq=seq+1,attempts=attempts+1 WHERE id=?", (job_id,))
 
     def append_token(self, lease, job_id, offset, token):
+        self.append_tokens(lease, job_id, offset, [token])
+
+    def append_tokens(self, lease, job_id, offset, tokens):
+        """Persist an already-settled contiguous prefix in one transaction.
+
+        There is no timer or pending publication buffer: callers may publish
+        only after this method returns. Sequence numbers still advance per token.
+        """
         started = time.perf_counter()
-        if type(token) is not int or not 0 <= token < (1 << 31):
-            raise JournalError("invalid durable token")
+        if (not isinstance(tokens, (list, tuple)) or not 1 <= len(tokens) <= 64 or
+                any(type(token) is not int or not 0 <= token < (1 << 31) for token in tokens)):
+            raise JournalError("invalid bounded durable token group")
+        tokens = tuple(tokens)
         with self._transaction(lease) as (conn, now):
             row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if (row is None or row["owner_fence"] != lease.fence or row["state"] != "running"
-                    or type(offset) is not int or offset != row["n"] or offset >= row["maximum"]):
+                    or type(offset) is not int or offset != row["n"] or offset + len(tokens) > row["maximum"]):
                 raise JournalConflict("durable token sequence/state mismatch")
-            conn.execute("INSERT INTO tokens VALUES(?,?,?)", (job_id, offset, token))
-            conn.execute("UPDATE jobs SET n=n+1,seq=seq+1 WHERE id=?", (job_id,))
+            conn.executemany("INSERT INTO tokens VALUES(?,?,?)",
+                             ((job_id, offset + i, token) for i, token in enumerate(tokens)))
+            conn.execute("UPDATE jobs SET n=n+?,seq=seq+? WHERE id=?", (len(tokens), len(tokens), job_id))
         with self._metrics_lock:
-            self._io_metrics["token_commits"] += 1
+            self._io_metrics["token_commits"] += len(tokens)
             self._io_metrics["token_commit_seconds"] += time.perf_counter() - started
 
     def request_cancel(self, lease, job_id, kind):

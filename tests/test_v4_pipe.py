@@ -2968,10 +2968,11 @@ def test_each_lever_actually_lands_in_the_launch_command(monkeypatch):
         for v in VP.ENG_ENV:
             monkeypatch.delenv(v, raising=False)
         assert lever not in VP.stage_launch_cmd(0, 3, 0, 15), f"{lever} unset must stay unset"
-        monkeypatch.setenv(lever, "7")
+        value = "resident-whole" if lever == "V4_EXECUTION_PROFILE" else "7"
+        monkeypatch.setenv(lever, value)
         cmd = VP.stage_launch_cmd(0, 3, 0, 15)
-        assert f"{lever}=7 " in cmd, f"{lever} never reaches the stage process: {cmd}"
-        assert cmd.index(f"{lever}=7 ") < cmd.index("setsid"), f"{lever} must precede the command"
+        assert f"{lever}={value} " in cmd, f"{lever} never reaches the stage process: {cmd}"
+        assert cmd.index(f"{lever}={value} ") < cmd.index("setsid"), f"{lever} must precede the command"
 
 
 def test_the_multigpu_builder_carries_the_levers_too(monkeypatch):

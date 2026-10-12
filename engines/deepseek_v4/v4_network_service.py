@@ -32,12 +32,18 @@ def serve_open_config(config_path, *, auth_file, bind="127.0.0.1", port=8000,
     def factory(directory, manifest, cohort, row, contracts):
         assignments = {stage["signer_pubkey"]: [stage["lo"], stage["hi"]]
                        for stage in manifest["stages"]}
+        round_slot = row.get("round_calibration_file")
+        if round_slot is not None and (not isinstance(round_slot, str) or not round_slot or "://" in round_slot):
+            raise ValueError("round_calibration_file must be a nonempty operator-local path")
         return V4RingBackend(str(directory), manifest["coordinator"]["head"],
             manifest["coordinator"]["tail"], assignments,
             mode=row.get("mode", "pipelined"), swarm_id=manifest["ring_id"],
             max_context=row.get("max_context", 8192), timeout=row.get("io_timeout_s", 60),
             pipeline_plan=manifest, coordinator_key=service.key,
             speculation_policy=row.get("speculation_policy"),
+            round_speculation=row.get("round_speculation"),
+            round_calibration_file=service.local(round_slot) if round_slot is not None else None,
+            native_lanes=row.get("native_lanes"),
             conversation_cache=row.get("conversation_cache"),
             calibrated_runtime_configs=row.get("verified_runtime_configs"),
             lease_fences=row.get("verified_lease_fences"))

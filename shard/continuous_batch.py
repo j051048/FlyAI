@@ -69,6 +69,7 @@ class ContinuousRingWorker:
         self.queue, self.ring, self.options = queue, ring, options
         self.active = {}
         self.stalled = {}
+        self.replay_allowance = {}
 
     def _finish(self, job, state, **kwargs):
         cleanup_error = None
@@ -81,6 +82,7 @@ class ContinuousRingWorker:
         finally:
             self.active.pop(job.id, None)
             self.stalled.pop(job.id, None)
+            self.replay_allowance.pop(job.id, None)
         with self.queue._condition:
             self.queue._running_by_ring[self.ring.ring_id] = tuple(self.active.values())
             self.queue._finish(job, state, **kwargs)
@@ -107,6 +109,11 @@ class ContinuousRingWorker:
                             break
                         job.execution_started = queue.clock()
                         self.active[job.id] = job
+                        # A recovered backend must recompute/check its already
+                        # committed prefix without emitting duplicate tokens.
+                        # Freeze this allowance at admission; fresh output must
+                        # never enlarge the number of tolerated silent steps.
+                        self.replay_allowance[job.id] = len(job.checkpoint())
                     queue._running_by_ring[ring.ring_id] = tuple(self.active.values())
                     if not self.active:
                         if queue._stopping or ring.state in (RingState.STOPPED, RingState.FAILED):
@@ -139,7 +146,8 @@ class ContinuousRingWorker:
                         self._finish(job, "completed", result=value)
                     elif len(job.tokens) == before[job.id]:
                         self.stalled[job.id] = self.stalled.get(job.id, 0) + 1
-                        limit = (job.prompt_tokens + contract["prefill_chunk_tokens"] - 1) // contract["prefill_chunk_tokens"] + 1
+                        limit = ((job.prompt_tokens + contract["prefill_chunk_tokens"] - 1) // contract["prefill_chunk_tokens"]
+                                 + self.replay_allowance[job.id] + 1)
                         if self.stalled[job.id] > limit:
                             raise RuntimeError("batch backend exhausted its bounded prefill without progress")
                     else:

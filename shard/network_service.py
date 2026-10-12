@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import math
 from pathlib import Path
 import secrets
@@ -164,21 +165,25 @@ class OpenNetworkService:
         self._generation_sequence = 0
         self._reconcile_stop = threading.Event()
         self._reconcile_thread = None
+        self._economic_cache = {}
         self._reconcile_interval = self.config.get("reconcile_interval_s", 1)
         self._reconcile_cooldown = self.config.get("reconcile_cooldown_s", 10)
         for value in (self._reconcile_interval, self._reconcile_cooldown):
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ControlError("positive finite reconciliation intervals required")
         for row in self.records.values():
+            from .ring_economics import options as economic_options
+            economic = economic_options(row.get("healthy_rebalance"))
             enabled = row.get("auto_replace", bool(row.get("calibrated_alternatives")))
             if type(enabled) is not bool:
                 raise ControlError("auto_replace must be an explicit boolean")
             if type(row.get("auto_generations", True)) is not bool:
                 raise ControlError("auto_generations must be an explicit boolean")
-            if enabled:
+            if enabled or economic is not None:
                 self._replacement_policies[row["ring_id"]] = {
                     "definition": row, "active_ring_id": None, "attempted": set(),
-                    "running": False, "next_attempt": 0.0}
+                    "running": False, "next_attempt": 0.0, "economic": economic,
+                    "replace_failed": enabled}
         self.controller = FormationController(self.registry, self.pool, {},
             requirements=self.requirements, backend_factory=self.backend,
             agent_factory=agent_factory or self.agent, quality=self.quality)
@@ -203,6 +208,24 @@ class OpenNetworkService:
         if self.quality is None:
             raise ControlError("replay audit policy is disabled")
         return self.quality.ingest(report)
+
+    def run_native_replay_audit(self, node_id, cohort_id, receipt, *, auditor, chunks):
+        """Local trusted-replica execution, never an HTTP contributor callback."""
+        if self.quality is None:
+            raise ControlError("replay audit policy is disabled")
+        from .offers import ModelCohort
+        offer = self.registry.get(node_id)
+        models = [ModelCohort.from_dict(row["cohort"]) for row in offer["models"]]
+        cohort = next((model for model in models if model.cohort_id == cohort_id), None)
+        if (cohort is None or auditor.cohort_id != cohort_id
+                or auditor.numeric_contract != cohort.numeric_contract):
+            raise ControlError("trusted replay replica differs from the selected cohort/numeric contract")
+        auditor.validate_cohort(cohort)
+        input_sha256 = auditor.input_identity(chunks)
+        case = self.issue_replay_audit(node_id, cohort_id, receipt, input_sha256=input_sha256,
+                                      execution_identity_sha256=auditor.execution_identity_sha256)
+        report = auditor.run(case, receipt, chunks)
+        return self.ingest_replay_audit(report)
 
     def local(self, value):
         target = Path(value)
@@ -287,6 +310,9 @@ class OpenNetworkService:
             raise ControlError("invalid service context ceiling")
         row = {**row, "max_context": min(requested_context, *context_limits)}
         manifest["execution"] = {"max_context": row["max_context"]}
+        if row.get("_economic_expected_plan") is not None:
+            from .ring_economics import require_measured_placement
+            require_measured_placement(manifest, row["_economic_expected_plan"])
         leases = {client.node_id: (client, lease) for client, lease in
                   self.controller._formations[plan["ring_id"]]["leases"]}
         selected = []
@@ -338,6 +364,13 @@ class OpenNetworkService:
             "verified_lease_fences": {node_id: {"lease_id": lease["lease_id"], "fencing_token": lease["fencing_token"]}
                                       for node_id, (_, lease) in leases.items()}}
         backend = self.backend_factory(directory, manifest, cohort, feature_row, contracts)
+        if row.get("_economic_expected_profile") is not None:
+            from .ring_economics import require_measured_coordinator
+            try:
+                require_measured_coordinator(backend, row["_economic_expected_profile"])
+            except Exception:
+                backend.close()
+                raise
         if backend.model_id != cohort.model_id or backend.layers != cohort.n_layers:
             backend.close()
             raise ControlError("engine does not implement the selected model cohort")
@@ -365,11 +398,42 @@ class OpenNetworkService:
         extra = {"coordinator_id": row["coordinator_id"]} if row.get("coordinator_id") else {}
         if row.get("route_ids") is not None:
             extra["route_ids"] = row["route_ids"]
-        return self.controller.form(row["ring_id"], row["cohort"], profile,
+        started = time.perf_counter()
+        result = self.controller.form(row["ring_id"], row["cohort"], profile,
             measurements=observation, locality=row.get("locality"),
             objective=row.get("objective", "pipeline"), workload=row.get("workload"),
             **({"slo": row["slo"]} if row.get("slo") is not None else {}),
             ttl_s=row.get("lease_ttl_s", 120), warmup_timeout_s=row.get("warmup_timeout_s", 300), **extra)
+        from .ring_economics import formation_digest
+        result["formation_measurement"] = {"schema": "shard-formation-timing/1", "clock": "perf_counter",
+            "formation_sha256": formation_digest(row), "ring_id": result["ring_id"],
+            "cohort_id": result["cohort_id"], "measured_at": time.time(),
+            "prepare_load_capture_warmup_s": time.perf_counter() - started,
+            "scope": "operator wall clock through planning/reservation/preparation/load/signed warmup; phases overlap"}
+        backend = self.controller._formations.get(result["ring_id"], {}).get("backend")
+        economics_profile = getattr(backend, "economics_profile", None)
+        result["formation_measurement"]["coordinator_profile"] = economics_profile() if callable(economics_profile) else None
+        manifest = getattr(backend, "pipeline_plan", None)
+        if manifest is not None:
+            result["deployment_plan"] = validate_plan(manifest)
+        evidence_dir = getattr(self, "config", {}).get("formation_evidence_dir")
+        if evidence_dir:
+            # One file per executable template keeps the collector bounded by
+            # operator configuration, independently of replacement epoch count.
+            # Economics artifacts embed a copy and retain their immutable pin.
+            destination = self.local(evidence_dir) / (formation_digest(row) + ".json")
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temporary = destination.with_suffix("." + secrets.token_hex(8) + ".tmp")
+                temporary.write_text(json.dumps(result, sort_keys=True, allow_nan=False), encoding="utf-8")
+                temporary.replace(destination)
+                result["formation_evidence_path"] = str(destination)
+            except OSError as error:
+                # A successful live ring must remain controllable when optional
+                # local evidence storage is full. Unknown stored evidence earns
+                # no future economic qualification.
+                result["formation_evidence_error"] = type(error).__name__
+        return result
 
     def form_with_alternatives(self, row):
         """Capacity failures can use explicitly configured, same-cohort alternatives.
@@ -420,6 +484,8 @@ class OpenNetworkService:
             if policy is not None:
                 result = results[-1]
                 policy["active_ring_id"] = result["ring_id"]
+                policy["active_definition"] = next((candidate for candidate in [row, *row.get("calibrated_alternatives", [])]
+                    if candidate["ring_id"] == result["ring_id"]), row)
                 policy["attempted"].update(item["ring_id"] for item in result.get("capacity_fallback", []))
                 policy["attempted"].add(result["ring_id"])
                 self.pool.record_reconciliation(row["ring_id"], {
@@ -450,7 +516,15 @@ class OpenNetworkService:
                 return
             for policy_id, policy in self._replacement_policies.items():
                 old = snapshot.get(policy["active_ring_id"])
+                if (old is not None and old.state == RingState.READY and policy.get("economic") is not None
+                        and not policy["running"] and not policy.get("evaluating")
+                        and time.monotonic() >= policy["next_attempt"]):
+                    policy["evaluating"] = True
+                    threading.Thread(target=self._evaluate_healthy_candidate, args=(policy_id, policy, old),
+                        daemon=True, name="evaluate-ring-" + policy_id).start()
+                    continue
                 if (old is None or old.state not in (RingState.FAILED, RingState.DRAINING, RingState.STOPPED)
+                        or not policy.get("replace_failed", True)
                         or policy["running"] or time.monotonic() < policy["next_attempt"]):
                     continue
                 candidates = [row for row in policy["definition"].get("calibrated_alternatives", [])
@@ -486,20 +560,120 @@ class OpenNetworkService:
                 threading.Thread(target=self._reconcile_candidate, args=(policy_id, policy, old, candidate),
                     daemon=True, name="replace-ring-" + candidate["ring_id"]).start()
 
+    def _evaluate_healthy_candidate(self, policy_id, policy, old):
+        """Disk reads and signature checks never hold the formation/pool lock."""
+        from .ring_economics import load_economics, compare_economics, formation_digest, require_measured_coordinator
+        from .ring_pool import RingState
+        chosen = None
+        try:
+            now = time.time()
+            settings = policy["economic"]
+            definition = policy.get("active_definition", policy["definition"])
+            current = load_economics(definition.get("economics"), definition, self.local,
+                                    now=now, cache=self._economic_cache)
+            require_measured_coordinator(old.backend, current["coordinator_profile"])
+            traffic = old.routing_costs.matching_traffic(current["workload"],
+                window_s=max(60, 2 * settings["stability_window_s"]))
+            if not traffic["balanced_frozen_mix"] or traffic["matching"] != traffic["total"]:
+                self.pool.record_reconciliation(policy_id, {"state": "economic_hold", "active_ring_id": old.ring_id,
+                    "reason": "recent_workload_not_calibrated", "traffic": traffic})
+                with self._formation_lock:
+                    policy.pop("stable_choice", None)
+                return
+            candidates = policy["definition"].get("calibrated_alternatives", [])
+            if not isinstance(candidates, list) or len(candidates) > 16:
+                raise ValueError("bounded operator-configured economic alternatives required")
+            best = None
+            for candidate in candidates:
+                if formation_digest(candidate) == formation_digest(definition):
+                    continue
+                try:
+                    observation = load_economics(candidate.get("economics"), candidate, self.local,
+                        now=now, cache=self._economic_cache)
+                    comparison = compare_economics(current, observation, settings)
+                except (ValueError, TypeError, KeyError, OSError):
+                    continue
+                if comparison["eligible"] and (best is None or comparison["net_savings_s"] > best[2]["net_savings_s"]):
+                    best = (candidate, observation, comparison)
+            with self._formation_lock:
+                if (self._reconcile_stop.is_set() or old.state != RingState.READY or policy["running"]
+                        or policy["active_ring_id"] != old.ring_id):
+                    return
+                if best is None:
+                    policy.pop("stable_choice", None)
+                    self.pool.record_reconciliation(policy_id, {"state": "economic_hold", "active_ring_id": old.ring_id,
+                        "reason": "no_fresh_profitable_configured_candidate"})
+                    return
+                candidate, observation, comparison = best
+                choice = (candidate["ring_id"], candidate["economics"]["sha256"], definition["economics"]["sha256"])
+                mono = time.monotonic()
+                if policy.get("stable_choice") != choice:
+                    policy["stable_choice"], policy["stable_since"] = choice, mono
+                if mono - policy["stable_since"] < settings["stability_window_s"]:
+                    self.pool.record_reconciliation(policy_id, {"state": "economic_observing", "active_ring_id": old.ring_id,
+                        "candidate_ring_id": candidate["ring_id"], "decision": comparison})
+                    return
+                self._generation_sequence += 1
+                suffix = f".e{self._generation_sequence:x}.{secrets.token_hex(4)}"
+                chosen = {**candidate, "ring_id": candidate["ring_id"][:128-len(suffix)] + suffix,
+                          "calibrated_alternatives": []}
+                evidence_key = (candidate["economics"]["sha256"], formation_digest(candidate))
+                chosen["_economic_expected_plan"] = self._economic_cache[evidence_key]["deployment_plan"]
+                chosen["_economic_expected_profile"] = observation["coordinator_profile"]
+                policy["running"] = True
+                policy["economic_pending"] = candidate
+                self.pool.record_reconciliation(policy_id, {"state": "economic_preparing", "active_ring_id": old.ring_id,
+                    "candidate_ring_id": chosen["ring_id"], "decision": comparison})
+            self._reconcile_candidate(policy_id, policy, old, chosen)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            with self._formation_lock:
+                policy.pop("stable_choice", None)
+            self.pool.record_reconciliation(policy_id, {"state": "economic_hold", "active_ring_id": old.ring_id,
+                "reason": "economic_evidence_unavailable", "error_class": type(error).__name__})
+        finally:
+            with self._formation_lock:
+                policy["evaluating"] = False
+
     def _reconcile_candidate(self, policy_id, policy, old, candidate):
         from .leases import LeaseConflict
         result, published = None, False
+        economic = policy.get("economic_pending")
         try:
+            if economic is not None:
+                self.pool.hold_admission(candidate["ring_id"])
             result = self.form_with_alternatives(candidate)
             if self._reconcile_stop.is_set():
                 self.controller.stop(result["ring_id"])
                 return
+            if economic is not None:
+                from .ring_economics import load_economics, compare_economics, require_measured_coordinator
+                from .ring_pool import RingState
+                # Preparation may take minutes. Recheck freshness, incumbent
+                # workload and the actual preparation charge before publication.
+                definition = policy.get("active_definition", policy["definition"])
+                current = load_economics(definition.get("economics"), definition, self.local,
+                    now=time.time(), cache=self._economic_cache)
+                measured = load_economics(economic.get("economics"), economic, self.local,
+                    now=time.time(), cache=self._economic_cache)
+                require_measured_coordinator(old.backend, current["coordinator_profile"])
+                new = next(ring for ring in self.pool.rings() if ring.ring_id == result["ring_id"])
+                require_measured_coordinator(new.backend, measured["coordinator_profile"])
+                measured = {**measured, "prepare_load_capture_warmup_s":
+                    result.get("formation_measurement", {}).get("prepare_load_capture_warmup_s")}
+                traffic = old.routing_costs.matching_traffic(current["workload"],
+                    window_s=max(60, 2 * policy["economic"]["stability_window_s"]))
+                if (old.state != RingState.READY or policy["active_ring_id"] != old.ring_id
+                        or not traffic["balanced_frozen_mix"] or traffic["matching"] != traffic["total"]
+                        or not compare_economics(current, measured, policy["economic"])["eligible"]):
+                    raise ValueError("economic gain no longer covers actual preparation and workload")
             aliases = [name for name, target in self.pool.snapshot()["aliases"].items()
                        if (target["model_id"], target["cohort_id"]) == (old.model_id, old.cohort_id)]
             self.pool.publish_replacement(result["ring_id"], [old.ring_id], aliases=aliases)
             published = True
             with self._formation_lock:
                 policy["active_ring_id"] = result["ring_id"]
+                policy["active_definition"] = policy.get("economic_pending", candidate)
+                policy.pop("stable_choice", None)
             self.pool.record_reconciliation(policy_id, {"state": "published",
                 "active_ring_id": result["ring_id"], "retired_ring_id": old.ring_id})
         except Exception as error:
@@ -514,9 +688,14 @@ class OpenNetworkService:
                 "error_class": type(error).__name__, "active_ring_id": old.ring_id,
                 "candidate_ring_id": candidate["ring_id"]})
         finally:
+            if economic is not None:
+                self.pool.clear_pending_hold(candidate["ring_id"])
             with self._formation_lock:
                 policy["running"] = False
-                policy["next_attempt"] = time.monotonic() + self._reconcile_cooldown
+                cooldown = self._reconcile_cooldown
+                if policy.pop("economic_pending", None) is not None:
+                    cooldown = max(cooldown, policy["economic"]["cooldown_s"])
+                policy["next_attempt"] = time.monotonic() + cooldown
 
     def _prune_records(self, *, preserve=None):
         """Keep approved definitions and live generations, bound old runtime rows."""

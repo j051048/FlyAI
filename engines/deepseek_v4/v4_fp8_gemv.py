@@ -90,6 +90,8 @@ self-test (needs a CUDA device):  python3 phase0/v4_fp8_gemv.py
 """
 import os
 import types
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
 
@@ -137,6 +139,25 @@ if _GEMV_INVALID:
     print(f"[v4] V4_FP8_GEMV={V4_FP8_GEMV!r} IGNORED — {_GEMV_INVALID}", flush=True)
 
 V4_FP8_SHARED = os.environ.get("V4_FP8_SHARED", "0") not in ("", "0")
+V4_FP8_AUTOTUNE = os.environ.get("V4_FP8_AUTOTUNE", "0")
+V4_KERNEL_TUNING_DIR = os.environ.get("V4_KERNEL_TUNING_DIR", "")
+_TUNING_RECORDS = {}
+_TUNING_POLICY = ContextVar("v4_fp8_execution_policy", default="eager")
+
+
+def configure_tuning_execution(policy):
+    if policy not in ("eager", "graph"):
+        raise ValueError("actual FP8 execution policy must be eager or graph")
+    _TUNING_POLICY.set(policy)
+
+
+@contextmanager
+def tuning_execution(policy):
+    token = _TUNING_POLICY.set(policy)
+    try:
+        yield
+    finally:
+        _TUNING_POLICY.reset(token)
 
 # Captured at install().
 _REF_FP8_GEMM = None       # the vendored fp8_gemm as the process had it bound — fallback AND oracle
@@ -324,6 +345,43 @@ def _probe_gemv(N, K, tl_dtype, tile):
         return False, f"{type(e).__name__}: {e}"
 
 
+def _measured_tile(N, K, tl_dtype):
+    """Benchmark exact candidates before serving graph capture; keep K math fixed."""
+    import hashlib
+    import json
+    from v4_kernel_tuning import KernelSelector, environment_identity, measure_cuda
+    from v4_observability import source_inventory
+    if _TUNING_POLICY.get() != V4_FP8_AUTOTUNE:
+        raise ValueError("requested FP8 timing policy/dtype differs from actual serving execution")
+    sources = source_inventory()
+    source_id = hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest()
+    identity = environment_identity(torch, policy=V4_FP8_AUTOTUNE, source_sha256=source_id)
+    identity["output_dtype"] = str(torch.get_default_dtype())
+    selector = KernelSelector(identity, V4_KERNEL_TUNING_DIR or None)
+    tiles = {"reference": None, **{f"{bn},4,128": (bn, 4, 128) for bn in (128, 64, 32, 16)}}
+    sd = torch.float8_e8m0fnu if tl_dtype == "float8_e8m0fnu" else torch.float32
+    def probe(name):
+        return name == "reference" or _probe_gemv(N, K, tl_dtype, tiles[name])[0]
+    def measure(name):
+        result = {}
+        for m in (1, 8, 32):
+            a, a_s, w, w_s = _probe_seeded(N, K, tl_dtype, m)
+            call = (lambda: _REF_FP8_GEMM(a, a_s, w, w_s, sd)) if name == "reference" else (
+                lambda: _run_tiled(a, a_s, w, w_s, sd, tiles[name]))
+            result[str(m)] = measure_cuda(call, torch, policy=V4_FP8_AUTOTUNE)
+        return result
+    choice = selector.select({"kernel": "fp8-gemv", "N": N, "K": K, "scale_dtype": tl_dtype,
+                              "rows": [1, 8, 32]}, list(tiles), probe=probe, measure=measure)
+    _TUNING_RECORDS[(N, K, tl_dtype)] = selector.last
+    return tiles[choice]
+
+
+def tuning_status():
+    return {"schema": "v4-fp8-tuning-status/1", "policy": V4_FP8_AUTOTUNE,
+            "scope": "startup representative operator timings; no serving speed claim",
+            "selections": list(_TUNING_RECORDS.values())}
+
+
 def _resolve_gemv(N, K, tl_dtype):
     """The tile this (N, K) may serve with: the tuned one iff its probe PASSED, else None.
 
@@ -333,6 +391,10 @@ def _resolve_gemv(N, K, tl_dtype):
     if _GEMV_MODE is None:
         return None
     key = (N, K, tl_dtype)
+    if V4_FP8_AUTOTUNE in ("eager", "graph"):
+        if _TUNING_POLICY.get() != V4_FP8_AUTOTUNE:
+            return None  # a graph elsewhere in the stage does not graph this operator
+        key += (_TUNING_POLICY.get(), str(torch.get_default_dtype()))
     if key in _GEMV_VERDICTS:
         v = _GEMV_VERDICTS[key]
         return v if isinstance(v, tuple) else None
@@ -340,6 +402,16 @@ def _resolve_gemv(N, K, tl_dtype):
     # whose driver cannot answer must not take the dispatch down.
     if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
         return None                        # unjudged mid-capture: serve the vendored, decide later
+    if _GEMV_MODE == "auto" and V4_FP8_AUTOTUNE in ("eager", "graph"):
+        try:
+            tile = _measured_tile(N, K, tl_dtype)
+            _GEMV_VERDICTS[key] = tile if tile is not None else "shipped"
+            return tile
+        except Exception as error:
+            # No measured choice is preferable to silently trusting an old cache.
+            _GEMV_VERDICTS[key] = False
+            print(f"[v4] FP8 startup tuning declined: {type(error).__name__}; reference serves", flush=True)
+            return None
     tile = _auto_tile(N) if _GEMV_MODE == "auto" else _GEMV_MODE
     if tile is None:
         _GEMV_VERDICTS[key] = "shipped"

@@ -5,6 +5,9 @@
 40、41、42 层以及 3 个 MTP 块。本指南不代表新集群已经通过 GPU 验收。
 4×RTX 5090 ≥40、6×RTX 5090 ≥30 committed decode tok/s 仍待真实硬件验证。
 
+2026-10-11 多卡宿主改造、命名执行配方、实际捕获观察、原生内核探针及数值/回滚
+诊断见 [V4_MULTIGPU_EXECUTION](V4_MULTIGPU_EXECUTION.md)。旧 legacy 快配方不等于严格生产资格。
+
 共享 Hadamard 初始化、缓存别名、自检、strict SSH 手动部署及 P0–P2 复测步骤见
 [V4_OPERATIONS](V4_OPERATIONS.md)。手动实验工具不代替下文的生产资源租约。
 

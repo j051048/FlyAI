@@ -24,17 +24,22 @@ GPU 身份、共享 RAM／锁页预算和实际链路决定放置。节点注册
 | V4 服务 | DSpark、可选本地专家 RAM／GPU 缓存、受控预取、KV 工作区、查询分块预填充 | 每项优化有数值／资源门控；新增路径 GPU 速度线待验收 |
 | V4 权重准备 | 有界 HF 流式转换、按层/角色分发、局部分片完整哈希、磁盘/RAM 准备租约和原子发布 | 配置准备源后自动执行；只支持已声明的原 V4-Flash native ABI，真实集群仍须验收 |
 | V4 状态优化 | 请求边界选择校准投机配方、签名全环恢复、保序专家预填充 DMA 流水 | 默认关闭；完全相同前缀可复用，扩展前缀每请求完整参考预填充验证；GPU 收益待实测 |
-| 多环与恢复 | 多环并行、可选私有 SQLite 作业日志/owner fencing、同 cohort 原请求重放、SSE 游标与短请求 aging | 不是分布式协调器 HA；token-step 框架默认关闭，当前 V4/GPT-OSS 无 qualified 原生批处理后端 |
+| V4 多卡执行 | 显式共享配方、实际图覆盖、数值/回滚诊断、原生内核探针、strict 宿主分组与有界接收缓冲 | 保留逐 GPU 身份和共享预算；四策略及故障矩阵已接入，GPU/速度资格待验，见 [多卡指南](docs/V4_MULTIGPU_EXECUTION.md) |
+| 多环与恢复 | 多环并行、私有 SQLite 日志/owner fencing、原请求重放、SSE 游标、aging 与成本路由 | V4 可另选独立 tokenwise greedy cohort 的 2–4 请求时间片；不是多请求 GEMM 或分布式 HA，GPU 收益待验 |
 | 回放质量 | 本机固定验证者的鲜活签名复算报告、按节点/cohort 限制新组环 | 不接受节点自报质量分，也不是硬件 attestation 或模型密码学证明 |
 | 收据 | 实际激活字节承诺、签名、nonce、层覆盖和相邻链核对 | 收据不是完整模型诚实计算的密码学证明；计算节点可见其处理的激活 |
 
-本轮相关 CPU／socket／HTTP 组合回归为 **1813 通过、8 项环境条件跳过**，66 项 GPU 标记用例未执行。
+本轮六项多卡 P0–P2 的 **123 个相关测试文件**完成组合回归：**2081 通过、11 项环境条件跳过**，80 项 GPU 标记用例未选入。
+覆盖真实原生 CPU 数学、strict socket、HTTP、SQLite、状态恢复及校准/经济证据；不代表 GPU 速度或全仓跨平台 CI。
+完整 Windows 全仓尝试包含既有编码、POSIX 与模拟计时失败；代表用例已与 `070ccd6` 基线对照，不能将相关组合结果登记为全仓通过。
+上一构建的组合回归为 1813 通过、8 项跳过、66 项 GPU 未选入。
+前一轮执行改造的 111 文件组合为 1903 通过、11 跳过、69 GPU 未选入；这些专项不相加。
 CI 报告复核后的部署／资源补充回归为 **218 通过、1 项 POSIX 用例在 Windows 跳过**；
 同一进程生命周期套件在 WSL Ubuntu 22.04 上 **51 项通过**。各专项与组合结果不相加，
 尚未把本机结果登记为 GitHub Python 3.12 全仓 CI 或真实 GPU 性能验收。
 上一构建的 1839 项及后续 137 项重叠回归保留在历史状态记录中。
 该构建另有两项 CUDA 缓存／图指针用例因本机条件跳过。这些是旧构建记录，不是本轮整体结果或 GPU 验收。
-当前服务加固仍需最终整体回归；真实 MXFP4 GPU 执行及 V4 四卡／六卡速度与持续运行需按新发布门槛实测。
+P0–P2 的相关组合回归已完成；真实 MXFP4 GPU 执行及 V4 四卡／六卡速度与持续运行仍需按新发布门槛实测。本轮按用户安排暂缓硬件验证。
 
 ### 使用当前入口
 
@@ -44,6 +49,7 @@ CI 报告复核后的部署／资源补充回归为 **218 通过、1 项 POSIX �
 * V4 自检、strict SSH 部署与性能复测：[V4_OPERATIONS](docs/V4_OPERATIONS.md)。
 * 三项可选状态优化、配置与验证边界：[V4_STATEFUL_OPTIMIZATIONS](docs/V4_STATEFUL_OPTIMIZATIONS.md)。
 * 持久恢复、SLO/风险、请求调度、质量报告与发布门槛：[V4_SERVICE_HARDENING](docs/V4_SERVICE_HARDENING.md)。
+* P0–P2 执行改造、投机校准热装、原生独立请求、增长前缀与健康环重组：[V4_PERFORMANCE_EXECUTION](docs/V4_PERFORMANCE_EXECUTION.md)。
 * 小磁盘节点、流式分片与请求边界换环：[WEIGHT_PREPARATION](docs/WEIGHT_PREPARATION.md)。
 * V4 固定速度线与原始证据：[V4_BENCHMARK](docs/V4_BENCHMARK.md)。
 * 全部当前规范、研究与历史记录：[DOCUMENTATION_INDEX](docs/DOCUMENTATION_INDEX.md)。
@@ -111,8 +117,10 @@ resource ownership, exact calibrated heterogeneous placement, authenticated HTTP
 multi-ring queues, request cancellation and original-prompt replay with prefix checking. Each ring has a
 serial worker; separate rings execute concurrently. Optional private SQLite journals retain original requests
 and committed prefixes for owner-fenced, same-cohort replay. This is not distributed coordinator HA.
-Token-step scheduling is opt-in and requires a qualified backend; current native V4/GPT-OSS backends must
-reject it. Shortest-request scheduling with aging works with the existing serial workers.
+Token-step scheduling is opt-in and requires an explicit backend contract. The distinct V4 native
+tokenwise greedy cohort now supports 2–4 independent scalar state lanes, growing-prefix reuse and
+strict per-job receipts. It is not grouped multi-request GEMM, and CUDA performance remains pending.
+Existing V4/GPT-OSS modes still reject token batching. See [execution changes](docs/V4_PERFORMANCE_EXECUTION.md).
 Receipts bind signed activation commitments, job freshness and layer coverage; they do not
 constitute a cryptographic proof of honest model execution or conceal activations from computing nodes.
 

@@ -9,6 +9,12 @@ separate contracts. Distinct colocated GPUs are permitted. Public IP is
 informational; region labels guide search and measured effective data channels
 constrain placement.
 
+Current P0–P2 execution also includes observed-cost request routing and default-off fixed-workload
+economic reformation. A distinct V4 tokenwise greedy cohort supports independent scalar lanes,
+growing-prefix reuse and node-local state checkpoints; this is not multi-request GEMM or coordinator HA.
+Configuration, numerical contracts and pending GPU acceptance are documented in
+[V4_PERFORMANCE_EXECUTION](V4_PERFORMANCE_EXECUTION.md).
+
 Optional SLO planning, private owner-fenced job recovery, shortest-job aging,
 qualified token-step scheduling and pinned replay-auditor feedback are described
 in [V4_SERVICE_HARDENING](V4_SERVICE_HARDENING.md). Native V4/GPT-OSS still execute

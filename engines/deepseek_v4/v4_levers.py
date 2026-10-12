@@ -731,6 +731,17 @@ NON_LEVER_ENV = {
     "V4_RUNTIME_METRICS": "opt-in signed per-job work/residency observations; no math or wire change",
     "V4_PROFILE_RUNTIME": "bounded host phase statistics and sampled CUDA event intervals",
     "V4_PROFILE_GPU_EVERY": "GPU profile sample interval; events resolved outside token execution",
+    "V4_EXECUTION_PROFILE": "explicit versioned deployment recipe; not hardware/performance qualification",
+    "V4_TRANSPORT_BUFFER_MIB": "opt-in bounded process-wide receive storage; unchanged socket wire",
+    "V4_TRANSPORT_BUFFER_SLOTS": "bounded receive buffer lease slots; last tensor view owns its slot",
+    "V4_TRANSPORT_PINNED": "explicit CUDA pinned receive allocation; host/pin calibration required",
+    "V4_FP8_AUTOTUNE": "startup-only exact-gated FP8 tile measurement policy: eager or graph; default off",
+    "V4_KERNEL_TUNING_DIR": "optional environment-bound FP8 startup timing cache; each cached tile is reprobed",
+    "V4_NATIVE_LANES": "opt-in 2..4 independent native tokenwise request state slots; default off",
+    "V4_NATIVE_LANE_HOST_MIB": "explicit host memory reservation for all independent native lane states",
+    "V4_NATIVE_LANE_CACHE_TTL_S": "bounded same-identity native lane prefix-state retention time",
+    "V4_NATIVE_LANE_STATE_DIR": "private node-local native lane safetensors checkpoint directory",
+    "V4_NATIVE_LANE_DISK_MIB": "explicit peak disk budget for atomic native lane checkpoint generations",
     "V4_EXPERT_PREFETCH_SLOTS": "maximum experts predicted before each layer's attention",
     "V4_EXPERT_PREFETCH_WARMUP": "executed routes observed before prediction begins",
     "V4_EXPERT_CACHE_SLOTS": "expert cache slot count per pool when V4_EXPERT_PLACEMENT=ram",
@@ -739,6 +750,7 @@ NON_LEVER_ENV = {
     "V4_DSPARK_CONF_MIN": "conf-gate knob, consumed with V4_DSPARK_CONF_GATE",
     "V4_DSPARK_CONF_THRESH": "conf-gate knob, consumed with V4_DSPARK_CONF_GATE",
     "V4_DSPARK_GRAPH": "drafter head graph, rides on V4_DSPARK_FAST and is CUDA-only",
+    "V4_DSPARK_RESULT_BUFFER": "opt-in reusable draft/confidence host result buffer; one CUDA completion event",
     "V4_LEVERS_STRICT": "this file: turn a finding into a refusal to serve",
 }
 
@@ -954,8 +966,11 @@ ENGINE_MODULES = (
     "v4_expert_cache.py", "v4_hybrid.py", "v4_chunked_prefill.py", "v4_wire_codec.py",
     "v4_kv_runtime.py", "v4_privacy.py", "v4_gateway.py",
     "v4_runtime_init.py", "v4_observability.py", "v4_artifact_contract.py", "v4_tokenizer.py",
-    "v4_native_trace.py",
+    "v4_native_trace.py", "v4_kernel_tuning.py", "v4_native_lanes.py", "v4_durable_state.py",
+    "v4_native_lane_backend.py", "v4_native_lane_protocol.py", "v4_replay_audit.py",
+    "v4_adaptive_round.py", "v4_draft_results.py", "v4_round_evidence.py",
     "v4_prefill_expert_pipeline.py", "v4_conversation_cache.py", "v4_conversation_protocol.py", "v4_request_features.py",
+    "v4_execution_profiles.py", "v4_native_capability.py", "v4_numeric_diagnostics.py",
 )
 
 _ENV_RE = re.compile(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""")

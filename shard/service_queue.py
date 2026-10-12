@@ -127,17 +127,29 @@ class Job:
             raise JobCancelled("job cancelled")
 
     def commit(self, token):
+        self.commit_many([token])
+
+    def commit_many(self, tokens):
         # Called AFTER the coordinator commits. Even a racing cancellation must
         # preserve this observed prefix; dropping it would lose the resume frontier.
-        if type(token) is not int or token < 0:
-            raise ValueError("committed token must be a nonnegative integer")
+        if (not isinstance(tokens, (list, tuple)) or not 1 <= len(tokens) <= 64 or
+                any(type(token) is not int or not 0 <= token < (1 << 31) for token in tokens)):
+            raise ValueError("committed tokens must be a bounded nonnegative integer group")
+        tokens = tuple(tokens)
         with self.changed:
-            if self.state != "running" or len(self.tokens) >= self.max_new:
+            if self.state != "running" or len(self.tokens) + len(tokens) > self.max_new:
                 raise RuntimeError("commit outside a running job or beyond max_new")
             if self._journal is not None:
-                self._journal.append_token(self._journal_owner, self.id, len(self.tokens), token)
-            self.tokens.append(token)
+                self._journal.append_tokens(self._journal_owner, self.id, len(self.tokens), tokens)
+            self.tokens.extend(tokens)
             self.changed.notify_all()
+
+    def emitter(self):
+        """Callable compatibility plus atomic publication of already-settled groups."""
+        def emit(token):
+            self.commit(token)
+        emit.commit_many = self.commit_many
+        return emit
 
     def snapshot(self, *, include_tokens=False):
         self.assert_publishable()
@@ -594,7 +606,7 @@ class ServiceQueue:
                     return
                 self._running = job
             try:
-                result = self.backend.execute(job, job.commit, lambda: job.check_stop(self.clock()))
+                result = self.backend.execute(job, job.emitter(), lambda: job.check_stop(self.clock()))
                 if not isinstance(result, dict) or result.get("tokens") != job.checkpoint():
                     raise RuntimeError("backend result does not match committed callback frontier")
                 job.check_stop(self.clock())

@@ -124,7 +124,9 @@ def test_engine_modules_accounts_for_every_v4_module_on_disk():
                   # acceptance harness, the round-replay economics, and the discrete-event ring sim
                   "v4_ngram_accept.py", "v4_ngram_econ.py", "v4_pipe_sim.py",
                   "v4_benchmark.py", "v4_acceptance.py", "v4_soak.py", "v4_release.py",
-                  "v4_stream_prepare.py", "v4_deploy.py", "v4_link_probe.py"}
+                  "v4_stream_prepare.py", "v4_deploy.py", "v4_link_probe.py",
+                      "v4_profile_report.py", "v4_ring_economics.py", "v4_round_calibration.py",
+                      "v4_local_transport_bench.py", "v4_numeric_diagnose.py", "v4_kernel_capability.py"}
     unclassified = on_disk - set(VL.ENGINE_MODULES) - bench_only
     assert not unclassified, (
         f"{sorted(unclassified)} is neither in v4_levers.ENGINE_MODULES (scraped for levers, and the "

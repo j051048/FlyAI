@@ -27,7 +27,7 @@ def test_pool_preferred_ring_respects_cohort_readiness_and_fixed_binding():
     a, b = add_ready(pool, "a"), add_ready(pool, "b")
     first = pool.acquire("test-model", COHORT, estimated_tokens=1)
     following = pool.acquire("test-model", COHORT, estimated_tokens=1, preferred_ring_id="a")
-    assert first.ring is following.ring is a
+    assert first.ring is a and following.ring is b  # affinity cannot override a known backlog
     pool.drain("a")
     fallback = pool.acquire("test-model", COHORT, estimated_tokens=1, preferred_ring_id="a")
     assert fallback.ring is b and first.ring is a and a.state == RingState.DRAINING
@@ -36,15 +36,15 @@ def test_pool_preferred_ring_respects_cohort_readiness_and_fixed_binding():
     pool.shutdown()
 
 
-def test_queue_same_session_prefers_old_ring_but_other_tenant_does_not():
+def test_queue_same_session_is_a_soft_hint_and_keeps_existing_bindings():
     pool = RingPool()
     a, b = add_ready(pool, "a"), add_ready(pool, "b")
     queue = service(pool, session_affinity=True)
     first = queue.submit_request("a", body("first", shard_session_id="s"))[0]
     second = queue.submit_request("a", body("second", shard_session_id="s"))[0]
-    assert first.ring_binding.ring is second.ring_binding.ring is a
+    assert first.ring_binding.ring is a and second.ring_binding.ring is b
     other = queue.submit_request("b", body("other", shard_session_id="s"))[0]
-    assert other.ring_binding.ring is b
+    assert other.ring_binding.ring is a  # another tenant cannot borrow tenant a's affinity
     assert first.conversation_session_id == "s"
     pool.drain("a")
     replacement = queue.submit_request("a", body("following", shard_session_id="s"))[0]

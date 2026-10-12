@@ -511,6 +511,37 @@ def moe_graph_coverage(stage):
     return sum(g is True for g in got), sum(g is False for g in got), sum(g is None for g in got)
 
 
+def coverage_summary(stage):
+    """Host metadata only; armed objects and MoE approval do not prove capture coverage.
+
+    Counts cover retained graphs on THIS stage. Budget/cumulative skipped counters are explicitly
+    process-wide and include graphs no longer retained; neither claims every context is warmed.
+    """
+    rows = []
+    for index, bg in enumerate(getattr(stage, "_block_graphs", None) or []):
+        if not isinstance(bg, WholeBlockGraphs):
+            continue
+        keys = sorted(bg._graphs)
+        rows.append({"layer": stage.lo + index, "captured_variants": len(keys),
+                     "captured_graphs": len(keys) + int(bg.g_post is not None),
+                     "bucket_compress_keys": [[int(bucket), bool(compress)] for bucket, compress in keys],
+                     "buckets": sorted({int(bucket) for bucket, _ in keys}),
+                     "eager": bool(bg.eager), "moe_requested": bg.moe_requested,
+                     "moe_in_graph": bg.moe_in_graph,
+                     "undecided": bool(bg.moe_requested and bg.moe_in_graph is None),
+                     "refused": bool(bg.moe_requested and bg.moe_in_graph is False),
+                     "refusal_reason": getattr(bg, "refusal_reason", None),
+                     "fallback_reason": getattr(bg, "fallback_reason", None)})
+    return {"schema": "flyai-v4-whole-coverage/1", "scope": "retained_stage_graphs",
+            "layers": rows, "captured_graphs": sum(row["captured_graphs"] for row in rows),
+            "captured_layers": sum(bool(row["captured_variants"]) and not row["eager"] for row in rows),
+            "refused_layers": sum(row["refused"] for row in rows),
+            "undecided_layers": sum(row["undecided"] for row in rows),
+            "process_budget": V4_GRAPH_MAX, "process_captured_total": _GRAPH_COUNT,
+            "process_skipped_total": _GRAPH_SKIPPED,
+            "all_contexts_warmed": False}
+
+
 # ── a whole decode block, capture-safe, from static buffers ─────────────────────────────────────────
 
 def block_pre_cs(R, L, h, pos, win_topk, comp_topk, arange_w, compress, read_w):
@@ -686,13 +717,17 @@ class WholeBlockGraphs:
     def _block(self, compress, bucket):
         """block_decode_cs on THIS layer's static buffers, at this bucket. The capture target."""
         comp, ar = self._bufs_for(bucket)
-        return block_decode_cs(self.R, self.L, self.h_buf, self.ids_buf, self.pos_buf,
-                               self.win_topk_buf, comp, ar, compress, self.moe, bucket)
+        from v4_fp8_gemv import tuning_execution
+        with tuning_execution("graph"):
+            return block_decode_cs(self.R, self.L, self.h_buf, self.ids_buf, self.pos_buf,
+                                   self.win_topk_buf, comp, ar, compress, self.moe, bucket)
 
     def _pre(self, compress, bucket):
         comp, ar = self._bufs_for(bucket)
-        return block_pre_cs(self.R, self.L, self.h_buf, self.pos_buf, self.win_topk_buf,
-                            comp, ar, compress, bucket)
+        from v4_fp8_gemv import tuning_execution
+        with tuning_execution("graph"):
+            return block_pre_cs(self.R, self.L, self.h_buf, self.pos_buf, self.win_topk_buf,
+                                comp, ar, compress, bucket)
 
     def _capture_pos(self, compress, bucket):
         """A representative decode position to capture this (bucket, compress) variant at.
@@ -768,6 +803,7 @@ class WholeBlockGraphs:
         SAYS SO: this lever's whole risk is being believed while it is not on."""
         global _MOE_GRAPHED, _MOE_REFUSED
         why = _moe_refusal(self.L, self.dev, self.dt, ids, self.R.M)
+        self.refusal_reason = why
         self.moe_in_graph = why is None
         if why is None:
             _MOE_GRAPHED += 1
@@ -864,6 +900,7 @@ class WholeBlockGraphs:
         if entry is None:
             need = 2 if (self.moe_mode == "eager" and self.g_post is None) else 1
             if _GRAPH_COUNT + need > V4_GRAPH_MAX:
+                self.fallback_reason = "graph_budget_exhausted"
                 self.eager, _GRAPH_SKIPPED = True, _GRAPH_SKIPPED + need
                 self._drop_moe_from_graph()
                 print(f"[v4] graph budget V4_GRAPH_MAX={V4_GRAPH_MAX} spent — layer "
@@ -872,18 +909,25 @@ class WholeBlockGraphs:
             try:
                 entry = self._graphs[key] = self._capture(key, ids)
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                self.fallback_reason = f"capture_failed:{type(e).__name__}"
                 torch.cuda.synchronize()
                 self.eager, self._graphs, _GRAPH_SKIPPED = True, {}, _GRAPH_SKIPPED + need
                 self._drop_moe_from_graph()
                 print(f"[v4] whole-layer capture failed for layer {self.L.layer_id} at bucket "
                       f"{key[0]}: {type(e).__name__}: {e} — layer stays eager", flush=True)
                 return self._eager(h, ids, start_pos)
-        self._feed(h, ids, start_pos, key[0])
-        entry["graph"].replay()
+        profiler = getattr(self.st, "_runtime_profile", None)
+        from contextlib import nullcontext
+        with (profiler.interval("main.decode.graph_input", torch, self.dev) if profiler else nullcontext()):
+            self._feed(h, ids, start_pos, key[0])
+        with (profiler.interval("main.decode.graph_replay", torch, self.dev) if profiler else nullcontext()):
+            entry["graph"].replay()
         if self.moe_mode != "eager":
             return entry["out"].clone()
-        self.ffn_out_buf.copy_(real_moe(self.L, self.ho[0], ids))    # real routed MoE, eager
-        self.g_post["graph"].replay()
+        with (profiler.interval("main.decode.eager_moe", torch, self.dev) if profiler else nullcontext()):
+            self.ffn_out_buf.copy_(real_moe(self.L, self.ho[0], ids))
+        with (profiler.interval("main.decode.graph_post", torch, self.dev) if profiler else nullcontext()):
+            self.g_post["graph"].replay()
         return self.g_post["out"].clone()
 
     def _feed(self, h, ids, start_pos, bucket):
@@ -897,6 +941,15 @@ class WholeBlockGraphs:
         if comp is not None:
             comp.copy_(build_comp_topk(self.R.M, self.ratio, start_pos, self.win, bucket))
 
+    def replay_eager(self, h, ids, start_pos):
+        """Rebuild rollback state with this block's math, without touching capture buffers.
+
+        This is also the numerical diagnostic oracle for a captured block. Reference Block.forward
+        is not interchangeable: REF_SLIM and top-k tie ordering can change its arithmetic.
+        """
+        self._check_aliases()
+        return self._eager(h, ids, start_pos)
+
     def _eager(self, h, ids, start_pos):
         """The capture-safe block run WITHOUT a graph -- the fallback, and the TIER-1 grading twin.
 
@@ -909,5 +962,16 @@ class WholeBlockGraphs:
         comp_topk = (build_comp_topk(self.R.M, self.ratio, start_pos, self.win, bucket)
                      if self.ratio and not self.has_indexer else None)
         ar = torch.arange(bucket, device=self.dev) if self.has_indexer else None
-        return block_decode_cs(self.R, self.L, h, ids, pos, win_topk, comp_topk, ar,
-                               compress, self.moe, bucket)
+        from v4_fp8_gemv import tuning_execution
+        if self.moe_mode == "eager":
+            # Numerical twin: choose the same kernels as capture; no graph executes here.
+            # This scope is NOT capture/replay or graph-performance evidence.
+            with tuning_execution("graph"):
+                x, residual, post, comb = block_pre_cs(self.R, self.L, h, pos, win_topk,
+                                                      comp_topk, ar, compress, bucket)
+            with tuning_execution("eager"):
+                y = self.moe(self.L, x, ids)
+            return block_post_cs(self.L, y, residual, post, comb)
+        with tuning_execution("graph"):
+            return block_decode_cs(self.R, self.L, h, ids, pos, win_topk, comp_topk, ar,
+                                   compress, self.moe, bucket)

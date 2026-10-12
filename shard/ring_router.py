@@ -153,6 +153,67 @@ class MultiRingQueue(ServiceQueue):
         self._preserve_pending = True
         super()._journal_fenced(error)
 
+    def _prepare_routes(self, model, cohort, body):
+        """Tokenize once, then run backend-local validation on immutable input.
+
+        Legacy backends without this optional validation seam are re-prepared
+        only if selected, and must match the same cohort's original preparation.
+        The memo lives for this admission only, never across tenants/requests.
+        """
+        candidates = self.router.pool.routing_candidates(model, cohort)
+        seed, prepared, failures = None, {}, []
+        for ring in candidates:
+            try:
+                if seed is None:
+                    value = ring.backend.prepare(body)
+                    seed = (ring, value)
+                else:
+                    validator = getattr(ring.backend, "validate_prepared_route", None)
+                    value = validator(seed[1], body) if callable(validator) else seed[1]
+                payload, count, maximum, timeout_s = value
+                if (not isinstance(payload, dict) or type(count) is not int or count < 1
+                        or type(maximum) is not int or maximum < 1):
+                    raise ValueError("invalid backend routing preparation")
+                if self._batching["enabled"]:
+                    from .continuous_batch import backend_contract
+                    contract = backend_contract(ring)
+                    if (count > contract["max_prompt_tokens"] or maximum > contract["max_new_tokens"]
+                            or count + maximum > contract["max_context_tokens"]):
+                        raise AdmissionError("prompt exceeds qualified batch state capacity", status=400,
+                                             code="context_length_exceeded")
+                prepared[ring.ring_id] = (ring, value)
+            except AdmissionError as error:
+                failures.append(error)
+        if not prepared:
+            if failures:
+                raise failures[0]
+            raise RingUnavailable("no READY leased ring accepts this request")
+        return prepared, seed
+
+    def _bind_prepared_route(self, model, cohort, prepared, seed, body, *, tenant,
+                             request_fingerprint, region, preferred_ring_id):
+        """Legacy selection-time validation must not hide another usable ring."""
+        remaining, rejected = dict(prepared), None
+        while remaining:
+            binding = self.router.pool.acquire_prepared(model, cohort, remaining, tenant=tenant,
+                request_fingerprint=request_fingerprint, region=region, preferred_ring_id=preferred_ring_id)
+            selected = remaining[binding.ring.ring_id][1]
+            try:
+                if binding.ring is not seed[0] and not callable(getattr(binding.backend, "validate_prepared_route", None)):
+                    actual = binding.backend.prepare(body)
+                    if actual != selected:
+                        raise AdmissionError("same-cohort backend preparation differs; refresh routing contracts",
+                                             status=503, code="incompatible_preparation")
+                return binding, selected
+            except AdmissionError as error:
+                self.router.pool.release(binding)
+                remaining.pop(binding.ring.ring_id)
+                rejected = error
+            except Exception:
+                self.router.pool.release(binding)
+                raise
+        raise rejected or RingUnavailable("no READY leased ring accepts this prepared request")
+
     def start(self):
         self.recover_pending()
         with self._condition:
@@ -220,23 +281,17 @@ class MultiRingQueue(ServiceQueue):
                     raise AdmissionError("invalid completion token budget", status=400, code="invalid_request_error")
                 preference = (self._session_affinity.preferred(tenant, cohort_id, session_id)
                     if self._session_affinity is not None and session_id is not None else None)
-                acquire_options = {"estimated_tokens": maximum, "region": region}
-                if preference is not None:
-                    acquire_options["preferred_ring_id"] = preference
-                binding = self.router.pool.acquire(model_id, cohort_id, **acquire_options)
+                prepared_body = dict(request, model=model_id)
+                for name in ("shard_cohort", "shard_region", "shard_session_id"):
+                    prepared_body.pop(name, None)
+                prepared, seed = self._prepare_routes(model_id, cohort_id, prepared_body)
+                binding, selected = self._bind_prepared_route(model_id, cohort_id, prepared, seed, prepared_body,
+                    tenant=tenant, request_fingerprint=raw_fingerprint,
+                    region=region, preferred_ring_id=preference)
             except RingUnavailable as error:
                 raise AdmissionError(str(error), status=503, code="no_ready_ring") from error
             try:
-                prepared_body = dict(request, model=model_id)
-                prepared_body.pop("shard_cohort", None); prepared_body.pop("shard_region", None)
-                prepared_body.pop("shard_session_id", None)
-                payload, count, maximum, timeout_s = binding.backend.prepare(prepared_body)
-                if self._batching["enabled"]:
-                    from .continuous_batch import backend_contract
-                    contract = backend_contract(binding.ring)
-                    if count > contract["max_prompt_tokens"] or maximum > contract["max_new_tokens"] or count + maximum > contract["max_context_tokens"]:
-                        raise AdmissionError("prompt exceeds qualified batch state capacity", status=400, code="context_length_exceeded")
-                self.router.pool.update_estimate(binding, count + maximum)
+                payload, count, maximum, timeout_s = selected
                 job, fresh = super().submit(tenant, payload, prompt_tokens=count, max_new=maximum,
                     timeout_s=timeout_s, idempotency_key=idempotency_key,
                     durable_context={"model_id": model_id, "cohort_id": cohort_id,

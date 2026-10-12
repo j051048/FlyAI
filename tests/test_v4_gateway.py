@@ -169,6 +169,39 @@ def test_legacy_coordinator_and_missing_assignments_refuse_production_backend():
         backend(pipe)
 
 
+def test_same_cohort_routing_revalidates_capacity_and_modes_without_encoding_again(monkeypatch):
+    pipe = Pipe()
+    adapter = backend(pipe)
+    body = chat(max_tokens=4)
+    prepared = adapter.prepare(body)
+    monkeypatch.setattr(pipe, "_encode_prompt", lambda *a: pytest.fail("same-cohort route encoded twice"))
+    assert adapter.validate_prepared_route(prepared, body) == prepared
+    adapter.max_context = 7
+    with pytest.raises(GW.AdmissionError, match="context"):
+        adapter.validate_prepared_route(prepared, body)
+    # Different default modes must apply their own speculative capacity margin.
+    adapter.mode = "greedy"
+    changed = adapter.validate_prepared_route(prepared, body)
+    assert changed[0]["mode"] == "greedy" and changed[0]["prompt_ids"] == prepared[0]["prompt_ids"]
+    assert changed[0]["prompt_ids"] is not prepared[0]["prompt_ids"]
+    with pytest.raises(GW.AdmissionError, match="greedy"):
+        adapter.validate_prepared_route(prepared, {**body, "temperature": .5})
+    adapter.close()
+
+
+def test_economics_profile_uses_loaded_coordinator_constants_not_changed_environment(monkeypatch):
+    pipe = Pipe()
+    pipe.V4_SPEC_DEPTH, pipe.V4_REFILL_FLOOR, pipe.V4_LAZY_DRAFT = 16, 1, False
+    adapter = backend(pipe)
+    monkeypatch.setenv("V4_SPEC_DEPTH", "32")
+    profile = adapter.economics_profile()
+    assert profile == {"mode": "pipelined", "coordinator_environment": {
+        "V4_SPEC_DEPTH": "16", "V4_REFILL_FLOOR": "1", "V4_LAZY_DRAFT": "0"}}
+    adapter._policy = object()
+    assert adapter.economics_profile() is None
+    adapter.close()
+
+
 @pytest.fixture
 def live():
     pipe = Pipe(fail_first=True)

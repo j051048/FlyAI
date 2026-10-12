@@ -793,6 +793,8 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
     """
     from .locality import link_snapshot, candidate_tiers, shortlist_candidates, ordering_costs
     from .planning_cost import estimate, workload_spec, slo_spec
+    from .host_topology import host_group_policy, contiguous_hosts, group_placement
+    host_policy = host_group_policy(locality.get("host_groups") if isinstance(locality, dict) else None)
     slo_policy = slo_spec(slo)
     if diagnostics is not None:
         if not isinstance(diagnostics, dict):
@@ -818,6 +820,10 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
     require_exact = (resolved or {}).get("require_exact_calibrations", False)
     if type(require_exact) is not bool:
         raise ValueError("require_exact_calibrations must be a boolean")
+    if host_policy is not None:
+        # A host segment remains several individual GPU workers. Capacity can
+        # never be pooled then evenly re-split without fitting measured roles.
+        require_exact = True
     floor = (resolved or {}).get("gpu_weight_storage_floor")
     if floor is not None:
         if (not isinstance(floor, dict) or set(floor) != {"version", "layer_bytes", "head_bytes", "tail_bytes"}
@@ -883,7 +889,7 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
     by_id = {node["id"]: i for i, node in enumerate(nodes)}
     attempts = []
     heads_truncated = False
-    use_cost = slo_policy is not None or objective == "pipeline" or workload is not None or any(node.get("stage_trace") is not None for node in nodes)
+    use_cost = host_policy is not None or slo_policy is not None or objective == "pipeline" or workload is not None or any(node.get("stage_trace") is not None for node in nodes)
     slo_rejections = {"unknown_metrics": set(), "exceeded_targets": set(), "candidates": 0}
     if isinstance(locality, dict) and locality.get("min_predicted_tok_s") is not None:
         from .locality import number
@@ -962,7 +968,9 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
                     prediction = estimate(order, allocation, timing, mesh, outgoing, incoming,
                                     scored_nodes, resolved or M25_PROFILE, workload,
                                     edges=snapshot["edges"], now=snapshot["now"], objective=objective,
-                                    slo=slo_policy, coordinator_id=coordinator_id)
+                                    slo=slo_policy, coordinator_id=coordinator_id, host_groups=host_policy)
+                    if host_policy is not None and not contiguous_hosts(order, scored_nodes):
+                        prediction["selection_score"] = math.inf
                     if slo_policy is not None and not prediction["slo"]["eligible"]:
                         slo_rejections["candidates"] += 1
                         for key in ("unknown_metrics", "exceeded_targets"):
@@ -1033,6 +1041,10 @@ def plan_ring(nodes, rtt=None, model=None, *, slack=None, privacy=None, isolatio
         for a, b in ((actual_coordinator, best["order"][0]), (best["order"][-1], actual_coordinator)):
             if a != b:
                 prediction["routes"].append({"src": a, "dst": b, **snapshot["edges"].get((a, b), {})})
+        if host_policy is not None:
+            prediction["host_groups"] = group_placement(best["stages"], nodes, host_policy,
+                now=snapshot["now"], coordinator_id=actual_coordinator, routes=prediction["routes"])
+            prediction["uncertainty"] = sorted(set(prediction["uncertainty"] + prediction["host_groups"]["uncertainty"]))
         if coordinator_id is not None:
             total_hop = hop(actual_coordinator, best["order"][0]) + hop(best["order"][-1], actual_coordinator)
             best["coordinator_placement"].update(preferred_host=coordinator_id,

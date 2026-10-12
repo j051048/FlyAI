@@ -54,7 +54,7 @@ def source_inventory():
     for name in ("receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport", "speculation_policy",
                  "execution_proof", "job_journal", "service_queue", "http_gateway", "ring_pool", "ring_router",
                  "continuous_batch", "node_quality", "locality", "planning_cost", "offers", "control_plane",
-                 "network_service", "plan", "topology"):
+                 "network_service", "plan", "topology", "routing_cost", "ring_economics", "receive_buffers", "host_topology"):
         path = root / "shard" / (name + ".py")
         if path.is_file():
             files.append(path)
@@ -88,6 +88,14 @@ def runtime_observation(stage, *, session_config=None, phase="loaded"):
     env = public_environment()
     torch_module = sys.modules.get("torch")
     tilelang_module = sys.modules.get("tilelang")
+    from v4_execution_profiles import stage_profile_status
+    actual_wire = sys.modules.get("v4_pipe") or sys.modules.get("engines.deepseek_v4.v4_pipe")
+    actual_transport = sys.modules.get(getattr(getattr(actual_wire, "_raw_recv_msg", None), "__module__", ""))
+    if actual_transport is None:
+        actual_transport = sys.modules.get("transport") or sys.modules.get("shard.transport")
+    pool_status = (actual_transport.receive_pool_status() if actual_transport is not None and
+                   hasattr(actual_transport, "receive_pool_status") else
+                   {"enabled": False, "scope": "actual transport has no receive pool"})
     value = {"schema": SCHEMA, "node_id": row["node_id"] if row else f"local-stage-{stage.lo}-{stage.hi}",
         "gpu_uuid": gpu_uuid, "process_run_id": stage._runtime_process_run_id,
         "runtime_config_sha256": runtime_config_identity(stage), "source_files": source,
@@ -100,7 +108,8 @@ def runtime_observation(stage, *, session_config=None, phase="loaded"):
         "backend_identity": {"hadamard": hadamard_identity()},
         "optimizations": {
             "prefill_expert_pipeline": stage.prefill_pipeline_status() if hasattr(stage, "prefill_pipeline_status") else {"enabled": False},
-            "conversation_cache": stage._conversation_cache.status() if hasattr(stage, "_conversation_cache") else {"enabled": False}},
+            "conversation_cache": stage._conversation_cache.status() if hasattr(stage, "_conversation_cache") else {"enabled": False},
+            "execution_profile": stage_profile_status(stage), "socket_buffers": pool_status},
         "versions": {"python": platform.python_version(), "torch": str(getattr(torch_module, "__version__", "unknown")),
             "cuda": getattr(getattr(torch_module, "version", None), "cuda", None),
             "tilelang": getattr(tilelang_module, "__version__", None)}, "phase": phase}

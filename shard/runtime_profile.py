@@ -66,6 +66,7 @@ class RuntimeProfiler:
         # A job reset is a barrier. Do not retain events/tensors from an old job.
         self._phases, self._seen = {}, {}
         self._pending = deque()
+        self._event_pool = []
         self.dropped = 0
 
     def record(self, name, elapsed_ms):
@@ -104,6 +105,7 @@ class RuntimeProfiler:
                 end.synchronize()
             if wait or end.query():
                 self.record(name, float(start.elapsed_time(end)))
+                self._event_pool.append((start, end))
             else:
                 remaining.append((name, start, end))
         self._pending = remaining
@@ -125,8 +127,11 @@ class RuntimeProfiler:
             return
         with torch_module.cuda.device(device):
             stream = torch_module.cuda.current_stream(device)
-            start = torch_module.cuda.Event(enable_timing=True)
-            end = torch_module.cuda.Event(enable_timing=True)
+            if self._event_pool:
+                start, end = self._event_pool.pop()
+            else:
+                start = torch_module.cuda.Event(enable_timing=True)
+                end = torch_module.cuda.Event(enable_timing=True)
             start.record(stream)
             try:
                 yield
@@ -134,8 +139,15 @@ class RuntimeProfiler:
                 end.record(stream)
                 self._pending.append((name, start, end))
 
-    def snapshot(self):
-        self._drain(wait=True)
+    @contextmanager
+    def interval(self, name, torch_module, device):
+        """Host submission and stream interval, kept separate even when overlapping."""
+        with self.host(name + ".host"):
+            with self.gpu(name + ".gpu", torch_module, device):
+                yield
+
+    def snapshot(self, *, wait=True):
+        self._drain(wait=wait)
         rows = {}
         for name, row in self._phases.items():
             values = sorted(row["values"])

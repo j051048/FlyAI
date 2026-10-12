@@ -231,7 +231,7 @@ def stage_observation(node, layers, fallback_ms, *, now, start=None, workload=No
     return result
 
 
-def simulate_frames(stages, hops, transfer, entry_ms, return_ms, depth, frames):
+def simulate_frames(stages, hops, transfer, entry_ms, return_ms, depth, frames, *, link_shared=None):
     """Deterministic resource calendar, complete feedback and finite window.
 
     Shared busy time is inside a stage's measured service interval, not another
@@ -251,7 +251,10 @@ def simulate_frames(stages, hops, transfer, entry_ms, return_ms, depth, frames):
             end = start + stage["service_ms"]
             available[i] = end
             if i + 1 < len(stages):
-                tx = max(end, links[i])
+                link_domain, link_busy = (link_shared[i] if link_shared else (None, 0))
+                tx = max(end, links[i], shared.get(link_domain, 0) if link_domain is not None else 0)
+                if link_domain is not None:
+                    shared[link_domain] = tx + link_busy
                 links[i] = tx + transfer[i]
                 arrival = links[i] + hops[i]
             else:
@@ -260,7 +263,7 @@ def simulate_frames(stages, hops, transfer, entry_ms, return_ms, depth, frames):
 
 
 def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
-             *, edges=None, now, objective="pipeline", slo=None, coordinator_id=None):
+             *, edges=None, now, objective="pipeline", slo=None, coordinator_id=None, host_groups=None):
     w = workload_spec(workload)
     stages, start = [], 0
     for n in order:
@@ -276,9 +279,10 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
             if trace and trace.get("context_tokens") != context:
                 warnings.append(f"{nodes[n]['id']}: trace context differs/unknown; service extrapolation is unverified")
     payload = number(model.get("wire_bytes_per_token", model.get("decode_bytes", 0)), "decode_bytes") * w["frame_tokens"]
-    hops, transfers, bandwidths = [], [], []
-    for a, b in zip(order, order[1:]):
+    hops, transfers, bandwidths, prefill_hops, link_shared, transport_costs = [], [], [], [], [], []
+    for index, (a, b) in enumerate(zip(order, order[1:])):
         hops.append(L[a][b])
+        prefill_hops.append(L[a][b])
         row = (edges or {}).get((nodes[a]["id"], nodes[b]["id"]), {})
         bw = row.get("bandwidth_mbps") or nodes[a].get("up_mbps")
         if bw is None:
@@ -288,12 +292,33 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
             warnings.append(f"{nodes[a]['id']} -> {nodes[b]['id']}: transfer bandwidth unknown; conservative 0.5Mbps assumption")
         bandwidths.append(bw)
         transfers.append(payload * 8 / (number(bw, "bandwidth_mbps", minimum=1e-9) * 1000))
+        link_shared.append((None, 0))
+        if host_groups is not None and nodes[a].get("host_id") == nodes[b].get("host_id") and nodes[a].get("host_id"):
+            from .host_topology import matching_transport
+            sample = matching_transport(host_groups, nodes[a], nodes[b], row, w, payload,
+                stages[index:index + 2], now=now)
+            cost = dict(src=nodes[a]["id"], dst=nodes[b]["id"], transport=row.get("channel"),
+                source="route_hop_and_bandwidth_estimate")
+            if sample is not None:
+                measured = sum(sample["samples_ms"]) / len(sample["samples_ms"])
+                hops[-1], transfers[-1] = 0.0, measured
+                link_shared[-1] = (sample.get("shared_resource_id"), sample.get("shared_busy_ms", 0))
+                cost.update(source="fresh_bound_engine_frame", service_ms=measured,
+                    measured_at=sample["measured_at"], ttl_s=sample["ttl_s"], source_sha256=sample["source_sha256"],
+                    source_binding="both_fresh_stage_runtime_inventories_including_transport",
+                    observation_age_s=max(0, now - timestamp(sample["measured_at"])))
+                warnings.append("host transport decode sample is not extrapolated to prefill payloads")
+                if sample.get("shared_resource_id") is None:
+                    warnings.append(f"{nodes[a]['id']} -> {nodes[b]['id']}: host transport shared-resource busy time unmeasured")
+            else:
+                warnings.append(f"{nodes[a]['id']} -> {nodes[b]['id']}: no fresh exact backend/route/frame/source transport observation with separate compute scope")
+            transport_costs.append(cost)
     entry, back = c_out[order[0]], c_in[order[-1]]
     serial = sum(s["service_ms"] for s in stages) + sum(hops) + sum(transfers) + entry + back
     prefill_values = [s["prefill_ms"] for s in stages]
     if any(value is None for value in prefill_values):
         warnings.append("prefill compute has no complete stage trace")
-    prefill = sum(value or 0 for value in prefill_values) + sum(hops) + entry + back
+    prefill = sum(value or 0 for value in prefill_values) + sum(prefill_hops) + entry + back
     pfbytes = number(model.get("prefill_bytes", 0), "prefill_bytes")
     if slo is not None and model.get("wire_bytes_per_token") is not None and w["context_tokens"] is not None:
         pfbytes=number(model["wire_bytes_per_token"],"wire_bytes_per_token")*_integer(w["context_tokens"],"context_tokens")
@@ -319,7 +344,7 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
             replay = math.ceil(valid_frames * w["cancel_rate"] * w["replay_frames_per_cancel"])
             frames = max(1, valid_frames + stale + replay)
             sampled = min(frames, max(64, w["depth"] * 4))
-            replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], sampled)
+            replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], sampled, link_shared=link_shared)
             elapsed = replies[-1]
             if frames > sampled:
                 period = min(w["depth"], sampled - 1)
@@ -331,7 +356,7 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
             elapsed = (elapsed if decode_needed else 0) + prefill
             warnings.append("chunk forecast prices full stale/replay frame work; early-abort savings not assumed")
         else:
-            elapsed, first, token_warnings = _token_pipeline(stages, hops, transfers, entry, back, w, decode_needed, serial, prefill)
+            elapsed, first, token_warnings = _token_pipeline(stages, hops, transfers, entry, back, w, decode_needed, serial, prefill, link_shared=link_shared)
             warnings.extend(token_warnings)
     else:
         raise ValueError("objective must be serial or pipeline")
@@ -343,6 +368,9 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
     for stage in stages:
         if stage["shared_id"]:
             domains[stage["shared_id"]] = domains.get(stage["shared_id"], 0) + stage["shared_ms"]
+    for domain, busy in link_shared:
+        if domain:
+            domains[domain] = domains.get(domain, 0) + busy
     constraints += [{"kind": "shared_resource", "resource_id": domain, "service_ms": busy} for domain, busy in domains.items()]
     constraints.append({"kind": "feedback_window", "service_ms": serial / w["depth"]})
     same_host = [nodes[n].get("host_id") for n in order]
@@ -355,6 +383,8 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
             "bottleneck": max(constraints, key=lambda row: row["service_ms"]),
             "stages": stages, "uncertainty": sorted(set(warnings)),
             "scope": "resource-calendar prediction; hardware acceptance requires a live verified run"}
+    if host_groups is not None:
+        result["host_transport_costs"] = transport_costs
     if slo is not None:
         result["slo"] = assess_slo(result, order, alloc, layer_ms, L, c_out, c_in, nodes, {**model,"prefill_bytes":pfbytes}, workload,
             edges=edges or {}, now=now, objective=objective, policy=slo_spec(slo), coordinator_id=coordinator_id)
@@ -443,6 +473,13 @@ def assess_slo(point, order, alloc, layer_ms, L, c_out, c_in, nodes, model, work
         prefix=sum(stress_L[a][b] for a,b in zip(order,order[1:]))+stress_out[order[0]]+stress_in[order[-1]]
         if w["generated_tokens"]>1:
             metrics["tpot_ms"]=(stress["predicted_request_ms"]-prefix)/(w["generated_tokens"]-1)
+    measured_host_transport = any(row.get("source") == "fresh_bound_engine_frame"
+                                  for row in point.get("host_transport_costs", []))
+    if measured_host_transport:
+        # The old route-p95 scenario excludes the measured engine-copy scope
+        # and its shared-resource calendar. A mean improvement cannot silently
+        # become a known TPOT tail bound under a different transport model.
+        metrics["tpot_ms"] = None
     mean_known = exact_stages and decode_bw_known and prefill_bw_known and prefill_geometry_known and all(row.get("source")=="fresh_sparse" for row in routes) and all(row["prefill_ms"] is not None for row in observed)
     if prices["hourly_cost"] is not None and mean_known:
         metrics["request_cost"]=prices["hourly_cost"]*point["predicted_request_ms"]/3_600_000
@@ -468,10 +505,11 @@ def assess_slo(point, order, alloc, layer_ms, L, c_out, c_in, nodes, model, work
         "component_stress_request_ms":metrics["ttft_ms"]+metrics["tpot_ms"]*(w["generated_tokens"]-1) if metrics["ttft_ms"] is not None and metrics["tpot_ms"] is not None else None,
         "scope":"component-p95 stress scenario, not end-to-end p95 or an SLO guarantee; loss/jitter do not invent retransmit time",
         "uncertainty":sorted(set(risk["uncertainty"]+prices["uncertainty"]+point["uncertainty"]+
+            (["host engine transport tail contention has no calibrated stress scenario"] if measured_host_transport else [])+
             (["shared-resource tail busy unknown; full-stage serialized stress assumption"] if any(row["shared_id"] is not None for row in observed) else [])))}
 
 
-def _token_pipeline(stages, hops, transfers, entry, back, w, decode_needed, serial, prefill):
+def _token_pipeline(stages, hops, transfers, entry, back, w, decode_needed, serial, prefill, *, link_shared=None):
     warnings = []
     rounds = math.ceil(decode_needed / w["acceptance_gain"])
     # Full acceptance can continue without a cancellation drain. Otherwise
@@ -479,7 +517,7 @@ def _token_pipeline(stages, hops, transfers, entry, back, w, decode_needed, seri
     if w["acceptance_gain"] == w["block_tokens"] and not w["cancel_rate"]:
         total = max(1, math.ceil(decode_needed / w["frame_tokens"]))
         sample = min(total, max(64, w["depth"] * 4))
-        replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], sample)
+        replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], sample, link_shared=link_shared)
         elapsed = replies[-1]
         if total > sample:
             period = min(w["depth"], sample - 1)
@@ -487,7 +525,7 @@ def _token_pipeline(stages, hops, transfers, entry, back, w, decode_needed, seri
             elapsed += (total - sample) * cycle
             warnings.append("steady-state tail extrapolated from bounded resource-calendar simulation")
     else:
-        replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], w["block_tokens"])
+        replies = simulate_frames(stages, hops, transfers, entry, back, w["depth"], w["block_tokens"], link_shared=link_shared)
         cancel = 1.0 if w["cancel_rate"] is None else w["cancel_rate"]
         replay = cancel * w["replay_frames_per_cancel"] * serial
         elapsed = rounds * (replies[-1] + replay + w["refill_ms"])

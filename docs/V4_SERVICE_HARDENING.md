@@ -5,7 +5,9 @@
 [状态优化](V4_STATEFUL_OPTIMIZATIONS.md)。这里只说明已接入的服务合同，不登记新的 GPU
 速度或可靠性成绩。默认服务仍为单环串行、多环并行；新增规划、日志和调度策略由本机配置启用。
 
-本轮选定 CPU/socket/HTTP 组合回归为 1813 passed / 8 skipped / 66 GPU deselected。
+上一轮服务加固的选定 CPU/socket/HTTP 组合回归为 1813 passed / 8 skipped / 66 GPU deselected。
+当前 P0–P2 的111文件相关组合为1903 passed / 11 skipped / 69 GPU deselected；最终
+复算入口及独立 CLI/runtime 导入顺序另做专项复核，结果不累加，见 [执行改造](V4_PERFORMANCE_EXECUTION.md)。
 用户提供的 CI 两项失败也已修复：选择性拉取测试改用真实 catalogue 与完整 payload hash，
 不恢复无哈希的 legacy 通过路径；进程清理使用 Popen 唯一回收直接子进程，保留 SIGKILL
 退出状态并继续等待真实后代。补充部署/资源回归为 218 passed / 1 POSIX skip；对应进程
@@ -167,9 +169,11 @@ SQLite 使用 FULL 同步、WAL、每 token 提交及有界结果预留；这会
 per-job 取消及步长上限，并由签名暖机绑定合同摘要。最终结果仍逐作业验证新收据与提交
 前缀；超步长、状态清理未确认或合同漂移会令环失败。
 
-**当前生产 V4/GPT-OSS 后端没有原生 qualified token-batch 合同，必须拒绝启用
-`batching.enabled=true`。** CPU 独立 lane producer 的测试覆盖框架行为，不说明原生
-DeepSeek 数学已支持 continuous batching，也不构成 GPU 吞吐验收。
+旧 V4/GPT-OSS 模式没有原生 qualified token-batch 合同，必须拒绝启用
+`batching.enabled=true`。新增独立 `v4-native-tokenwise-greedy/1` cohort 可显式接入
+2–4 请求标量时间片后端，包含真实 Stage 数学、HTTP、strict wire 和各自签名收据。
+它不是多请求 GEMM，GPU 数值/吞吐资格仍待验。配置与增长前缀/持久化边界见
+[执行改造](V4_PERFORMANCE_EXECUTION.md)；早期 CPU producer 测试本身仍不构成 GPU 证据。
 
 ## 5. 回放质量与缓存命中证明
 
@@ -266,6 +270,10 @@ python phase0/v4_release.py verify --contract release-contract.json \
 JUnit、稳定源码及所需 FP4/状态/图/continuation 用例；CPU 或跳过的 CUDA 用例返回
 unverified，不能以测试 exit 0 凑通过。发布检查还比较 gate 与实际冻结节点的 GPU 类型、
 驱动和依赖环境。
+
+2026-10-11 多卡改造增加 whole 数值/回滚、island 实际捕获、原生量化 kernel 及 pinned
+接收缓冲 CUDA 用例；GPU gate 在 owned 进程树监督下运行，超时不遗留自己的编译子进程。
+命名配方与本地测试范围见 [V4_MULTIGPU_EXECUTION](V4_MULTIGPU_EXECUTION.md)。
 
 固定目标仍为 **4×5090 ≥40、6×5090 ≥30 committed decode tok/s**，加独立持续运行
 门槛；所有检查 passed 才接受。结果始终 `hardware_attested=false`：这是运营者实机证据，

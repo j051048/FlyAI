@@ -101,11 +101,14 @@ WHAT IS A SEAM HERE AND NOT YET A FEATURE
 
   self-test:  python3 phase0/v4_stage.py --layers 0 4
 """
-import argparse, copy, glob, json, os, sys, threading, torch
+import argparse, copy, glob, json, os, sys, threading
 from collections import deque
 from contextlib import nullcontext
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from v4_execution_profiles import apply_profile
+apply_profile()  # Resolve explicit recipes before Torch/model modules read environment constants.
+import torch
 from safetensors import safe_open
 
 # The lever registry. Imported at module scope ON PURPOSE, and deliberately not guarded: a stage that
@@ -999,9 +1002,11 @@ class Stage:
         # eager and says why -- never a silent half-capture.
         self._block_graphs = None
         self._graph_mode = _graph_mode()
+        self._graph_refusal_reason = None
         if self._graph_mode != "off":
             why = self._graph_refusal()
             if why:
+                self._graph_refusal_reason = why
                 print(f"[v4] GRAPH REFUSED for stage[{lo}:{hi}): {why} — staying eager", flush=True)
             elif self._graph_mode == "whole":
                 import v4_whole_layer_graph as _wl
@@ -1013,6 +1018,11 @@ class Stage:
                 self._block_graphs = [_wl.WholeBlockGraphs(L, self, moe_mode=mm) for L in self.layers]
             else:
                 self._block_graphs = [_BlockGraphs(L, self) for L in self.layers]
+        import v4_fp8_gemv
+        # Only actual captured FP8 call sites enter graph timing scope.
+        v4_fp8_gemv.configure_tuning_execution("eager")
+        from v4_native_lanes import configured_runner
+        self._native_lanes = configured_runner(self)
 
     def _graph_refusal(self):
         """Why this stage cannot graph its decode step, or None. Loud and specific, never silent.
@@ -1550,11 +1560,15 @@ class Stage:
         graph when the stage is armed -- island mode replays the hc_pre/hc_post/norm islands (attn/ffn
         eager between), whole mode replays the whole layer incl. the capture-safe attention core (real
         routed MoE eager between two graphs, or INSIDE the one graph under V4_MOE_IN_GRAPH on a layer
-        that proved it can be). Prefill, a multi-token chunk, and a rollback replay
-        (`_replaying`) all stay on the eager per-layer call -- the graph is a fixed b=1,s=1 shape and
-        the reference's own decode branch is the thing it is proven against."""
+        that proved it can be). Prefill and a multi-token fast chunk stay on the reference call.
+        Whole-mode rollback uses the capture-safe eager twin: using the reference Block would
+        switch the indexer's selection/order contract (especially with REF_SLIM). Replay never
+        captures or overwrites a graph's static inputs."""
         bg = self._block_graphs
-        graphed = bg is not None and not self._replaying and start_pos > 0 and h.shape[1] == 1
+        decode_graph = bg is not None and start_pos > 0 and h.shape[1] == 1
+        twin = decode_graph and self._graph_mode == "whole" and (
+            self._replaying or getattr(self, "_numeric_eager_twin", False))
+        graphed = decode_graph and not self._replaying and not twin
         for i, (li, L) in enumerate(zip(range(self.lo, self.hi), self.layers)):
             hybrid = getattr(L.ffn, "_hybrid_runtime", None)
             phase = "replay" if self._replaying else "prefill" if start_pos == 0 else "decode"
@@ -1568,7 +1582,14 @@ class Stage:
                 with (profiler.gpu(name + ".gpu", torch, self.device) if profiler else nullcontext()):
                     with (self._kv_runtime.layer(L.attn, start_pos, h.shape[1], h.shape[0])
                           if self._kv_runtime is not None else nullcontext()):
-                        h = bg[i].run(h, ids, start_pos) if graphed else L(h, start_pos, ids)
+                        if twin:
+                            h = bg[i].replay_eager(h, ids, start_pos)
+                        else:
+                            h = bg[i].run(h, ids, start_pos) if graphed else L(h, start_pos, ids)
+            observer = getattr(self, "_numeric_layer_observer", None)
+            if observer is not None:
+                observer(li, start_pos, h, "whole_eager_twin" if twin else
+                         "graph_or_fallback" if graphed else "reference")
             if self._runtime_metrics is not None and hybrid is None:
                 # Outside the graph: count this executed layer once, not its capture/warmups.
                 # world_size=1 is enforced at construction, so each row owns the full top-k.
@@ -1837,6 +1858,41 @@ class Stage:
 
 # ── partial CUDA graphs over a decode step ─────────────────────────────────────────────────────────
 
+def island_coverage_summary(stage):
+    """Retained per-layer island graphs, not an enabled flag or a speed certificate.
+
+    An armed runner has no captured graphs until its first decode. Failed partial
+    construction contributes to the process counter, but never retained coverage.
+    `replayed_steps` counts only complete three-island decode calls on this runner.
+    Attention and MoE remain eager; this does not certify long-context performance.
+    """
+    runners = getattr(stage, "_block_graphs", None) or []
+    rows = []
+    for index, layer in enumerate(stage.layers):
+        runner = runners[index] if index < len(runners) else None
+        valid = isinstance(runner, _BlockGraphs) and runner.L is layer
+        graphs = runner.g if valid and isinstance(runner.g, (tuple, list)) else ()
+        captured = sum(isinstance(graph, _Graphlet) and getattr(graph, "graph", None) is not None
+                       for graph in graphs)
+        complete = len(graphs) == captured == 3
+        eager = not valid or bool(runner.eager)
+        reason = (getattr(runner, "fallback_reason", None) if valid else
+                  getattr(stage, "_graph_refusal_reason", None) or "island_runner_unavailable")
+        rows.append({"layer": stage.lo + index, "captured_graphs": captured,
+                     "required_graphs": 3, "eager": eager,
+                     "undecided": not eager and not complete, "refused": eager,
+                     "fallback_reason": reason,
+                     "replayed_steps": getattr(runner, "replayed_steps", 0) if valid else 0})
+    return {"schema": "flyai-v4-island-coverage/1", "scope": "retained_stage_island_graphs",
+            "layers": rows, "captured_graphs": sum(row["captured_graphs"] for row in rows),
+            "captured_layers": sum(row["captured_graphs"] == 3 and not row["eager"] and
+                                   not row["undecided"] for row in rows),
+            "undecided_layers": sum(row["undecided"] for row in rows),
+            "refused_layers": sum(row["refused"] for row in rows),
+            "process_budget": V4_GRAPH_MAX, "process_captured_total": _GRAPH_COUNT,
+            "process_skipped_total": _GRAPH_SKIPPED, "all_contexts_warmed": False}
+
+
 class _Graphlet:
     """Capture + replay ONE pure, fixed-shape function of tensors -- a hyper-connection or a norm.
 
@@ -1899,6 +1955,8 @@ class _BlockGraphs:
         self.st = stage
         self.g = None
         self.eager = False
+        self.fallback_reason = None
+        self.replayed_steps = 0
 
     def _g1_fn(self, h):
         y, post, comb = self.L.hc_pre(h, self.L.hc_attn_fn, self.L.hc_attn_scale, self.L.hc_attn_base)
@@ -1934,6 +1992,7 @@ class _BlockGraphs:
             return self.L(h, start_pos, ids)
         if self.g is None:
             if _GRAPH_COUNT + 3 > V4_GRAPH_MAX:
+                self.fallback_reason = "graph_budget_exhausted"
                 self.eager, _GRAPH_SKIPPED = True, _GRAPH_SKIPPED + 3
                 print(f"[v4] graph budget V4_GRAPH_MAX={V4_GRAPH_MAX} spent — layer "
                       f"{self.L.layer_id} stays eager", flush=True)
@@ -1941,6 +2000,7 @@ class _BlockGraphs:
             try:
                 self._build()
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                self.fallback_reason = f"capture_failed:{type(e).__name__}"
                 torch.cuda.synchronize()
                 self.eager, self.g, _GRAPH_SKIPPED = True, None, _GRAPH_SKIPPED + 3
                 print(f"[v4] graph capture failed for layer {self.L.layer_id}: "
@@ -1951,7 +2011,9 @@ class _BlockGraphs:
         attn_out = self.L.attn(attn_in, start_pos)
         ffn_in, x2, post_f, comb_f = g2.run(attn_out, h, post_a, comb_a)
         ffn_out = self.L.ffn(ffn_in, ids)
-        return g3.run(ffn_out, x2, post_f, comb_f)
+        output = g3.run(ffn_out, x2, post_f, comb_f)
+        self.replayed_steps += 1
+        return output
 
 
 def _selftest(lo, hi, d):

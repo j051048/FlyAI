@@ -19,6 +19,7 @@ import json
 import os
 import socket
 import struct
+import threading
 
 import numpy as np
 import torch
@@ -56,6 +57,30 @@ _DSIZE = {d: torch.empty(0, dtype=d).element_size() for d in set(_DTYPES.values(
 # (bytes); default 256 MiB >> the largest legit activation chunk (bf16/fp8 prefill), tiny vs a DoS.
 MAX_FRAME = int(os.environ.get("M25_MAX_FRAME") or 256 * 1024 * 1024)
 
+_RECEIVE_POOL = None
+_POOL_LOCK = threading.Lock()
+
+
+def configure_receive_pool(budget_bytes=0, *, slots=2, pinned=False):
+    """Explicit process-wide opt-in, before receiving job frames; no protocol change."""
+    global _RECEIVE_POOL
+    try:
+        from .receive_buffers import ReceiveBufferPool
+    except ImportError:
+        from receive_buffers import ReceiveBufferPool
+    if type(budget_bytes) is not int or budget_bytes < 0 or type(pinned) is not bool:
+        raise ValueError("explicit receive buffer budget/pinning required")
+    with _POOL_LOCK:
+        if _RECEIVE_POOL is not None and _RECEIVE_POOL.snapshot()["live_slots"]:
+            raise RuntimeError("cannot replace a receive pool while tensor views are live")
+        _RECEIVE_POOL = ReceiveBufferPool(budget_bytes, slots=slots, pinned=pinned) if budget_bytes else None
+    return receive_pool_status()
+
+
+def receive_pool_status():
+    pool = _RECEIVE_POOL
+    return pool.snapshot() if pool is not None else {"enabled": False, "scope": "process lifetime"}
+
 
 def _pack_parts(obj) -> list:
     """encode one message as a list of wire segments (bytes-likes) whose concatenation IS the
@@ -78,6 +103,7 @@ def _pack_parts(obj) -> list:
         raise TypeError(f"transport cannot encode {type(o).__name__}")
 
     head = json.dumps(encode(obj)).encode()
+    encode = None  # break recursive closure ownership; do not retain tensor blobs until cyclic GC
     parts = [struct.pack("!I", len(head)) + head]
     for b in blobs:
         parts.append(struct.pack("!Q", len(b)))
@@ -89,13 +115,21 @@ def _pack(obj) -> bytes:
     return b"".join(_pack_parts(obj))
 
 
-def _unpack(buf):
+def _unpack(buf, *, copy_tensors=True):
     mv = memoryview(buf)                    # zero-copy blob slices (a bytes slice copies)
+    if len(mv) < 4:
+        raise ValueError("truncated frame header")
     (hlen,) = struct.unpack_from("!I", mv, 0)
+    if hlen > len(mv) - 4:
+        raise ValueError("header length exceeds frame")
     head = json.loads(bytes(mv[4:4 + hlen]))
     blobs, off = [], 4 + hlen
     while off < len(mv):
+        if len(mv) - off < 8:
+            raise ValueError("truncated blob length")
         (blen,) = struct.unpack_from("!Q", mv, off); off += 8
+        if blen > len(mv) - off:
+            raise ValueError("blob length exceeds frame")
         blobs.append(mv[off:off + blen]); off += blen
 
     def decode(node):
@@ -104,25 +138,34 @@ def _unpack(buf):
                 dt = _DTYPES.get(node["dtype"])
                 if dt is None:
                     raise ValueError(f"unknown tensor dtype {node['dtype']!r}")
-                shape, blob = node["shape"], blobs[node["__t__"]]
+                index = node["__t__"]
+                if type(index) is not int or not 0 <= index < len(blobs):
+                    raise ValueError("invalid tensor blob index")
+                shape, blob = node["shape"], blobs[index]
+                if not isinstance(shape, list) or len(shape) > 32:
+                    raise ValueError("invalid tensor shape")
                 numel = 1
                 for d in shape:
-                    if not isinstance(d, int) or d < 0:
+                    if type(d) is not int or d < 0:
                         raise ValueError(f"bad tensor dim {d!r}")
                     numel *= d
                 if numel * _DSIZE[dt] != len(blob):    # declared shape must match the blob EXACTLY — a lying
                     raise ValueError(                  # shape (esp. an empty blob + huge shape) must never
                         f"tensor {shape} needs {numel * _DSIZE[dt]} bytes, blob has {len(blob)}")  # drive torch.empty
                 if numel == 0:
-                    return torch.empty(shape, dtype=dt)
-                raw = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy())
+                    return torch.empty(shape, dtype=dt, device="cpu")
+                array = np.frombuffer(blob, dtype=np.uint8)
+                raw = torch.from_numpy(array.copy() if copy_tensors else array)
                 return raw.view(dt).reshape(shape)
             return {k: decode(v) for k, v in node.items()}
         if isinstance(node, list):
             return [decode(v) for v in node]
         return node
 
-    return decode(head)
+    try:
+        return decode(head)
+    finally:
+        decode = None  # returned tensor storages, not the codec closure, own borrowed frame leases
 
 
 _IOV_CAP = 512      # segments per sendmsg() call, safely under the kernel's UIO_MAXIOV (1024)
@@ -162,9 +205,21 @@ def recv_msg(sock: socket.socket):
     (n,) = struct.unpack("!Q", _read_exact(sock, 8))
     if n > MAX_FRAME:                                   # refuse an oversized length BEFORE allocating the body
         raise ConnectionError(f"frame length {n} exceeds MAX_FRAME ({MAX_FRAME})")
-    frame = _read_exact(sock, n)
+    with _POOL_LOCK:
+        pool = _RECEIVE_POOL
+        frame = pool.borrow(n) if pool is not None else None
+    borrowed = frame is not None
+    if borrowed:
+        view, got = memoryview(frame), 0
+        while got < n:
+            read = sock.recv_into(view[got:], n - got)
+            if not read:
+                raise ConnectionError(f"peer closed while reading buffered frame ({got}/{n} bytes)")
+            got += read
+    else:
+        frame = _read_exact(sock, n)
     try:
-        return _unpack(frame)
+        return _unpack(frame, copy_tensors=not borrowed)
     except (ValueError, KeyError, IndexError, TypeError, RuntimeError, struct.error, json.JSONDecodeError) as e:
         raise ConnectionError(f"malformed frame ({type(e).__name__}: {str(e)[:80]})") from e
 

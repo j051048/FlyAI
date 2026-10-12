@@ -438,6 +438,8 @@ def runtime_config_payload(stage):
     body["hadamard"] = hadamard_identity()
     from v4_conversation_protocol import cache_config
     body["conversation_cache"] = cache_config(stage)
+    lanes = getattr(stage, "_native_lanes", None)
+    body["native_lanes"] = lanes.config() if lanes is not None else {"enabled": False}
     body["prefill_expert_pipeline"] = (stage.prefill_pipeline_config() if hasattr(stage, "prefill_pipeline_config")
                                         else {"enabled": False})
     body["spec_depth"] = int(getattr(stage, "_spec_depth", 16))
@@ -497,11 +499,17 @@ def placement_requirements_for_stage(stage, calibration=None, checkpoint_dir=Non
         if cache_config(stage)["enabled"]:
             raise ResourceError("enabled conversation caching needs measured snapshot reservation evidence")
         cache = {"remaining_host_reserved_bytes": 0, "restore_gpu_reserved_bytes": 0}
-    if requirements.host.peak_bytes < report["module_storage"]["host_bytes"] + cache["remaining_host_reserved_bytes"]:
+    native = report.get("native_lane_reservation")
+    if native is None and getattr(stage, "_native_lanes", None) is not None:
+        raise ResourceError("enabled native lanes need measured host snapshot/workspace reservation evidence")
+    native_remaining = (native or {}).get("remaining_host_reserved_bytes", 0)
+    from v4_execution_profiles import transport_buffer_reservation
+    buffers = transport_buffer_reservation()
+    if requirements.host.peak_bytes < report["module_storage"]["host_bytes"] + cache["remaining_host_reserved_bytes"] + native_remaining + buffers["host_reserved_bytes"]:
         raise ResourceError("calibration budget is below actual host tensor storage")
     if requirements.gpu.peak_bytes < observed + cache["restore_gpu_reserved_bytes"]:
         raise ResourceError("calibration GPU budget omits the declared conversation restore reserve")
-    if requirements.host.pinned_bytes < report["module_storage"]["host_pinned_bytes"]:
+    if requirements.host.pinned_bytes < report["module_storage"]["host_pinned_bytes"] + buffers["pinned_reserved_bytes"]:
         raise ResourceError("calibration budget is below actual pinned host tensor storage")
     return requirements
 
@@ -590,11 +598,19 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
         for key, value in vars(tail).items():
             walk_state(f"draft.{key}", value)
     conversation = getattr(stage, "_conversation_cache", None)
+    lanes = getattr(stage, "_native_lanes", None)
+    if lanes is not None:
+        for name, tensor in lanes.tensors():
+            record(f"native_lanes.{name}", tensor, "native_lane_state")
     if conversation is not None:
         for name, tensor in conversation.snapshot_tensors():
             record(f"conversation_cache.{name}", tensor, "conversation_cache")
     gpu_bytes = sum(entry["storage_bytes"] for entry in entries if entry["device"].startswith("cuda"))
     host_bytes = sum(entry["storage_bytes"] for entry in entries if entry["device"] == "cpu")
+    # Tensor inventory already includes the preallocated slots. Account for the
+    # bounded Python/identity state as a separate host reservation as well.
+    lane_metadata_reserve = (lanes.metadata_bytes * lanes.max_jobs + lanes.restore_workspace_bytes
+                             if lanes is not None else 0)
     from v4_conversation_protocol import cache_config
     declared_cache = cache_config(stage)
     cached_host = sum(entry["storage_bytes"] for entry in entries
@@ -604,6 +620,8 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
         "restore_gpu_reserved_bytes": declared_cache["restore_gpu_reserved_bytes"]}
     conversation_reserve["hash_workspace"] = (conversation.hash_workspace_reservation()
         if conversation is not None and hasattr(conversation, "hash_workspace_reservation") else None)
+    from v4_execution_profiles import transport_buffer_reservation
+    socket_reservation = transport_buffer_reservation()
     totals = {}
     for entry in entries:
         key = ("gpu_" if entry["device"].startswith("cuda") else "host_") + entry["kind"] + "_bytes"
@@ -637,6 +655,9 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
                                "host_pinned_bytes": sum(entry["storage_bytes"] for entry in entries if entry["pinned"]),
                                "by_kind": totals, "storages": entries},
             "conversation_cache_reservation": conversation_reserve,
+            "transport_buffer_reservation": socket_reservation,
+            "native_lane_reservation": {"host_reserved_bytes": lanes.reserved_bytes if lanes else 0,
+                                        "remaining_host_reserved_bytes": lane_metadata_reserve},
             "prefill_expert_pipeline": stage.prefill_pipeline_status() if hasattr(stage, "prefill_pipeline_status") else None,
             "allocator": allocator,
             "unattributed_components": {"graph_bytes": None, "workspace_bytes": None,

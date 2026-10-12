@@ -125,7 +125,8 @@ def validate_runtime_observation(value):
     # Reject non-JSON content and detach all caller-owned dictionaries before signing.
     if "optimizations" in value:
         optimizations = value["optimizations"]
-        if not isinstance(optimizations, dict) or set(optimizations) != {"prefill_expert_pipeline", "conversation_cache"}:
+        if (not isinstance(optimizations, dict) or not {"prefill_expert_pipeline", "conversation_cache"} <= set(optimizations)
+                or set(optimizations) - {"prefill_expert_pipeline", "conversation_cache", "execution_profile", "socket_buffers"}):
             raise ValueError("unknown runtime optimization observations")
         if any(not isinstance(item, dict) for item in optimizations.values()) or len(json.dumps(optimizations, allow_nan=False)) > 65536:
             raise ValueError("bounded JSON runtime optimization observations required")

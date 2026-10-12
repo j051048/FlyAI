@@ -204,7 +204,8 @@ class V4Deployment(RingDeployment):
         # Freeze common defaults and overlay explicit choices before any import
         # in every spawned stage/coordinator. No Torch import on the controller.
         from phase0.v4_benchmark import DEFAULT_ENV
-        self.common_environment = {**DEFAULT_ENV, **self.config.get("environment", {})}
+        from engines.deepseek_v4.v4_execution_profiles import expanded_environment
+        self.common_environment = {**DEFAULT_ENV, **expanded_environment(self.config.get("environment", {}))}
         if any(not isinstance(k, str) or not isinstance(v, str) for k,v in self.common_environment.items()):
             raise ValueError("common environment must be a string mapping")
         for node in self.nodes.values():
@@ -222,7 +223,9 @@ class V4Deployment(RingDeployment):
             raise ValueError("positive common context ceiling required")
 
     def environment(self, node, *, coordinator=False):
-        env = {**self.common_environment, **node.get("environment", {}),
+        from engines.deepseek_v4.v4_execution_profiles import expanded_environment
+        explicit = {**self.config.get("environment", {}), **node.get("environment", {})}
+        env = {**self.common_environment, **expanded_environment(explicit),
                "V4_MAX_SEQ": str(self.max_context), "SHARD_RECEIPTS": "1"}
         env["SHARD_NODE_KEY"] = node["node_key"]
         if coordinator:
@@ -405,6 +408,11 @@ class V4Deployment(RingDeployment):
         verify_coverage(receipts, 43, expected_by_signer=expected, expected_nonce=nonce, check_chain=True)
         if any(r.get("job_id") != job_id or r.get("swarm_id") != self.plan["ring_id"] for r in receipts):
             raise ValueError("warmup receipt belongs to another job or ring")
+        from engines.deepseek_v4.v4_execution_profiles import require_profile_warmup
+        expected_profiles = {stage["node_id"]: self.environment(self.nodes[stage["node_id"]]).get("V4_EXECUTION_PROFILE")
+                             for stage in self.plan["stages"]}
+        if any(expected_profiles.values()):
+            require_profile_warmup(receipts, expected_profiles)
         self.failure_diagnostics = None
         return {"verified": True, "nonce": nonce, "job_id": job_id, "tokens_generated": final["tokensGenerated"],
                 "receipts": receipts, "scope": "strict handshake and complete signed warmup; not numerical/performance acceptance"}

@@ -172,6 +172,10 @@ exact repeat 只跳过同一匹配前缀的预填充，恢复缓存的首 token 
 能力声明。私有作业重放、token batching 后端门槛和组合发布见
 [V4_SERVICE_HARDENING](V4_SERVICE_HARDENING.md)。
 
+新增独立 `v4-native-tokenwise-greedy/1` 模式提供实际 HTTP/strict wire 的多请求时间片
+与同轨迹增长前缀；它不改变本节旧 full-prefill 的 shadow 合同。配置、数值和 GPU
+验收范围见 [V4_PERFORMANCE_EXECUTION](V4_PERFORMANCE_EXECUTION.md)。
+
 ## 4. 有界专家 DMA 预填充流水
 
 以下环境只用于 `V4_EXPERT_PLACEMENT=ram`，在导入前设置：

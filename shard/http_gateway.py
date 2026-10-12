@@ -292,6 +292,7 @@ class Handler(BaseHTTPRequestHandler):
                              "finish_reason": result["finish_reason"]}],
                 "usage": self._usage(job), "shard": {"proof_verified": result["proof"]["verified"],
                     "proof_scope": result["proof"]["scope"], "recovery": result["recovery"],
+                    **({"numerical_contract": result["numerical_contract"]} if "numerical_contract" in result else {}),
                     **({"route": result["route"]} if "route" in result else {})}})
         except (OSError, ValueError, JournalError):
             self.close_connection = True
@@ -383,6 +384,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._chunk(job, {}, result["finish_reason"], len(tokens), usage=self._usage(job),
                         shard={"proof_verified": True, "proof_scope": result["proof"]["scope"],
                                "recovery": result["recovery"],
+                               **({"numerical_contract": result["numerical_contract"]} if "numerical_contract" in result else {}),
                                **({"route": result["route"]} if "route" in result else {})})
                 else:
                     self._sse({"error": {"code": error_code, "message": error}}, len(tokens), job)

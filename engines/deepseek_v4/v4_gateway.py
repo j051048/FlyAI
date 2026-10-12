@@ -58,7 +58,8 @@ class V4RingBackend:
     service_name = "v4-serial-gateway"
     def __init__(self, directory, head, tail, assignments, *, mode="pipelined", max_retries=1,
                  timeout=60.0, max_context=8192, swarm_id="v4-service", vp=None, tokenizer=None, pipeline_plan=None, coordinator_key=None,
-                 speculation_policy=None, conversation_cache=None, calibrated_runtime_configs=None, lease_fences=None):
+                 speculation_policy=None, conversation_cache=None, calibrated_runtime_configs=None, lease_fences=None,
+                 round_speculation=None, native_lanes=None, round_calibration_file=None):
         if mode not in ("greedy", "dspark", "pipelined"):
             raise ValueError("invalid V4 service mode")
         if type(max_retries) is not int or not 0 <= max_retries <= 3:
@@ -81,7 +82,9 @@ class V4RingBackend:
             self.artifact_verification = vp.verify_cohort_directory(directory, pipeline_plan["model_cohort"])
         self.model_id = (pipeline_plan["model_cohort"]["model_id"] if pipeline_plan is not None and pipeline_plan.get("model_cohort")
                          else vp.V4_MODEL_ID)
-        self.layers = int(json.loads((Path(directory) / "config.json").read_text(encoding="utf-8-sig"))['n_layers']) if tokenizer is None else vp.N_LAYERS
+        self.layers = (pipeline_plan["n_layers"] if pipeline_plan is not None else
+            int(json.loads((Path(directory) / "config.json").read_text(encoding="utf-8-sig"))['n_layers'])
+            if tokenizer is None else vp.N_LAYERS)
         self.assignments = {str(key): tuple(span) for key, span in assignments.items()}
         self._check_assignments()
         methods = (vp.coordinate, vp.coordinate_dspark, vp.coordinate_dspark_pipelined)
@@ -109,6 +112,20 @@ class V4RingBackend:
         self._conversation_owner = None
         self._last_policy_record = None
         self._last_conversation_record = None
+        self._round_config = self._round_options = None
+        self._round_slot = None
+        self._round_request_policy_enabled = bool(isinstance(speculation_policy, dict) and speculation_policy.get("enabled", False))
+        if round_speculation is not None:
+            self.install_round_calibration(round_speculation)
+        if round_calibration_file is not None:
+            if self.mode != "pipelined" or not pipeline_plan or not pipeline_plan.get("model_cohort"):
+                raise ValueError("round calibration reload requires a strict pipelined model cohort")
+            from v4_adaptive_round import service_options
+            from v4_round_evidence import CalibrationSlot, publish_binding
+            self._round_slot = CalibrationSlot(round_calibration_file)
+            publish_binding(round_calibration_file, service_options(pipeline_plan, self._runtime_configs, self._lease_fences,
+                depth=getattr(vp, "V4_SPEC_DEPTH", 16), floor=getattr(vp, "V4_REFILL_FLOOR", 1),
+                lazy=getattr(vp, "V4_LAZY_DRAFT", False)))
         for name, value in (("speculation_policy", speculation_policy), ("conversation_cache", conversation_cache)):
             if value is not None and (not isinstance(value, dict) or type(value.get("enabled", False)) is not bool):
                 raise ValueError(f"{name} requires an explicit boolean enabled flag")
@@ -162,9 +179,40 @@ class V4RingBackend:
                 "template_sha256": hashlib.sha256(encoder.read_bytes()).hexdigest(),
                 "ring_id": pipeline_plan["ring_id"],
                 "lease_fences": [[node, spec["fencing_token"]] for node, spec in sorted(self._lease_fences.items())]}
+        from v4_native_lane_backend import install as install_native_lanes
+        self._native_runner = install_native_lanes(self, native_lanes)
         if pipeline_plan is not None:
             self._idle_thread = threading.Thread(target=self._idle_keepalive, daemon=True, name="v4-session-keepalive")
             self._idle_thread.start()
+
+    def install_round_calibration(self, config):
+        """Operator-local update, serialized with whole requests; no HTTP client input."""
+        with self._io_lock:
+            if config == {"enabled": False} and type(config.get("enabled")) is bool:
+                self._round_config = self._round_options = None
+                return {"mode": "disabled"}
+            if not isinstance(config, dict) or config.get("enabled") is not True:
+                raise ValueError("round speculation requires an explicit boolean enabled flag")
+            if self.mode != "pipelined" or not self.pipeline_plan or not self.pipeline_plan.get("model_cohort"):
+                raise ValueError("round speculation requires a strict pipelined model cohort")
+            if self._round_request_policy_enabled and config.get("mode", "shadow") == "enforce":
+                raise ValueError("enforced round adaptation cannot share request-recipe learning")
+            from copy import deepcopy
+            from v4_adaptive_round import RoundPolicy, service_options
+            from v4_round_evidence import verify_calibration
+            options = service_options(self.pipeline_plan, self._runtime_configs, self._lease_fences,
+                depth=getattr(self.vp, "V4_SPEC_DEPTH", 16), floor=getattr(self.vp, "V4_REFILL_FLOOR", 1),
+                lazy=getattr(self.vp, "V4_LAZY_DRAFT", False))
+            detached = deepcopy(config)
+            detached["calibration"] = verify_calibration(detached.get("calibration"), options)
+            checked = RoundPolicy(detached, **options)
+            if checked.expires_at <= time.time():
+                raise ValueError("expired round calibration cannot replace the active policy")
+            # Do not replace either member until raw signatures, selected leases,
+            # source/config identity and the entire bounded policy have passed.
+            self._round_config, self._round_options = detached, options
+            return {"mode": checked.mode, "binding_sha256": checked.binding_sha256,
+                    "expires_at": checked.expires_at}
 
     def _check_assignments(self):
         if not self.assignments:
@@ -178,6 +226,26 @@ class V4RingBackend:
             raise ValueError("incomplete signer assignments")
 
     def prepare(self, body):
+        return self._prepare(body)
+
+    def validate_prepared_route(self, prepared, body):
+        """Recheck a trusted same-cohort router candidate without encoding twice.
+
+        The router supplies the original body and groups candidates by the exact
+        cohort (including artifact/tokenizer identity). Public callers still go
+        through prepare; this hook never accepts client-supplied token IDs.
+        """
+        if (not isinstance(prepared, (tuple, list)) or len(prepared) != 4
+                or not isinstance(prepared[0], dict) or not isinstance(prepared[0].get("prompt_ids"), list)
+                or len(prepared[0]["prompt_ids"]) != prepared[1]
+                or prepared[0].get("max_new") != prepared[2]):
+            raise AdmissionError("invalid prepared same-cohort request", status=503, code="incompatible_preparation")
+        result = self._prepare(body, prompt_ids=prepared[0]["prompt_ids"])
+        if result[1:] != tuple(prepared[1:]):
+            raise AdmissionError("prepared token/timeout bounds changed", status=503, code="incompatible_preparation")
+        return result
+
+    def _prepare(self, body, *, prompt_ids=None):
         if not isinstance(body, dict):
             raise AdmissionError("request must be a JSON object", status=400, code="invalid_request_error")
         if body.get("model", self.model_id) != self.model_id:
@@ -208,9 +276,11 @@ class V4RingBackend:
         mode = body.get("shard_mode", self.mode)
         if mode not in ("greedy", "dspark", "pipelined"):
             raise AdmissionError("invalid shard_mode", status=400, code="invalid_request_error")
+        if getattr(self, "_native_runner", None) is not None and mode != "greedy":
+            raise AdmissionError("native tokenwise cohort only supports greedy lanes", status=400, code="unsupported_feature")
         effort = body.get("reasoning_effort")
-        ids = self.vp._encode_prompt(self.tokenizer, {"messages": messages,
-            "thinking": bool(body.get("thinking", False)), "reasoningEffort": effort})
+        ids = (list(prompt_ids) if prompt_ids is not None else self.vp._encode_prompt(self.tokenizer,
+            {"messages": messages, "thinking": bool(body.get("thinking", False)), "reasoningEffort": effort}))
         if not isinstance(ids, list) or not ids or any(type(token) is not int or token < 0 for token in ids):
             raise AdmissionError("V4 prompt encoding failed", status=400, code="invalid_request_error")
         if len(ids) + maximum + (64 if mode != "greedy" else 0) > self.max_context:
@@ -219,6 +289,9 @@ class V4RingBackend:
         if type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or not 0 < timeout_s <= 3600:
             raise AdmissionError("timeout_s must be finite in (0,3600]", status=400, code="invalid_request_error")
         payload = {"prompt_ids": ids, "mode": mode, "max_new": maximum}
+        if getattr(self, "_native_runner", None) is not None:
+            from v4_native_lanes import CONTRACT
+            payload["numerical_contract"] = CONTRACT
         if self._policy is not None:
             payload["policy_allowed"] = "shard_mode" not in body
             if payload["policy_allowed"] and len(ids) + maximum + 64 > self.max_context:
@@ -337,6 +410,10 @@ class V4RingBackend:
 
     def execute(self, job, emit, cancel_check):
         with self._io_lock:
+            if self._round_slot is not None:
+                self._round_slot.poll(self.install_round_calibration)
+            if self._native_runner is not None:
+                return self._native_runner.execute(job, emit, cancel_check)
             return self._execute(job, emit, cancel_check)
 
     def _execute(self, job, emit, cancel_check):
@@ -406,6 +483,21 @@ class V4RingBackend:
                         emit(token)
                     seen += 1
 
+                if callable(getattr(emit, "commit_many", None)):
+                    def committed_many(tokens):
+                        nonlocal seen
+                        tokens = [int(token) for token in tokens]
+                        replay_count = min(len(tokens), max(0, len(prefix)-seen))
+                        if tokens[:replay_count] != prefix[seen:seen+replay_count]:
+                            raise ReplayMismatch("recomputed committed prefix differs; refusing unsafe resume")
+                        fresh = tokens[replay_count:]
+                        if fresh:
+                            emit.commit_many(fresh)
+                        offsets.extend([time.perf_counter()-started] * len(tokens))
+                        self._stats["replayed_tokens"] += replay_count
+                        seen += len(tokens)
+                    committed.commit_many = committed_many
+
                 method = {"greedy": self.vp.coordinate, "dspark": self.vp.coordinate_dspark,
                           "pipelined": self.vp.coordinate_dspark_pipelined}[selected_mode]
                 kwargs = dict(eos_ids=self.eos_ids, nonce=nonce, swarm_id=self.swarm_id, job_id=attempt_id,
@@ -418,6 +510,15 @@ class V4RingBackend:
                     kwargs.update(decision.recipe.coordinator_kwargs())
                     if selected_mode == "pipelined":
                         kwargs["draft_block_limit"] = self._policy.binding()["loaded_block_size"]
+                if self._round_config is not None and selected_mode == "pipelined" and not attempt and not prefix:
+                    from v4_adaptive_round import RoundPolicy
+                    bound = self._round_options
+                    if (kwargs.get("depth", getattr(self.vp, "V4_SPEC_DEPTH", 16)),
+                            kwargs.get("floor", getattr(self.vp, "V4_REFILL_FLOOR", 1)),
+                            kwargs.get("lazy", getattr(self.vp, "V4_LAZY_DRAFT", False))) == (
+                            bound["depth"], bound["floor"], bound["binding"]["lazy"]):
+                        kwargs["round_policy"] = RoundPolicy(self._round_config, **bound)
+                        kwargs["draft_block_limit"] = bound["loaded_block_size"]
                 if conversation is not None:
                     kwargs["conversation"] = conversation
                 audit = nullcontext()
@@ -433,6 +534,8 @@ class V4RingBackend:
                 receipts = self._verify_receipts(result, nonce, attempt_id, conversation)
                 self._last_ok = time.monotonic()
                 optimization = {}
+                if "round_speculation" in result:
+                    optimization["round_speculation"] = result["round_speculation"]
                 if conversation is not None:
                     self._last_conversation_record = dict(conversation.record)
                     optimization["conversation_cache"] = dict(conversation.record)
@@ -537,6 +640,13 @@ class V4RingBackend:
 
     def warmup(self, timeout_s=300.0):
         """A real signed two-token request, isolated from tenant quota/accounting."""
+        if self._native_runner is not None:
+            try:
+                return self._native_runner.warmup(timeout_s)
+            except Exception:
+                self._last_ok = 0.0
+                self._close_channels()
+                raise
         payload, count, maximum, timeout_s = self.prepare({"model": self.model_id,
             "messages": [{"role": "user", "content": "Reply briefly with a greeting."}],
             "max_tokens": 2, "shard_mode": self.mode, "timeout_s": timeout_s})
@@ -548,15 +658,66 @@ class V4RingBackend:
         job = Job("__startup_warmup__", payload, count, maximum, now + timeout_s,
                   "startup-warmup", None, now, state="running")
         result = self.execute(job, job.commit, job.check_stop)
+        try:
+            self._verify_warmup_profile(result)
+        except Exception:
+            self._last_ok = 0.0
+            self._close_channels()
+            raise
         return {"ready": True, "committed_tokens": len(result["tokens"]),
                 "proof_verified": result["proof"]["verified"]}
+
+    def _verify_warmup_profile(self, result):
+        expected_profiles = {node: config.get("environment", {}).get("V4_EXECUTION_PROFILE")
+                             for node, config in self._runtime_configs.items()}
+        if any(expected_profiles.values()):
+            from v4_execution_profiles import require_profile_warmup
+            require_profile_warmup(result["proof"]["receipts"], expected_profiles)
 
     def stats(self):
         values = dict(self._stats)
         # No other request's tenant-scoped decisions or history are exposed here.
         values["adaptive_policy_enabled"] = self._policy is not None
+        values["round_speculation_mode"] = self._round_config.get("mode", "shadow") if self._round_config else "disabled"
+        if self._round_slot is not None:
+            values["round_calibration_reload"] = self._round_slot.status()
         values["conversation_cache_enabled"] = self._conversation_owner is not None
+        values["native_lanes_enabled"] = self._native_runner is not None
+        if self._native_runner is not None:
+            values["native_lanes"] = self._native_runner.status()
         return values
+
+    def routing_identity(self):
+        if self._native_runner is not None:
+            return self._native_runner.identity()
+        if self.pipeline_plan and self._runtime_configs:
+            from v4_conversation_protocol import canonical
+            return {"cohort_id": self.pipeline_plan["cohort_id"],
+                    "runtime_config_sha256": hashlib.sha256(canonical(self._runtime_configs)).hexdigest()}
+        return None
+
+    def economics_profile(self):
+        """Loaded coordinator constants, rather than a second os.environ read.
+
+        Fixed benchmark forecasts do not qualify adaptive/native lane policies.
+        There is no V4_DSPARK_INFLIGHT setting in this coordinator: its in-flight
+        capacity is derived by the original loop from depth and draft geometry.
+        """
+        if self._policy is not None or self._round_config is not None or self._native_runner is not None:
+            return None
+        names = ("V4_SPEC_DEPTH", "V4_REFILL_FLOOR", "V4_LAZY_DRAFT")
+        if any(not hasattr(self.vp, name) for name in names):
+            return None
+        return {"mode": self.mode, "coordinator_environment": {
+            "V4_SPEC_DEPTH": str(self.vp.V4_SPEC_DEPTH),
+            "V4_REFILL_FLOOR": str(self.vp.V4_REFILL_FLOOR),
+            "V4_LAZY_DRAFT": "1" if self.vp.V4_LAZY_DRAFT else "0"}}
+
+    def routing_cache_hint(self, payload, *, tenant, request_fingerprint, now):
+        # Availability of a snapshot does not measure the complete first-token
+        # restore cost. In particular an extended-prefix shadow still prefills.
+        # Until a matching restored-first-token sample exists, keep it unknown.
+        return None
 
 
 

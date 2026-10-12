@@ -146,6 +146,18 @@ def test_listen_without_signed_receipts_never_reports_ready_and_rolls_back_owned
     assert all("kill -9" not in line and "fuser" not in line for line in fake.stops)
 
 
+def test_named_profile_signed_warmup_also_requires_actual_capture_observations(fixture, tmp_path):
+    plan, config, keys = fixture
+    config["environment"] = {"V4_EXECUTION_PROFILE": "resident-whole"}
+    fake = FakeSSH(plan, keys)
+    deploy = V4Deployment(plan, config, state_dir=tmp_path, executor=fake)
+    # Real signature/coverage remains valid, but these fixture receipts have no
+    # graph observations. Merely loading the named environment cannot mean READY.
+    with pytest.raises(ValueError, match="observations"):
+        deploy.deploy(routes=())
+    assert len([line for line in fake.stops if ".stage" in line]) == 3
+
+
 def test_failure_does_not_kill_preexisting_or_other_stage_processes(fixture, tmp_path):
     plan, config, keys = fixture
     fake = FakeSSH(plan, keys, start_failure="stage1")

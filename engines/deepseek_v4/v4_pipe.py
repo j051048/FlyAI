@@ -87,6 +87,9 @@ if os.path.isdir(os.path.join(_REPO_ROOT, "shard")) and _REPO_ROOT not in sys.pa
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.dirname(_HERE))
 
+from v4_execution_profiles import apply_profile  # noqa: E402
+apply_profile()  # environment constants must be frozen before model imports
+
 import torch  # noqa: E402
 
 # The lever registry (phase0/v4_levers.py). Module scope and UNGUARDED for the same reason v4_stage
@@ -103,6 +106,32 @@ try:                                                    # flat box layout (files
     from transport import send_msg as _raw_send_msg, recv_msg as _raw_recv_msg
 except ImportError:
     from shard.transport import send_msg as _raw_send_msg, recv_msg as _raw_recv_msg
+
+
+def transport_module():
+    """The codec actually used by these channels, including a flat-box import."""
+    return sys.modules[_raw_recv_msg.__module__]
+
+
+def configure_transport_buffers(budget_bytes=0, *, slots=2, pinned=False):
+    module = transport_module()
+    if not hasattr(module, "configure_receive_pool"):
+        raise ValueError("selected transport does not support bounded receive buffers")
+    return module.configure_receive_pool(budget_bytes, slots=slots, pinned=pinned)
+
+
+def transport_buffer_status():
+    module = transport_module()
+    return module.receive_pool_status() if hasattr(module, "receive_pool_status") else {"enabled": False}
+
+V4_TRANSPORT_BUFFER_MIB = int(os.environ.get("V4_TRANSPORT_BUFFER_MIB", "0"))
+V4_TRANSPORT_BUFFER_SLOTS = int(os.environ.get("V4_TRANSPORT_BUFFER_SLOTS", "2"))
+V4_TRANSPORT_PINNED = os.environ.get("V4_TRANSPORT_PINNED", "0")
+if not 0 <= V4_TRANSPORT_BUFFER_MIB <= 512 or not 1 <= V4_TRANSPORT_BUFFER_SLOTS <= 64 or V4_TRANSPORT_PINNED not in ("0", "1"):
+    raise ValueError("bounded transport buffer MiB and explicit 0/1 pinning required")
+if V4_TRANSPORT_BUFFER_MIB:
+    configure_transport_buffers(V4_TRANSPORT_BUFFER_MIB * 1024**2,
+        slots=V4_TRANSPORT_BUFFER_SLOTS, pinned=V4_TRANSPORT_PINNED == "1")
 try:
     from shard.pipeline_session import SessionConfig, SessionSocket, SessionAcceptor, ProtocolError, hello_client, send_message, recv_message
 except ImportError:
@@ -922,6 +951,8 @@ def _privacy_binding(st, msg):
 def _reset_capacity_error(st, msg):
     if msg.get("reset_error"):
         return str(msg["reset_error"])
+    if getattr(st, "_native_lanes", None) is not None:
+        return "native tokenwise cohort requires the authenticated native_lane protocol"
     if getattr(st, "_kv_runtime", None) is not None:
         limit = st.kv_runtime_status()["max_supported_tokens"]
         horizon = msg.get("max_pos")
@@ -1008,6 +1039,13 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
             install_stage_lease_checks(st, lease_guard)
         if ckpt_dir is not None:
             st.load(ckpt_dir)
+    if session_config is not None and session_config.plan.get("model_cohort"):
+        from v4_native_lanes import CONTRACT as native_contract
+        declared_native = session_config.plan["model_cohort"]["numeric_contract"] == native_contract
+        if declared_native != (getattr(st, "_native_lanes", None) is not None):
+            raise ValueError("native tokenwise runtime and signed numerical cohort differ")
+    if getattr(st, "_native_lanes", None) is not None and V4_SEALED_IDS:
+        raise ValueError("native lane v1 does not claim sealed token-ID compatibility")
     preloaded_drafter = {}
     if tail and dspark and session_config is not None:
         loaded_drafter = _tail_drafter(st, ckpt_dir, preloaded_drafter)
@@ -1248,6 +1286,13 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
             if op == "noop":                                  # keep-warm tick from the predecessor: skip
                 continue
             st._diagnostic_operation = op
+            if op == "native_lane" or (op == "reset" and msg.get("native_lane_open") is True):
+                from v4_native_lane_protocol import handle
+                frame = handle(st, msg, stage_index=stage,
+                    session=getattr(st, "_runtime_session_config", None), signer_key=node_key,
+                    vp=sys.modules[__name__], owner_grant=getattr(conn, "grant", None))
+                kw.send(frame)
+                continue
             if op == "reset":
                 st._diagnostic_job_id = msg.get("job_id")
                 st._conversation_reset_parameters = dict(msg)
@@ -1573,6 +1618,13 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
             if op == "noop":                                  # keep-warm tick from the predecessor: skip
                 continue
             st._diagnostic_operation = op
+            if op == "native_lane" or (op == "reset" and msg.get("native_lane_open") is True):
+                from v4_native_lane_protocol import handle
+                frame = handle(st, msg, stage_index=getattr(st, "_diagnostic_stage_index", 0),
+                    session=getattr(st, "_runtime_session_config", None), signer_key=node_key,
+                    vp=sys.modules[__name__], owner_grant=getattr(pred, "grant", None))
+                chan.send({"op": "native_lane_ack", "acks": frame["acks"]})
+                continue
             if op == "reset":
                 st._diagnostic_job_id = msg.get("job_id")
                 st._conversation_reset_parameters = dict(msg)
@@ -1883,6 +1935,11 @@ def _coord_io(cancel_check, on_token, expected_job=None, *, conversation=None, p
     def commit(token):
         guard()
         on_token(token)
+    if on_token is not None and callable(getattr(on_token, "commit_many", None)):
+        def commit_many(tokens):
+            guard()
+            on_token.commit_many(tokens)
+        commit.commit_many = commit_many
     guard()
     return send, recv, commit if on_token is not None else None
 
@@ -2217,11 +2274,22 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
         if conf_probe is not None and block:                  # the FULL block's conf vs what accepted
             conf_probe(list(confs), n)
         stop = False
-        for committed_index, t in enumerate(committed):
+        ready = []
+        for t in committed[:max_new-len(toks)]:
+            ready.append(int(t))
+            if int(t) in eos:
+                break
+        grouped = on_token is not None and callable(getattr(on_token, "commit_many", None))
+        if grouped and ready:
+            # The durable journal bounds a transaction to 64 already-settled
+            # tokens; a fully accepted B=64 round also contains its bonus.
+            for offset in range(0, len(ready), 64):
+                on_token.commit_many(ready[offset:offset+64])
+        for committed_index, t in enumerate(ready):
             committed_predictions += int(committed_index < n)
             toks.append(int(t))
             ids.append(int(t))
-            if on_token is not None:
+            if on_token is not None and not grouped:
                 on_token(int(t))
             if int(t) in eos or len(toks) >= max_new:
                 stop = True
@@ -2386,7 +2454,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                                 swarm_id="swarm", job_id="job", layer_count=None, receipts=False,
                                 timeout=600.0, on_token=None, depth=None, lazy=None, floor=None,
                                 cancel_check=None, expected_by_signer=None, strict_job_binding=False, conversation=None,
-                                draft_block_limit=None):
+                                draft_block_limit=None, round_policy=None, draft_prefix_cap=None):
     """DSPARK speculative decode, PIPELINED — the same lossless round, streamed instead of chunked.
 
     Same contract as coordinate_dspark (same reset, same drafter, same accept rule, same emitted
@@ -2473,10 +2541,21 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         raise ValueError("approved draft block limit must be an integer in 1..256")
     W = int(depth or V4_SPEC_DEPTH)
     F = int(floor if floor is not None else V4_REFILL_FLOOR)
+    if draft_prefix_cap is not None:
+        if (type(draft_prefix_cap) is not int or draft_block_limit is None or
+                not 0 <= draft_prefix_cap <= min(draft_block_limit, W-1) or F != 1 or round_policy is not None):
+            raise ValueError("fixed prefix experiment requires a bounded cap, loaded block limit, floor=1 and no adaptive policy")
     if F < 1:
         raise ValueError(f"v4 pipelined dspark: refill floor {F} — the pipe refills at or below the "
                          f"floor, so it must be at least 1 (1 = the shipped drain-only behaviour)")
     lazy = V4_LAZY_DRAFT if lazy is None else bool(lazy)
+    if round_policy is not None:
+        # Local, per-attempt policy only. It cannot resize the drafter, a graph,
+        # rollback storage or frames already submitted to the ring.
+        from v4_adaptive_round import RoundPolicy
+        if not isinstance(round_policy, RoundPolicy):
+            raise ValueError("round_policy must be a locally validated RoundPolicy")
+        round_policy.validate_runtime(depth=W, floor=F, draft_block_limit=draft_block_limit)
     # A coordinator lever has no rebound method for an audit to inspect -- `lazy` is an ARGUMENT to
     # this loop -- so the loop states what it ran with and v4_levers reports THAT, not a second read
     # of the env it already believed. This is the lever that was set on six stages for a night.
@@ -2645,6 +2724,8 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                                    f"{type(sender.err).__name__}: {sender.err}") from sender.err
             raise
         replies_received += 1
+        if round_policy is not None:
+            round_policy.observe_reply_cost(rep.get("round_cost"))
         with st8.lock:
             pos, ep = st8.outstanding.popleft()
             st8.pending -= 1
@@ -2705,6 +2786,8 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             run += 1
         stop = m in eos or len(toks) >= max_new
         if stop:
+            if round_policy is not None:
+                round_policy.finish(len(toks))
             with st8.lock:                                    # fence what is still queued: the run is
                 st8.epoch += 1                                # over, so nothing more reaches the ring
             sender.stop()                                     # settle `pending` before draining on it
@@ -2753,6 +2836,12 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         # `m` is what sits at `c` on every path — it is what the two branches below feed there, and on
         # the accepted path `fed == m` was already streamed there. Hints are one per position of it.
         nblk = min(len(blk), max(W - 1, 0))
+        if draft_prefix_cap is not None:
+            nblk = min(nblk, draft_prefix_cap)
+        if round_policy is not None and need:
+            # Acceptance has settled this frontier; only the unsent suffix is
+            # subject to a new cap. Shadow returns exactly the unchanged width.
+            nblk = round_policy.refill(committed_tokens=len(toks), available_drafts=len(blk))
         hints = _hints([m] + blk[:nblk])
         if fed is None:                                       # nothing speculated here: feed the truth
             _feed(c, m, hints[0])
@@ -2781,7 +2870,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         # streamed and the ones already in flight are never re-streamed — a frame on the wire cannot
         # be recalled, and the disagreement between it and the fresh block's re-prediction is the
         # measurement (`topup_agree`/`topup_disagree`), not a decision.
-        if blk and horizon - c + 1 <= F:
+        if blk and nblk and horizon - c + 1 <= F:
             base = horizon                                    # deepest frame already in flight
             topup = base > c                                  # a refill past frames still unjudged
             drafted += 1
@@ -2814,7 +2903,11 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 # returned one frame ago" stops naming the block this loop will stream from, and the
                 # prediction is withheld rather than made cleverer. The frames dprev would have
                 # covered simply draft, which a deeper floor needs of them anyway.
-                _feed(p, d, hints[i + 1], prev=(F == 1 and i == nblk - 1 and nblk >= 2),
+                # dprev assumes the NEXT burst has >=2 drafts. An enforced
+                # adaptive cap can become 0/1, so retain only proven dnxt hints.
+                _feed(p, d, hints[i + 1], prev=(F == 1 and i == nblk - 1 and nblk >= 2
+                      and draft_prefix_cap is None
+                      and not (round_policy is not None and round_policy.changes_frames)),
                       dep=p - c, src="topup" if topup else "block",
                       alt=alt2[i] if i < len(alt2) else None)
         # THE PIPELINE FILL, measured: positions c..horizon all have a frame in the ring and none of
@@ -2857,6 +2950,9 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             "frames_per_token": round(frames / gen, 3) if gen else 0.0,
             "block_len": blen,
             "stale_replies": stale, "unsent_frames": st8.unsent,
+            **({"round_speculation": round_policy.finish(gen)} if round_policy is not None else {}),
+            **({"draft_prefix_cap": draft_prefix_cap, "loaded_block_limit": draft_block_limit,
+                "predictive_dprev_disabled": True} if draft_prefix_cap is not None else {}),
             "mode": "pipelined", "legacy_g_definition": "total_generated_tokens_per_cancel_cycle",
             "receipt_sweep_s": sweep_s,
             "inflight_intervals": [{"level": level, "duration_s": duration}
@@ -2981,9 +3077,10 @@ ENG_ENV = [
     "V4_FP8_WIRE", "V4_WIRE_FUSED",                                             # wire codec
     "V4_PIPELINED_SPEC", "V4_SPEC_DEPTH", "V4_LAZY_DRAFT", "V4_REFILL_FLOOR",   # pipelined speculation
     "V4_MOE_GROUPED", "V4_MOE_DECODE", "V4_MOE_MULTI", "V4_MOE_MULTI_MAX",      # MoE kernels
-    "V4_FP8_GEMV", "V4_FP8_SHARED",                                             # fp8 GEMV path
+    "V4_FP8_GEMV", "V4_FP8_SHARED", "V4_FP8_AUTOTUNE", "V4_KERNEL_TUNING_DIR",    # fp8 GEMV path
     "V4_GRAPH_MAX", "V4_MOE_IN_GRAPH",                                          # graph budget / scope
     "V4_DSPARK_FAST", "V4_DSPARK_GRAPH", "V4_DSPARK_MOE", "V4_DSPARK_BLOCK",    # drafter
+    "V4_DSPARK_RESULT_BUFFER",                                                # opt-in one-event small D2H
     "V4_DRAFT_TOP2",                                                            # tree-gate measurement
     "V4_DSPARK_CONF_GATE", "V4_DSPARK_CONF_MIN", "V4_DSPARK_CONF_THRESH",       # adaptive send-length
     "V4_REF_SLIM", "V4_REF_SLIM_NOQAT",                                         # reference-compute slim
@@ -2998,6 +3095,9 @@ ENG_ENV = [
     "V4_TIMING", "V4_TIMING_EVERY",                                             # instrumentation
     "V4_RUNTIME_METRICS",                                                       # signed work/residency observations
     "V4_PROFILE_RUNTIME", "V4_PROFILE_GPU_EVERY",                               # bounded phase profiling
+    "V4_EXECUTION_PROFILE", "V4_TRANSPORT_BUFFER_MIB", "V4_TRANSPORT_BUFFER_SLOTS", "V4_TRANSPORT_PINNED",
+    "V4_NATIVE_LANES", "V4_NATIVE_LANE_HOST_MIB", "V4_NATIVE_LANE_CACHE_TTL_S",
+    "V4_NATIVE_LANE_STATE_DIR", "V4_NATIVE_LANE_DISK_MIB",                        # native independent state
     "V4_EXPERT_PREFETCH", "V4_EXPERT_PREFETCH_SLOTS", "V4_EXPERT_PREFETCH_WARMUP", # local prefetch policy
     "V4_EXPERT_PLACEMENT", "V4_EXPERT_CACHE_SLOTS", "V4_EXPERT_CACHE_MIB",         # local experts
     "V4_EXPERT_CACHE_RESERVE_MIB",                                               # measured free VRAM headroom
@@ -3030,7 +3130,7 @@ def _graph_env_conflict(gp_mode):
 
 def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=False,
                      device="cuda", token=None, extra_env="", gpu=None, port=None, nxt_addr=None,
-                     ret_relay=None, dspark=False, cuda_graph=True, key_path=None):
+                     ret_relay=None, dspark=False, cuda_graph=True, key_path=None, execution_profile=None):
     """The shell command a launcher runs to start ONE v4 engine stage over the sidecar. Fully
     DETACHED in every shape (setsid + fd redirect), mirroring k3_pipe.stage_launch_cmd /
     m25_scatter_pipe.stage_cmd — see the note by the return.
@@ -3091,6 +3191,16 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=F
     # A bool keeps the old spelling; a string passes the mode through, so "whole" is reachable from a
     # launcher argument instead of only from a hand-written extra_env.
     gp_mode = ("1" if cuda_graph is True else "0" if cuda_graph is False else str(cuda_graph))
+    profile_env = ""
+    execution_profile = execution_profile or os.environ.get("V4_EXECUTION_PROFILE") or None
+    if execution_profile is not None:
+        import shlex
+        from v4_execution_profiles import resolve_profile
+        resolved = resolve_profile(execution_profile)
+        if cuda_graph is not True and gp_mode != resolved["V4_CUDA_GRAPH"]:
+            raise ValueError("explicit cuda_graph conflicts with execution_profile")
+        gp_mode = resolved["V4_CUDA_GRAPH"]
+        profile_env = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(resolved.items())) + " "
     if gp_mode not in GRAPH_MODE_VALUES:
         raise ValueError(f"stage_launch_cmd: V4_CUDA_GRAPH={gp_mode!r} is not a mode v4_stage "
                          f"recognises, so the stage would resolve it to OFF. Use one of "
@@ -3109,7 +3219,7 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=F
     # host's one key would fail the unchanged receipt duplicate-signer check.
     import shlex
     node_key = f"SHARD_NODE_KEY={shlex.quote(str(key_path))} " if key_path is not None else ""
-    return (f"{rc}{tk}{cvd}{gp}{_eng_env()}{extra_env}{node_key}V4_DIR={model_dir} V4_DEV={device} "
+    return (f"{rc}{tk}{cvd}{gp}{_eng_env()}{profile_env}{extra_env}{node_key}V4_DIR={model_dir} V4_DEV={device} "
             f"M25_ENGINE_BIND=127.0.0.1 setsid bash -c '{inner}' </dev/null >/dev/null 2>&1 &")
 
 

@@ -1,8 +1,10 @@
-"""Read-only V4 deployment checks; environment is applied before Torch imports.
+"""V4 deployment checks; environment is applied before Torch imports.
 
 File integrity and GPU visibility do not establish a reservation, a successful
 inference session, or numerical acceptance. This module never creates keys,
 loads model weights into a GPU, starts tunnels, or changes model directories.
+An explicitly enabled native_kernel_probe runs bounded synthetic CUDA work in
+a separate process. That optional operation is not a passive/read-only check.
 """
 from __future__ import annotations
 
@@ -31,6 +33,8 @@ def apply_environment(environment):
         raise ValueError("explicit string environment required")
     if "torch" in sys.modules:
         raise ValueError("preflight environment must be installed before importing Torch")
+    from v4_execution_profiles import expanded_environment
+    environment = expanded_environment(environment)
     for name in tuple(os.environ):
         if name.startswith("V4_"):
             os.environ.pop(name)
@@ -172,7 +176,7 @@ def process_observation(name, *, state_dir=".shard-processes", listener_port=Non
 
 
 def check_node(plan, index, node, *, verify_files=True, probe_gpu=True, check_tokenizer=True,
-               allow_owned_listener=False):
+               allow_owned_listener=False, native_kernel_probe=None):
     from shard.pipeline_plan import validate_plan
     plan = validate_plan(plan)
     values, errors, warnings = {}, [], []
@@ -183,6 +187,25 @@ def check_node(plan, index, node, *, verify_files=True, probe_gpu=True, check_to
             values[name] = action()
         except Exception as error:
             errors.append({"check": name, "error_class": type(error).__name__, "message": str(error)[:500]})
+    kernel_requested = native_kernel_probe is not None and native_kernel_probe != {"enabled": False}
+    if kernel_requested:
+        def native_probe():
+            if (not isinstance(native_kernel_probe, dict) or native_kernel_probe.get("enabled") is not True
+                    or set(native_kernel_probe) - {"enabled", "graph", "max_probe_bytes", "timeout_s", "cache_dir"}):
+                raise ValueError("native_kernel_probe requires explicit enabled:true and bounded options")
+            if stage is None:
+                raise ValueError("native kernel probe belongs to an explicitly selected GPU stage")
+            from engines.deepseek_v4.v4_native_capability import probe_native_capability
+            options = {k: v for k, v in native_kernel_probe.items() if k != "enabled"}
+            result = probe_native_capability(node.get("device", "cuda:0"), **options)
+            values["native_kernel_probe"] = result
+            if result["status"] != "pass":
+                raise ValueError("native kernel capability remains " + result["status"] + ": " + result["reason"])
+            if result["identity"]["gpu_uuid"].casefold() != str(stage.get("gpu_uuid")).casefold():
+                raise ValueError("native kernel probe GPU differs from assigned stage")
+            return result
+        record("native_kernel_probe", native_probe)
+        warnings.append("explicit native kernel probe performs bounded local GPU computation; it does not qualify a full stage")
     cohort = plan.get("model_cohort")
     dspark = node.get("dspark", True)
     if type(dspark) is not bool:
@@ -236,7 +259,8 @@ def check_node(plan, index, node, *, verify_files=True, probe_gpu=True, check_to
         warnings.append("weight payload SHA256 was not verified; preview cannot authorize startup")
     return {"schema": "shard-v4-preflight/1", "node_id": node_id, "stage": index,
             "preflight_ok": not errors, "runtime_ready": False, "checks": values,
-            "errors": errors, "warnings": warnings, "scope": "read-only deployment checks",
+            "errors": errors, "warnings": warnings,
+            "scope": "deployment checks plus opt-in synthetic GPU probe" if kernel_requested else "read-only deployment checks",
             "remaining_checks": ["Stage.load strict tensor coverage", "signed real-model warmup", "numerical/performance acceptance"]}
 
 
@@ -249,7 +273,8 @@ def main(argv=None):
     result = check_node(request["plan"], request.get("index"), request["node"],
         verify_files=request.get("verify_files", True), probe_gpu=request.get("probe_gpu", True),
         check_tokenizer=request.get("check_tokenizer", True),
-        allow_owned_listener=request.get("allow_owned_listener", False))
+        allow_owned_listener=request.get("allow_owned_listener", False),
+        native_kernel_probe=request.get("native_kernel_probe"))
     print(json.dumps(result, allow_nan=False))
     return 0 if result["preflight_ok"] else 1
 
