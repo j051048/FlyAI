@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 
 import torch
 
@@ -184,7 +185,8 @@ def trace_stage(stage, token_ids, *, prompt_tokens, hidden=None, execution="conf
             stage._spec = bool(reject)
             h = forward(0, prompt_tokens)
             if stage.tail:
-                records.append(_logits_record(stage, h, 0, prompt_tokens, max_tensor_bytes))
+                records.append(_logits_record(stage, h, 0, prompt_tokens, max_tensor_bytes,
+                                              teacher_token=int(ids[0, prompt_tokens])))
             pos = prompt_tokens
             while pos < total:
                 if reject is not None and pos == reject[0]:
@@ -194,12 +196,16 @@ def trace_stage(stage, token_ids, *, prompt_tokens, hidden=None, execution="conf
                     stop_recording_at = None
                     if stage.tail:
                         for i in range(accepted):
-                            records.append(_logits_record(stage, h[:, i:i+1], pos+i, 1, max_tensor_bytes))
+                            following = int(ids[0, pos+i+1]) if pos+i+1 < total else None
+                            records.append(_logits_record(stage, h[:, i:i+1], pos+i, 1, max_tensor_bytes,
+                                                          teacher_token=following))
                     pos += accepted
                 else:
                     h = forward(pos)
                     if stage.tail:
-                        records.append(_logits_record(stage, h, pos, 1, max_tensor_bytes))
+                        following = int(ids[0, pos+1]) if pos+1 < total else None
+                        records.append(_logits_record(stage, h, pos, 1, max_tensor_bytes,
+                                                      teacher_token=following))
                     pos += 1
                 # Keep only the just-completed chunk needed by the forced rejection.
                 if reject is None or pos != reject[0] + reject[2]:
@@ -242,10 +248,20 @@ def _recipe(stage, slim):
         "performance_evidence": False}
 
 
-def _logits_record(stage, hidden, pos, width, limit):
+def _logits_record(stage, hidden, pos, width, limit, *, teacher_token=None):
     value = stage.logits_all(hidden, full_logits=False)
-    return {"position": pos, "tokens": width, "layer": stage.hi,
+    record = {"position": pos, "tokens": width, "layer": stage.hi,
             "logits": tensor_identity(value, max_bytes=limit), "argmax": int(value.reshape(-1, value.shape[-1])[-1].argmax())}
+    if teacher_token is not None:
+        logits = value.reshape(-1, value.shape[-1])[-1].float()
+        if type(teacher_token) is not int or not 0 <= teacher_token < logits.numel():
+            raise ValueError("teacher token is outside the native logits vocabulary")
+        logprob = float(logits[teacher_token] - torch.logsumexp(logits, dim=-1))
+        record["teacher_token"] = teacher_token
+        # Keep invalid arithmetic diagnosable without emitting non-JSON NaNs.
+        # compare_traces already refuses matching NaN/Inf logits as a pass.
+        record["next_token_logprob"] = logprob if math.isfinite(logprob) and logprob <= 0 else None
+    return record
 
 
 def compare_traces(left, right):
@@ -254,6 +270,15 @@ def compare_traces(left, right):
                 trace.get("sha256") != digest({k:v for k,v in trace.items() if k != "sha256"}) or
                 not isinstance(trace.get("records"), list) or len(trace["records"]) > MAX_RECORDS):
             raise ValueError("invalid or modified bounded numeric trace")
+        for row in trace["records"]:
+            if ("next_token_logprob" in row) != ("teacher_token" in row):
+                raise ValueError("teacher token and log probability must be bound together")
+            if "next_token_logprob" in row:
+                p = row["next_token_logprob"]
+                invalid_logits = any(row.get("logits", {}).get(k) is True for k in ("nan", "infinity"))
+                if (type(row["teacher_token"]) is not int or row["teacher_token"] < 0 or
+                        not (p is None and invalid_logits or type(p) in (int, float) and math.isfinite(p) and p <= 0)):
+                    raise ValueError("invalid teacher-forced probability record")
     if left["identity"] != right["identity"] or left["inputs"] != right["inputs"]:
         raise ValueError("numeric traces have different model/source/configuration/input identities")
     first = None
@@ -263,7 +288,14 @@ def compare_traces(left, right):
         invalid = any(row is not None and (
             any(row[k]["nan"] or row[k]["infinity"] for k in ("hidden", "logits") if k in row) or
             any(value["nan"] for value in row.get("state", {}).values())) for row in (a, b))
-        if a != b or invalid:
+        # Older traces predate optional teacher-token probabilities. Their
+        # tensor hashes still compare exactly; missing probabilities are
+        # unknown, never synthesized as zero or mistaken for tensor drift.
+        comparable_a, comparable_b = a, b
+        if a is not None and b is not None and ("next_token_logprob" not in a or "next_token_logprob" not in b):
+            comparable_a = {k: v for k, v in a.items() if k not in ("teacher_token", "next_token_logprob")}
+            comparable_b = {k: v for k, v in b.items() if k not in ("teacher_token", "next_token_logprob")}
+        if comparable_a != comparable_b or invalid:
             first = {"record": index, "left": a, "right": b}
             if invalid:
                 first["invalid_numeric"] = True

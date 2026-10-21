@@ -171,8 +171,9 @@ def validate_runtime_metrics(value):
         except ImportError:
             from shard.runtime_profile import validate_profile
         validate_profile(value["performance"])
-        if value["mode"] == "reference_cpu" and any(
-                name.endswith(".gpu") for name in value["performance"]["phases"]):
+        if value["mode"] == "reference_cpu" and (any(
+                name.endswith(".gpu") for name in value["performance"]["phases"]) or any(
+                row["clock"] == "cuda_event" for row in value["performance"].get("timeline", {}).get("spans", []))):
             raise ValueError("CPU reference execution cannot claim GPU phase timings")
     if "prefetch_policy" in value:
         p = value["prefetch_policy"]

@@ -1,6 +1,6 @@
 # 当前文档导航与历史证据
 
-核对日期：2026-10-12；当前工作区含权重准备/换环、状态优化、恢复证明修复、可选持久作业日志、SLO/风险规划与请求 aging 调度。本页区分操作合同、接口规范、
+核对日期：2026-10-21；当前工作区增加设备驻留批执行、B4数值修正、可选partial批图、时间线、置信预算、精确缓存与质量工具。本页区分操作合同、接口规范、
 有日期的实验记录和参考实现来源。历史性能数字按原实验条件保留；新版计时、
 会话或资源合同需要新的原始运行证据。
 
@@ -17,6 +17,11 @@
 | P0–P2 执行、成本路由、原生请求、增量前缀及经济重组 | [V4_PERFORMANCE_EXECUTION](V4_PERFORMANCE_EXECUTION.md) |
 | 多卡宿主、命名配方、数值诊断、原生内核探针及四策略验收 | [V4_MULTIGPU_EXECUTION](V4_MULTIGPU_EXECUTION.md) |
 | 租用 5090 后交给 OpenClaw 的完整脚本、冻结计划与证据回收 | [V4_5090_ACCEPTANCE](V4_5090_ACCEPTANCE.md) |
+| 本轮 DeepInfer 思路的 P0–P2 落地、预算和新真机门槛 | [V4_DEEPINFER_IMPROVEMENTS](V4_DEEPINFER_IMPROVEMENTS.md) |
+| 新独立批合同、设备驻留、请求轴batch与取消排空 | [V4_DEVICE_BATCHING](V4_DEVICE_BATCHING.md) |
+| B4零容差修正、partial图桶、scalar/eager/graph三方真机对照 | [V4_BATCH_GRAPH_ACCEPTANCE](V4_BATCH_GRAPH_ACCEPTANCE.md) |
+| 条件概率校准、shadow与周期成本预算 | [V4_CONFIDENCE_BUDGET](V4_CONFIDENCE_BUDGET.md) |
+| 精确缓存、UTF-8/控制token、独立质量比较 | [V4_CACHE_QUALITY](V4_CACHE_QUALITY.md) |
 | 小磁盘节点、流式转换、权重准备与请求边界换环 | [WEIGHT_PREPARATION](WEIGHT_PREPARATION.md) |
 | 任意节点注册、区域组环、租约与多环 | [OPEN_INFERENCE_NETWORK](OPEN_INFERENCE_NETWORK.md) |
 | 资源准入与部署检查 | [RESOURCE_CONTRACT](RESOURCE_CONTRACT.md)、[DEPLOY_READINESS](DEPLOY_READINESS.md) |
@@ -31,7 +36,7 @@
 CLI 有各自兼容合同，不能仅更换命令名称就认为已经启用严格会话。
 
 有日期的 CPU/socket/HTTP 验证属于各自选定范围，不能合并为当前全仓 CI 或 GPU 证据。
-当前六项多卡 P0–P2 相关123文件组合为2081 passed / 11 skipped / 80 GPU deselected；前一轮
+2026-10-12 六项多卡 P0–P2 历史123文件组合为2081 passed / 11 skipped / 80 GPU deselected；本轮见[改造记录](V4_DEEPINFER_IMPROVEMENTS.md)。前一轮
 111文件1903通过属于重叠历史范围，独立专项
 不累加，Windows全仓的既有平台失败不被隐藏为通过。范围见 [执行改造](V4_PERFORMANCE_EXECUTION.md)。
 新增代码的 CUDA 正确性、吞吐与长时间稳定性仍需实测。V4 四卡 >=40、六卡 >=30 committed

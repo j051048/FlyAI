@@ -50,3 +50,32 @@ def test_noncontiguous_history_hash_uses_large_contiguous_slabs_with_identical_b
     chunks = list(_byte_chunks(prefix, chunk_bytes=4096))
     assert len(chunks) == 2, "one contiguous slab per batch, not one driver readback per head row"
     assert _digest(prefix, chunk_bytes=4096) == _digest(prefix.contiguous(), chunk_bytes=17)
+
+
+@pytest.mark.parametrize("tier", [False, True])
+@pytest.mark.parametrize("frontier", [1, 5, 8])
+def test_short_prefix_omits_unread_window_and_restores_after_poison(tier, frontier):
+    previous = torch.get_num_threads(); torch.set_num_threads(1)
+    try:
+        a = args(); model = a, R.build_oracle(a, 7)
+        control, restored = stage(model, tier=tier), stage(model, tier=tier)
+        c = cache(restored)
+        prefix = list(range(frontier))
+        for value in (control, restored): forward(value, torch.tensor([prefix]), 0)
+        entry = c.capture(identity(), prefix, committed_frontier=frontier, drained=True)
+        for index, layer in enumerate(restored.layers):
+            assert c._entries[entry].buffers[f"main.{index}.kv"].shape[1] == min(frontier, layer.attn.window_size)
+        pointers = {name: value.data_ptr() for name, value in _buffers(restored, None).items()}
+        restored.reset()
+        for layer in restored.layers:
+            # These slots must be overwritten before any native attention read.
+            layer.attn.kv_cache[:, min(frontier, layer.attn.window_size):layer.attn.window_size].fill_(float("nan"))
+        c.commit_restore(c.prepare_restore(identity(), prefix, entry_id=entry))
+        assert pointers == {name: value.data_ptr() for name, value in _buffers(restored, None).items()}
+        for pos in range(frontier, frontier + 12):
+            token = torch.tensor([[pos]])
+            wanted, logits = forward(control, token, pos)
+            got, actual = forward(restored, token, pos)
+            assert torch.equal(wanted, got) and torch.equal(logits, actual)
+    finally:
+        torch.set_num_threads(previous)

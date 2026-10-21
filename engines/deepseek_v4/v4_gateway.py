@@ -95,6 +95,8 @@ class V4RingBackend:
             from v4_tokenizer import load_v4_tokenizer
             tokenizer = load_v4_tokenizer(directory)
         self.tokenizer = tokenizer
+        from v4_text_protocol import V4TextDecoder
+        self._text_decoder = V4TextDecoder(tokenizer)
         eos = tokenizer.eos_token_id
         self.eos_ids = tuple(eos) if isinstance(eos, (tuple, list)) else (() if eos is None else (eos,))
         self._lock = threading.RLock()
@@ -205,6 +207,12 @@ class V4RingBackend:
                 lazy=getattr(self.vp, "V4_LAZY_DRAFT", False))
             detached = deepcopy(config)
             detached["calibration"] = verify_calibration(detached.get("calibration"), options)
+            if "confidence_calibration" in detached:
+                try:
+                    from engines.deepseek_v4.v4_confidence_calibration import verify_calibration as verify_confidence
+                except ModuleNotFoundError:
+                    from v4_confidence_calibration import verify_calibration as verify_confidence
+                detached["confidence_calibration"] = verify_confidence(detached["confidence_calibration"], options)
             checked = RoundPolicy(detached, **options)
             if checked.expires_at <= time.time():
                 raise ValueError("expired round calibration cannot replace the active policy")
@@ -266,7 +274,8 @@ class V4RingBackend:
             raise AdmissionError("stream/thinking must be boolean", status=400, code="invalid_request_error")
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages or any(not isinstance(m, dict)
-                or m.get("role") not in ("system", "user", "assistant") or not isinstance(m.get("content"), str) for m in messages):
+                or set(m) - {"role", "content"} or m.get("role") not in ("system", "user", "assistant")
+                or not isinstance(m.get("content"), str) for m in messages):
             raise AdmissionError("messages require text system/user/assistant entries", status=400, code="invalid_request_error")
         maximum = body.get("max_tokens", body.get("max_completion_tokens", 512))
         if "max_tokens" in body and "max_completion_tokens" in body and body["max_tokens"] != body["max_completion_tokens"]:
@@ -279,6 +288,8 @@ class V4RingBackend:
         if getattr(self, "_native_runner", None) is not None and mode != "greedy":
             raise AdmissionError("native tokenwise cohort only supports greedy lanes", status=400, code="unsupported_feature")
         effort = body.get("reasoning_effort")
+        if effort is not None and effort not in ("low", "high", "max"):
+            raise AdmissionError("reasoning_effort must be low, high or max", status=400, code="unsupported_feature")
         ids = (list(prompt_ids) if prompt_ids is not None else self.vp._encode_prompt(self.tokenizer,
             {"messages": messages, "thinking": bool(body.get("thinking", False)), "reasoningEffort": effort}))
         if not isinstance(ids, list) or not ids or any(type(token) is not int or token < 0 for token in ids):
@@ -290,8 +301,7 @@ class V4RingBackend:
             raise AdmissionError("timeout_s must be finite in (0,3600]", status=400, code="invalid_request_error")
         payload = {"prompt_ids": ids, "mode": mode, "max_new": maximum}
         if getattr(self, "_native_runner", None) is not None:
-            from v4_native_lanes import CONTRACT
-            payload["numerical_contract"] = CONTRACT
+            payload["numerical_contract"] = self._native_runner.contract["numerical_contract"]
         if self._policy is not None:
             payload["policy_allowed"] = "shard_mode" not in body
             if payload["policy_allowed"] and len(ids) + maximum + 64 > self.max_context:
@@ -299,7 +309,10 @@ class V4RingBackend:
         return payload, len(ids), maximum, timeout_s
 
     def decode(self, tokens):
-        return self.tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        return self._text_decoder.decode_prefix(tokens, final=True)
+
+    def decode_stream_prefix(self, tokens, *, final=False):
+        return self._text_decoder.decode_prefix(tokens, final=final)
 
     def _close_channels(self, owner=None):
         with self._lock:

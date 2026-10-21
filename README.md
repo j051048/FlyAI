@@ -4,7 +4,7 @@
 
 ## 当前版本（中文）
 
-文档核对日期：**2026-10-11**；当前工作区增加缓存恢复证明核对、可选持久作业日志、SLO/风险规划及短请求 aging 调度。配置与验收见 [服务加固指南](docs/V4_SERVICE_HARDENING.md)。
+文档核对日期：**2026-10-21**；当前版本新增设备驻留小批执行、原始时间线、校准置信预算、精确缓存与质量工具。本轮修正B4 CPU数值偏差，新增独立partial批图分桶，默认关闭且GPU资格待验。配置与真机门槛见 [本轮改造](docs/V4_DEEPINFER_IMPROVEMENTS.md)。
 FlyAI 基于 Shard 的分布式推理框架演进。上游项目为 [leyten/shard](https://github.com/leyten/shard)，
 其 c0mpute 集成背景和历史实验保留在仓库记录中。
 
@@ -26,11 +26,11 @@ GPU 身份、共享 RAM／锁页预算和实际链路决定放置。节点注册
 | V4 状态优化 | 请求边界选择校准投机配方、签名全环恢复、保序专家预填充 DMA 流水 | 默认关闭；完全相同前缀可复用，扩展前缀每请求完整参考预填充验证；GPU 收益待实测 |
 | V4 多卡执行 | 显式共享配方、实际图覆盖、数值/回滚诊断、原生内核探针、strict 宿主分组与有界接收缓冲 | 保留逐 GPU 身份和共享预算；四策略及故障矩阵已接入，GPU/速度资格待验，见 [多卡指南](docs/V4_MULTIGPU_EXECUTION.md) |
 | 5090 真机验收 | whole/eager 回滚状态、同机多卡、四模式短/长矩阵、持续 soak、原始证据归档 | [OpenClaw 操作步骤和验收入口](docs/V4_5090_ACCEPTANCE.md)；本地回归通过，真机资格待验 |
-| 多环与恢复 | 多环并行、私有 SQLite 日志/owner fencing、原请求重放、SSE 游标、aging 与成本路由 | V4 可另选独立 tokenwise greedy cohort 的 2–4 请求时间片；不是多请求 GEMM 或分布式 HA，GPU 收益待验 |
+| 多环与恢复 | 多环并行、私有 SQLite 日志/owner fencing、原请求重放、SSE 游标、aging 与成本路由 | 原scalar lanes保留；独立`/2` greedy批合同、逐请求固定算形与可选partial图，非融合GEMM；GPU/FP4收益待验，无分布式HA |
 | 回放质量 | 本机固定验证者的鲜活签名复算报告、按节点/cohort 限制新组环 | 不接受节点自报质量分，也不是硬件 attestation 或模型密码学证明 |
 | 收据 | 实际激活字节承诺、签名、nonce、层覆盖和相邻链核对 | 收据不是完整模型诚实计算的密码学证明；计算节点可见其处理的激活 |
 
-本轮六项多卡 P0–P2 的 **123 个相关测试文件**完成组合回归：**2081 通过、11 项环境条件跳过**，80 项 GPU 标记用例未选入。
+2026-10-12 六项多卡 P0–P2 的历史 **123 个相关测试文件**组合回归：**2081 通过、11 项环境条件跳过**，80 项 GPU 标记用例未选入。2026-10-21 冻结源码的137文件相关回归为 **2333通过、11跳过、92项GPU未运行**；详情见[改造记录](docs/V4_DEEPINFER_IMPROVEMENTS.md)。
 覆盖真实原生 CPU 数学、strict socket、HTTP、SQLite、状态恢复及校准/经济证据；不代表 GPU 速度或全仓跨平台 CI。
 完整 Windows 全仓尝试包含既有编码、POSIX 与模拟计时失败；代表用例已与 `070ccd6` 基线对照，不能将相关组合结果登记为全仓通过。
 上一构建的组合回归为 1813 通过、8 项跳过、66 项 GPU 未选入。
@@ -53,6 +53,7 @@ P0–P2 的相关组合回归已完成；真实 MXFP4 GPU 执行及 V4 四卡／
 * P0–P2 执行改造、投机校准热装、原生独立请求、增长前缀与健康环重组：[V4_PERFORMANCE_EXECUTION](docs/V4_PERFORMANCE_EXECUTION.md)。
 * 小磁盘节点、流式分片与请求边界换环：[WEIGHT_PREPARATION](docs/WEIGHT_PREPARATION.md)。
 * V4 固定速度线与原始证据：[V4_BENCHMARK](docs/V4_BENCHMARK.md)。
+* B4数值修正、独立partial批图与scalar/eager/graph真机对照：[V4_BATCH_GRAPH_ACCEPTANCE](docs/V4_BATCH_GRAPH_ACCEPTANCE.md)。
 * 全部当前规范、研究与历史记录：[DOCUMENTATION_INDEX](docs/DOCUMENTATION_INDEX.md)。
 
 完整仓库中的生产服务入口是：
@@ -119,9 +120,13 @@ multi-ring queues, request cancellation and original-prompt replay with prefix c
 serial worker; separate rings execute concurrently. Optional private SQLite journals retain original requests
 and committed prefixes for owner-fenced, same-cohort replay. This is not distributed coordinator HA.
 Token-step scheduling is opt-in and requires an explicit backend contract. The distinct V4 native
-tokenwise greedy cohort now supports 2–4 independent scalar state lanes, growing-prefix reuse and
-strict per-job receipts. It is not grouped multi-request GEMM, and CUDA performance remains pending.
-Existing V4/GPT-OSS modes still reject token batching. See [execution changes](docs/V4_PERFORMANCE_EXECUTION.md).
+tokenwise greedy cohort retains scalar state lanes and growing-prefix reuse. A new independent native
+batch cohort runs 2–4 resident request states through actual equal-frontier batch forwards with bounded
+socket pipelining and per-job receipts. The `/2` request-row math fixes the frozen B4 CPU
+trajectory at zero tolerance. Optional partial attention/dense graphs use request-size/context buckets;
+MoE and exact-width Indexer remain eager. This is not fused grouped GEMM or scalar whole capture.
+Actual CUDA/FP4 correctness and performance remain pending; batching and its graphs default off.
+See [current implementation and acceptance](docs/V4_DEEPINFER_IMPROVEMENTS.md).
 Receipts bind signed activation commitments, job freshness and layer coverage; they do not
 constitute a cryptographic proof of honest model execution or conceal activations from computing nodes.
 

@@ -507,7 +507,8 @@ def placement_requirements_for_stage(stage, calibration=None, checkpoint_dir=Non
     buffers = transport_buffer_reservation()
     if requirements.host.peak_bytes < report["module_storage"]["host_bytes"] + cache["remaining_host_reserved_bytes"] + native_remaining + buffers["host_reserved_bytes"]:
         raise ResourceError("calibration budget is below actual host tensor storage")
-    if requirements.gpu.peak_bytes < observed + cache["restore_gpu_reserved_bytes"]:
+    graph_remaining = (native or {}).get("remaining_device_reserved_bytes", 0)
+    if requirements.gpu.peak_bytes < observed + cache["restore_gpu_reserved_bytes"] + graph_remaining:
         raise ResourceError("calibration GPU budget omits the declared conversation restore reserve")
     if requirements.host.pinned_bytes < report["module_storage"]["host_pinned_bytes"] + buffers["pinned_reserved_bytes"]:
         raise ResourceError("calibration budget is below actual pinned host tensor storage")
@@ -609,8 +610,19 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
     host_bytes = sum(entry["storage_bytes"] for entry in entries if entry["device"] == "cpu")
     # Tensor inventory already includes the preallocated slots. Account for the
     # bounded Python/identity state as a separate host reservation as well.
-    lane_metadata_reserve = (lanes.metadata_bytes * lanes.max_jobs + lanes.restore_workspace_bytes
+    lane_host_storages = {}
+    if lanes is not None:
+        for _, tensor in lanes.tensors():
+            if tensor.device.type == "cpu":
+                storage = tensor.untyped_storage()
+                lane_host_storages[(storage.data_ptr(), storage.nbytes())] = storage.nbytes()
+    # Reference mode also reserves graph capacity in host memory. Charge the
+    # unallocated part, while avoiding a second charge for inventoried tensors.
+    lane_metadata_reserve = (max(0, lanes.reserved_bytes - sum(lane_host_storages.values()))
                              if lanes is not None else 0)
+    graph_pool = getattr(lanes, "graph_pool", None)
+    graph_remaining = max(0, getattr(lanes, "graph_bytes", 0) -
+                          (graph_pool.accounted_device_bytes if graph_pool is not None else 0))
     from v4_conversation_protocol import cache_config
     declared_cache = cache_config(stage)
     cached_host = sum(entry["storage_bytes"] for entry in entries
@@ -657,6 +669,8 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
             "conversation_cache_reservation": conversation_reserve,
             "transport_buffer_reservation": socket_reservation,
             "native_lane_reservation": {"host_reserved_bytes": lanes.reserved_bytes if lanes else 0,
+                                        "device_reserved_bytes": getattr(lanes, "device_reserved_bytes", 0),
+                                        "remaining_device_reserved_bytes": graph_remaining,
                                         "remaining_host_reserved_bytes": lane_metadata_reserve},
             "prefill_expert_pipeline": stage.prefill_pipeline_status() if hasattr(stage, "prefill_pipeline_status") else None,
             "allocator": allocator,

@@ -44,6 +44,7 @@ def service_options(plan, node_configs, lease_fences, *, depth, floor, lazy):
     binding = {"capabilities": checked.binding(), "source_sha256": digest(source_inventory()), "lazy": lazy,
         "runtime_config_sha256_by_node": {node: digest(cfg) for node, cfg in sorted(node_configs.items())},
         "checkpoint_config_sha256": plan["model_cohort"]["config_sha256"],
+        "model_cohort": deepcopy(plan["model_cohort"]),
         "stages": [{key: row[key] for key in ("node_id", "gpu_uuid", "signer_pubkey", "lo", "hi")}
                    for row in plan["stages"]]}
     return {"binding": binding, "loaded_block_size": checked.binding()["loaded_block_size"],
@@ -81,7 +82,7 @@ class RoundPolicy:
             raise ValueError("round speculation requires an object")
         allowed = {"enabled", "mode", "calibration", "ema_alpha", "min_gain",
                    "min_hold_windows", "sample_ttl_s", "max_records",
-                   "max_dma_bytes_per_committed_token"}
+                   "max_dma_bytes_per_committed_token", "confidence_calibration"}
         if set(config) - allowed or config.get("enabled") is not True:
             raise ValueError("unknown round speculation options or missing enabled=true")
         self.mode = config.get("mode", "shadow")
@@ -143,6 +144,15 @@ class RoundPolicy:
             raise ValueError("round calibration must include the unchanged baseline")
         self.calibration_sha256 = digest(calibration)
         self.config_sha256 = digest(config)
+        self._confidence = None
+        if "confidence_calibration" in config:
+            try:
+                from engines.deepseek_v4.v4_confidence_calibration import ConfidenceBudget
+            except ModuleNotFoundError:  # copied flat engine on a worker
+                from v4_confidence_calibration import ConfidenceBudget
+            self._confidence = ConfidenceBudget(config["confidence_calibration"],
+                binding_sha256=self.binding_sha256, baseline=self.baseline, mode=self.mode,
+                wall_clock=wall_clock, dma_limit=self.dma_limit, min_gain=self.min_gain)
         self._runtime = {}
         self._records = deque(maxlen=self.max_records)
         self._window = None
@@ -181,6 +191,11 @@ class RoundPolicy:
             return
         self._cost_bytes += value
 
+    def bind_request(self, prompt_ids, max_new):
+        """Match actual tokens against the frozen measured workload, before reset."""
+        if self._confidence is not None:
+            self._confidence.bind_request(prompt_ids, max_new)
+
     def _close(self, committed, now, *, truncated=False):
         if self._window is None:
             return
@@ -218,7 +233,7 @@ class RoundPolicy:
             return None
         return row["rate"]
 
-    def refill(self, *, committed_tokens, available_drafts):
+    def refill(self, *, committed_tokens, available_drafts, raw_conf=None):
         if self._finished:
             raise ValueError("round controller has already completed")
         committed = _integer(committed_tokens, "actual committed count", 0)
@@ -231,7 +246,14 @@ class RoundPolicy:
         self._cost_complete = True
         valid = self.created_at <= self.wall_clock() < self.expires_at
         reason = "calibration_expired"
-        if valid:
+        if valid and self._confidence is not None:
+            selected = self._confidence.select(raw_conf, available)
+            if selected != self._selected:
+                self._switches += 1
+                self._last_switch = self._windows
+            self._selected = selected
+            reason = self._confidence.records[-1]["reason"]
+        elif valid:
             scored = [(self._score(cap, now), cap) for cap in self.profiles]
             scored = [(score, cap) for score, cap in scored if score is not None]
             if scored:
@@ -270,4 +292,5 @@ class RoundPolicy:
             "baseline_cap": self.baseline, "loaded_block_size": self.block_size,
             "windows": self._windows, "switches": self._switches,
             "measurement_scope": "local_coordinator_observation_not_execution_proof",
-            "expert_cost_missing_is_zero": False, "records": deepcopy(list(self._records))}
+            "expert_cost_missing_is_zero": False, "records": deepcopy(list(self._records)),
+            **({"confidence": self._confidence.report()} if self._confidence is not None else {})}

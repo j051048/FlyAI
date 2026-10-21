@@ -124,6 +124,7 @@ except ImportError:
 V4_RUNTIME_METRICS = os.environ.get("V4_RUNTIME_METRICS", "0") not in ("", "0")
 V4_PROFILE_RUNTIME = os.environ.get("V4_PROFILE_RUNTIME", "0") not in ("", "0")
 V4_PROFILE_GPU_EVERY = int(os.environ.get("V4_PROFILE_GPU_EVERY", "16"))
+V4_PROFILE_TIMELINE = int(os.environ.get("V4_PROFILE_TIMELINE", "0"))
 V4_EXPERT_PREFETCH = os.environ.get("V4_EXPERT_PREFETCH", "0") not in ("", "0")
 V4_EXPERT_PREFETCH_SLOTS = int(os.environ.get("V4_EXPERT_PREFETCH_SLOTS", "2"))
 V4_EXPERT_PREFETCH_WARMUP = int(os.environ.get("V4_EXPERT_PREFETCH_WARMUP", "2"))
@@ -982,7 +983,8 @@ class Stage:
                 from runtime_profile import RuntimeProfiler
             except ImportError:
                 from shard.runtime_profile import RuntimeProfiler
-            self._runtime_profile = RuntimeProfiler(gpu_sample_every=V4_PROFILE_GPU_EVERY)
+            self._runtime_profile = RuntimeProfiler(gpu_sample_every=V4_PROFILE_GPU_EVERY,
+                                                    timeline_capacity=V4_PROFILE_TIMELINE)
         else:
             self._runtime_profile = None
         self._expert_prefetch = V4_EXPERT_PREFETCH if expert_prefetch is None else bool(expert_prefetch)
@@ -1578,8 +1580,9 @@ class Stage:
                     hybrid.prefetch_for_attention()
             profiler = getattr(self, "_runtime_profile", None)
             name = f"main.{phase}.layer"
-            with (profiler.host(name + ".host") if profiler else nullcontext()):
-                with (profiler.gpu(name + ".gpu", torch, self.device) if profiler else nullcontext()):
+            with (profiler.host(name + ".host", timeline_name=f"{name}.{li}.host") if profiler else nullcontext()):
+                with (profiler.gpu(name + ".gpu", torch, self.device,
+                                   timeline_name=f"{name}.{li}.gpu") if profiler else nullcontext()):
                     with (self._kv_runtime.layer(L.attn, start_pos, h.shape[1], h.shape[0])
                           if self._kv_runtime is not None else nullcontext()):
                         if twin:

@@ -126,9 +126,29 @@ def validate_runtime_observation(value):
     if "optimizations" in value:
         optimizations = value["optimizations"]
         if (not isinstance(optimizations, dict) or not {"prefill_expert_pipeline", "conversation_cache"} <= set(optimizations)
-                or set(optimizations) - {"prefill_expert_pipeline", "conversation_cache", "execution_profile", "socket_buffers"}):
+                or set(optimizations) - {"prefill_expert_pipeline", "conversation_cache", "execution_profile", "socket_buffers", "native_batch"}):
             raise ValueError("unknown runtime optimization observations")
         if any(not isinstance(item, dict) for item in optimizations.values()) or len(json.dumps(optimizations, allow_nan=False)) > 65536:
             raise ValueError("bounded JSON runtime optimization observations required")
+        native = optimizations.get("native_batch")
+        if native is not None:
+            if (set(native) != {"schema", "numerical_contract", "scope", "config", "counters", "graphs"}
+                    or native["schema"] != "v4-native-batch-observation/1"
+                    or native["scope"] != "stage_lifetime_not_per_job"
+                    or native["numerical_contract"] != "v4-native-small-batch-greedy/2"
+                    or any(not isinstance(native[k], dict) for k in ("config", "counters", "graphs"))
+                    or native["config"].get("numerical_contract") != native["numerical_contract"]
+                    or native["config"].get("graph_qualified") is not False
+                    or native["graphs"].get("graph_qualified") is not False):
+                raise ValueError("invalid native batch observation scope/contract")
+            for key in ("captured_graphs", "replays"):
+                count = native["graphs"].get(key)
+                if type(count) is not int or count < 0:
+                    raise ValueError("invalid native CUDA graph execution counts")
+                if value["gpu_uuid"] is None and count:
+                    raise ValueError("CPU reference cannot claim CUDA batch graph execution")
+            if native["config"].get("reference") is True and (
+                    native["graphs"]["captured_graphs"] or native["graphs"]["replays"]):
+                raise ValueError("reference batch cannot claim CUDA graph execution")
     json.dumps(value, allow_nan=False)
     return deepcopy(value)

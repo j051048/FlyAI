@@ -2072,9 +2072,9 @@ def test_dspark_confidence_gate_is_lossless_and_adapts_send_length(tiny):
     assert max(trim["send_hist"], default=0) <= 1 and trim["sent"] == trim["drafted"]
     # and nothing clears -inf from below, so the whole-block run offered strictly more than the trim
     assert whole["sent"] > trim["sent"], f"the gate did not vary send-length: {whole['sent']} vs {trim['sent']}"
-    # the probe saw every drafted round's FULL block confidence and its accept count
+    # The probe only saw offered candidates; unsent futures are censored.
     assert probe and len(probe) == trim["drafted"]
-    assert all(clen == args.dspark_block_size and 0 <= n <= clen for clen, n in probe)
+    assert all(clen == 1 and 0 <= n <= clen for clen, n in probe)
 
 
 def test_a_second_dspark_job_on_a_warm_ring_is_a_cold_rings_answer(tiny):

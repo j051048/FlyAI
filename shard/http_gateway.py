@@ -321,10 +321,16 @@ class Handler(BaseHTTPRequestHandler):
     def _job_model(self, job):
         return getattr(job, "served_model", self.gateway.backend.model_id)
 
-    def _job_decode(self, job, tokens):
+    def _job_decode(self, job, tokens, *, streaming=False, final=False):
         backend = getattr(job, "bound_backend", self.gateway.backend)
         if not callable(getattr(backend, "decode", None)):
             raise ValueError("the original cohort tokenizer is unavailable")
+        if streaming:
+            decode_prefix = getattr(backend, "decode_stream_prefix", None)
+            if callable(decode_prefix):
+                return decode_prefix(tokens, final=final)
+            text = backend.decode(tokens)
+            return text if final else text.rstrip("\ufffd")
         return backend.decode(tokens)
 
     def _stream(self, job):
@@ -370,7 +376,7 @@ class Handler(BaseHTTPRequestHandler):
                 tokens, state, result, error, error_code = (list(job.tokens), job.state,
                     job.result, job.error, job.error_code)
             terminal = state in ("completed", "failed", "cancelled", "expired")
-            text = self._job_decode(job, tokens).rstrip("\ufffd") if not terminal else self._job_decode(job, tokens)
+            text = self._job_decode(job, tokens, streaming=True, final=terminal)
             if not text.startswith(published):
                 self._sse({"error": {"code": "non_append_only_decode", "message": "tokenizer revised a published prefix"}}, len(tokens), job)
                 self._sse("[DONE]")

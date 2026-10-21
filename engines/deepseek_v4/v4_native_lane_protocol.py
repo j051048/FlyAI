@@ -44,7 +44,9 @@ def handle(st, message, *, stage_index, session, signer_key, vp, owner_grant=Non
     request = _verify(session.plan["coordinator"]["signer_pubkey"], DOMAIN, message["request"])
     fields = {"schema", "contract", "action", "request_id", "job", "identity_sha256",
               "owner_epoch", "cohort_id", "horizon", "parameters"}
-    if set(request) != fields or request["schema"] != SCHEMA or request["contract"] != CONTRACT:
+    runner = getattr(st, "_native_lanes", None)
+    contract = getattr(runner, "contract", CONTRACT)
+    if set(request) != fields or request["schema"] != SCHEMA or request["contract"] != contract:
         raise ValueError("invalid native lane request contract")
     if message.get("op") == "reset":
         if message.get("native_lane_open") is not True or request["action"] != "open":
@@ -57,7 +59,6 @@ def handle(st, message, *, stage_index, session, signer_key, vp, owner_grant=Non
     if (not isinstance(request["request_id"], str) or len(request["request_id"]) != 32
             or not isinstance(request["parameters"], dict)):
         raise ValueError("invalid native lane transaction")
-    runner = getattr(st, "_native_lanes", None)
     if runner is None:
         raise ValueError("node was not calibrated with native lanes")
     if (not owner_grant or request["owner_epoch"] !=
@@ -132,6 +133,9 @@ def handle(st, message, *, stage_index, session, signer_key, vp, owner_grant=Non
                       "runtime_binding_sha256": st._native_runtime_binding,
                       "restore_seconds": time.perf_counter() - started if cached else None,
                       "capability": runner.config()}
+        elif action == "batch_step":
+            message, result = _batch_step(st, message, request, runner, contexts,
+                                         session=session, vp=vp)
         elif action == "close" and key not in contexts:
             # Cleanup is idempotent after a partially successful open barrier.
             result = {"released": True, "cache": None}
@@ -191,6 +195,83 @@ def handle(st, message, *, stage_index, session, signer_key, vp, owner_grant=Non
         result, ok = {"error": str(error)[:256]}, False
     ack = {"schema": SCHEMA, "request_id": request["request_id"], "request_sha256": hashlib.sha256(canonical(request)).hexdigest(),
            "job": job, "stage": stage_index, "pubkey": pub_b64(signer_key), "ok": ok,
-           "contract": CONTRACT, "result": result}
+           "contract": contract, "result": result}
     message.setdefault("acks", []).append(_sign(signer_key, ACK_DOMAIN, ack))
     return message
+
+
+def _batch_step(st, message, outer, runner, contexts, *, session, vp):
+    """Authenticate every row before a real request-axis native forward.
+
+    The enclosing signed barrier binds the row order. Each row keeps its own
+    token/hash input, nonce, signer and receipt chain across the native batch.
+    """
+    params = outer["parameters"]
+    if (not hasattr(runner, "forward_batch") or set(params) != {"steps"}
+            or not isinstance(params["steps"], list) or not 1 <= len(params["steps"]) <= runner.max_jobs):
+        raise ValueError("native batch requires an explicitly calibrated bounded batch runner")
+    requests = [_verify(session.plan["coordinator"]["signer_pubkey"], DOMAIN, signed)
+                for signed in params["steps"]]
+    shared = {"schema", "contract", "identity_sha256", "owner_epoch", "cohort_id", "horizon"}
+    # Identity differs between tenants. All other envelope bindings must agree.
+    shared.remove("identity_sha256")
+    seen, rows, pos, capture_graph = set(), [], None, None
+    for request in requests:
+        if (set(request) != set(outer) or any(request.get(k) != outer[k] for k in shared)
+                or request.get("action") != "step" or not isinstance(request.get("request_id"), str)
+                or len(request["request_id"]) != 32
+                or set(request.get("parameters", {})) != {"pos", "token", "capture_graph"}):
+            raise ValueError("native batch row contract/owner changed")
+        job = _job(request["job"])
+        key = job["job_id"]
+        ctx = contexts.get(key)
+        value = request["parameters"]
+        if (key in seen or ctx is None or ctx["job"] != job or ctx["identity"] != request["identity_sha256"]
+                or ctx["receipted"] or type(value["pos"]) is not int
+                or type(value["token"]) is not int or not 0 <= value["token"] < st.args.vocab_size
+                or type(value["capture_graph"]) is not bool):
+            raise ValueError("native batch row does not own its live token frontier")
+        if pos is None:
+            pos = value["pos"]
+            capture_graph = value["capture_graph"]
+        if value["capture_graph"] != capture_graph:
+            raise ValueError("native batch graph admission must agree within the authenticated cohort")
+        if value["pos"] != pos or key not in runner.active or runner.active[key]["pos"] != pos:
+            raise ValueError("native batch requires equal independent frontiers")
+        seen.add(key)
+        rows.append((key, ctx, value["token"]))
+    if outer["job"] != requests[0]["job"] or outer["identity_sha256"] != requests[0]["identity_sha256"]:
+        raise ValueError("native batch enclosing job differs from its first authenticated row")
+    frames = message.get("batch_frames")
+    if not st.head and (not isinstance(frames, list) or len(frames) != len(rows)):
+        raise ValueError("native batch payload omits request rows")
+    ids = torch.tensor([[token] for _, _, token in rows], dtype=torch.long, device=st.device)
+    incoming, payloads = [], []
+    if st.head:
+        h = st.embed(ids)
+        incoming = [vp._payload_bytes(h[i:i + 1], ids[i:i + 1]) for i in range(len(rows))]
+    else:
+        for index, (_, ctx, _) in enumerate(rows):
+            hrow, received, raw = vp._recv_hids(frames[index], ctx["signer"], device=st.device)
+            if received.shape != ids[index:index + 1].shape or not torch.equal(received.to(ids.device), ids[index:index + 1]):
+                raise ValueError("native batch token/hash row changed between authenticated stages")
+            payloads.append(hrow)
+            incoming.append(raw)
+        h = torch.cat(payloads, dim=0)
+    with torch.no_grad():
+        h = runner.forward_batch([key for key, _, _ in rows], h, ids, pos, capture_graph=capture_graph)
+        predictions = runner.logits_all(h, full_logits=False).reshape(len(rows), -1).argmax(-1).tolist() if st.tail else None
+    outgoing_frames, results = [], []
+    for index, (key, ctx, _) in enumerate(rows):
+        frame, outgoing = vp._make_step_frame(h[index:index + 1], ids[index:index + 1], pos, ctx["signer"])
+        ctx["signer"].observe(incoming[index], outgoing)
+        outgoing_frames.append(frame)
+        result = {"job": ctx["job"], "pos": pos + 1}
+        if st.tail:
+            result["token"] = int(predictions[index])
+        results.append(result)
+    if not st.tail:
+        message = {"op": "native_lane", "request": message["request"],
+                   "acks": message.get("acks", []), "batch_frames": outgoing_frames}
+    return message, {"steps": results, "actual_batch_size": len(rows),
+                     "compute": "native_equal_frontier_batch", "graph_capture_allowed": capture_graph}

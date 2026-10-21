@@ -47,7 +47,8 @@ def explain(report, protocol):
             rows.append({"node_id": observation["node_id"], "layers": [receipt["layer_start"], receipt["layer_end"]],
                          "job_id": receipt["job_id"], "workload": sample.get("workload"), "rep": sample.get("rep"),
                          "gpu_sample_every": profile["gpu_sample_every"], "dropped_gpu_samples": profile["dropped_gpu_samples"],
-                         "phases": profile["phases"], "receipt_sha256": B.digest(receipt)})
+                         "phases": profile["phases"], "receipt_sha256": B.digest(receipt),
+                         **({"timeline": profile["timeline"]} if "timeline" in profile else {})})
     return {"schema": "flyai-v4-profile-diagnosis/1", "protocol_sha256": protocol["sha256"],
             "report_sha256": B.digest(report), "benchmark_verdict": B.evaluate_report(report, protocol),
             "status": "diagnostic_only" if rows else "unverified", "stage_profiles": rows, "missing_profiles": missing,
@@ -58,15 +59,43 @@ def explain(report, protocol):
                 "cpu_fraction": None, "speed_acceptance": "independent benchmark verdict only; this report does not qualify a release"}}
 
 
+def chrome_trace(diagnosis):
+    """Perfetto/Chrome events; every receipt/clock/stream is an independent lane.
+
+    CUDA epochs measure device events. Aligning them to host submission times
+    would invent an enqueue/execute correlation which CUDA events do not give.
+    """
+    events = []
+    for row in diagnosis["stage_profiles"]:
+        timeline = row.get("timeline")
+        if timeline is None:
+            continue
+        from shard.runtime_profile import validate_timeline
+        validate_timeline(timeline)
+        for span in timeline["spans"]:
+            # Do not combine even two jobs from the same stage: reset restarts
+            # the local origin. The receipt hash binds the exact epoch.
+            pid = f"{row['node_id']}:{row['receipt_sha256']}:{span['clock']}"
+            events.append({"name": span["name"], "cat": span["clock"], "ph": "X", "pid": pid,
+                "tid": span["track"], "ts": span["start_ms"] * 1000, "dur": span["duration_ms"] * 1000,
+                "args": {"job_id": row["job_id"], "receipt_sha256": row["receipt_sha256"]}})
+    return {"traceEvents": events, "displayTimeUnit": "ms", "metadata": {
+        "protocol_sha256": diagnosis["protocol_sha256"], "report_sha256": diagnosis["report_sha256"],
+        "scope": "Independent local clock domains; not a synchronized distributed critical path or CPU utilization"}}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", required=True)
     parser.add_argument("--protocol", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--trace-out", help="Optional Perfetto/Chrome JSON; clock domains stay separate")
     args = parser.parse_args(argv)
     result = explain(json.loads(Path(args.report).read_text(encoding="utf-8")),
                      json.loads(Path(args.protocol).read_text(encoding="utf-8")))
     Path(args.out).write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
+    if args.trace_out:
+        Path(args.trace_out).write_text(json.dumps(chrome_trace(result), allow_nan=False), encoding="utf-8")
     print(json.dumps({"status": result["status"], "profiles": len(result["stage_profiles"]),
                       "missing_profiles": len(result["missing_profiles"])}))
     return 0

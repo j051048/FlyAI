@@ -19,6 +19,7 @@ import v4_stage as V
 import v4_pipe as VP
 from v4_gateway import V4RingBackend
 from v4_native_lanes import CONTRACT
+from v4_native_batch import BATCH_CONTRACT
 from v4_resources import runtime_config_payload
 from shard.offers import ModelCohort
 from shard.pipeline_plan import build_plan
@@ -38,6 +39,17 @@ def ring(tmp_path, monkeypatch, request):
     old_threads = torch.get_num_threads(); torch.set_num_threads(1)
     monkeypatch.setenv("V4_NATIVE_LANES", "2")
     monkeypatch.setenv("V4_NATIVE_LANE_HOST_MIB", "32")
+    batch_mode = getattr(request, "param", None) in ("batch", "batch_graph")
+    numerical_contract = BATCH_CONTRACT if batch_mode else CONTRACT
+    if batch_mode:
+        monkeypatch.setenv("V4_NATIVE_BATCH", "1")
+        monkeypatch.setenv("V4_NATIVE_BATCH_REFERENCE", "1")
+        monkeypatch.setenv("V4_NATIVE_LANE_DEVICE_MIB", "32")
+        monkeypatch.setenv("V4_NATIVE_PREFILL_QUANTUM", "8")
+        if getattr(request, "param", None) == "batch_graph":
+            monkeypatch.setenv("V4_NATIVE_BATCH_GRAPH", "partial")
+            monkeypatch.setenv("V4_NATIVE_BATCH_GRAPH_MIB", "16")
+            monkeypatch.setenv("V4_NATIVE_BATCH_GRAPH_LIMIT", "32")
     if getattr(request, "param", None) == "durable":
         import v4_native_lanes as native
         # Each production stage owns its private configured path. Threads in
@@ -63,7 +75,7 @@ def ring(tmp_path, monkeypatch, request):
     catalog, pack = ART.catalogue_directory(tmp_path, VP.V4_MODEL_ID, source={"fixture": "native CPU tokenwise"})
     ART.write_metadata(tmp_path, catalog, pack)
     cohort = ModelCohort(catalog["model_id"], catalog["manifest_sha256"], catalog["checkpoint_id"],
-        catalog["config_sha256"], "cpu-bf16-test", catalog["runtime_abi"], "shard-pipeline-session/1", CONTRACT, 4)
+        catalog["config_sha256"], "cpu-bf16-test", catalog["runtime_abi"], "shard-pipeline-session/1", numerical_contract, 4)
     # Keep actual hash/coverage verification. Only the production 43-layer/FP4
     # dimensional check is inapplicable to this tiny native mathematical test.
     verify = VP.verify_cohort_directory
@@ -101,7 +113,7 @@ def ring(tmp_path, monkeypatch, request):
         mode="greedy", vp=VP, tokenizer=TinyTokenizer(), timeout=8, max_context=64,
         swarm_id=plan["ring_id"], pipeline_plan=plan, coordinator_key=keys[2],
         calibrated_runtime_configs=configs, lease_fences=leases,
-        native_lanes={"enabled": True, "numerical_contract": CONTRACT})
+        native_lanes={"enabled": True, "numerical_contract": numerical_contract})
     # Preserve the oracle's exact native layers/weights for tokenwise controls.
     baseline = V.Stage(0, 4, args, head=True, tail=True, device="cpu").load(tmp_path)
     try:

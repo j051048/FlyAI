@@ -3,7 +3,9 @@
 The shared HTTP implementation is `shard/http_gateway.py`; the V4 backend lives in
 `engines/deepseek_v4/v4_gateway.py`. It exposes an existing V4 ring as a bounded text-chat service.
 It directly calls the current greedy, serial DSpark and pipelined DSpark coordinators. It does
-not launch/rent GPU nodes, download models, provide continuous batching or claim durable HA.
+not launch/rent GPU nodes, download models or claim durable HA. Legacy modes remain serial;
+the opt-in native batch cohort has its own state, numerical and warmup contracts, described in
+[V4_DEVICE_BATCHING](V4_DEVICE_BATCHING.md).
 The single-ring dispatcher owns one ring. `--ring-pool` now runs one serial worker
 per verified leased ring, sharing tenant quotas and idempotency across the pool.
 The complete open-contribution workflow, renewal ownership and rolling-version

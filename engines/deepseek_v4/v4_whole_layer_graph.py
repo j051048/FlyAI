@@ -199,7 +199,7 @@ class _Ref:
 
 # ── the capture-safe decode transcription (bit-exact vs Attention.forward, start_pos>0, seqlen==1) ──
 
-def _compressor_decode_cs(R, C, x, pos, compress):
+def _compressor_decode_cs(R, C, x, pos, compress, batch_size=1):
     """Compressor.forward's decode branch, device-indexed. `compress` is should_compress (host-known).
 
     Line for line against model.py Compressor.forward (start_pos>0): the only changes are the four
@@ -221,8 +221,8 @@ def _compressor_decode_cs(R, C, x, pos, compress):
     score = score + C.ape.index_select(0, slot_r)
     kv1 = kv.squeeze(1)
     score1 = score.squeeze(1)
-    ks = C.kv_state.narrow(0, 0, 1)
-    ss = C.score_state.narrow(0, 0, 1)
+    ks = C.kv_state.narrow(0, 0, batch_size)
+    ss = C.score_state.narrow(0, 0, batch_size)
     if overlap:
         ks.index_copy_(1, ratio + slot_r, kv1.unsqueeze(1))
         ss.index_copy_(1, ratio + slot_r, score1.unsqueeze(1))
@@ -247,10 +247,11 @@ def _compressor_decode_cs(R, C, x, pos, compress):
         R.fp4_act_quant(kv, R.fp4_block_size, True)
     else:
         R.act_quant(kv[..., :-rd], 64, R.scale_fmt, R.scale_dtype, True)
-    C.kv_cache.narrow(0, 0, 1).index_copy_(1, comp_slot, kv)
+    C.kv_cache.narrow(0, 0, batch_size).index_copy_(1, comp_slot, kv)
 
 
-def _indexer_decode_cs(R, I, x, qr, pos, end_ratio, freqs_row, offset, arange_w, compress, read_w):
+def _indexer_decode_cs(R, I, x, qr, pos, end_ratio, freqs_row, offset, arange_w, compress, read_w,
+                       batch_size=1, native_topk=False):
     """Indexer.forward's decode branch with the GROWING read/topk made fixed-width + masked.
 
     Reference (start_pos>0): scores q against `kv_cache[:, :end_pos//ratio]`, `topk(min(index_topk,
@@ -268,13 +269,18 @@ def _indexer_decode_cs(R, I, x, qr, pos, end_ratio, freqs_row, offset, arange_w,
     R.apply_rotary_emb(q[..., -rd:], freqs_row)
     q = R.rotate_activation(q)
     R.fp4_act_quant(q, R.fp4_block_size, True)
-    _compressor_decode_cs(R, I.compressor, x, pos, compress)
+    _compressor_decode_cs(R, I.compressor, x, pos, compress, batch_size=batch_size)
     weights = I.weights_proj(x) * (I.softmax_scale * I.n_heads ** -0.5)
     # BUCKETED read, not the whole cache: `read_w` is a host-side rung >= this position's end_ratio,
     # fixed for the graph that captured it (see INDEXER_BUCKETS). Columns in [end_ratio, read_w) hold
     # slots this position may not see yet and are masked out below.
-    index_score = torch.einsum("bshd,btd->bsht", q, I.kv_cache.narrow(0, 0, 1).narrow(1, 0, read_w))
+    index_score = torch.einsum("bshd,btd->bsht", q, I.kv_cache.narrow(0, 0, batch_size).narrow(1, 0, read_w))
     index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+    if native_topk:
+        # Native batches key this graph by the EXACT position/read width. Using
+        # the native narrow topk retains its tie and reduction-lane ordering;
+        # padding to a wider bucket would change the original selection.
+        return (index_score.topk(min(index_topk, read_w), dim=-1)[1] + offset).int()
     return select_compress_topk(index_score, end_ratio, index_topk, offset, arange_w)
 
 
@@ -342,7 +348,8 @@ def select_compress_topk(index_score, end_ratio, index_topk, offset, arange_w):
     return torch.where(kept, pick + offset, pick.new_full((), -1)).int()
 
 
-def attn_decode_cs(R, A, x, pos, win_topk, comp_topk, arange_w, compress, read_w):
+def attn_decode_cs(R, A, x, pos, win_topk, comp_topk, arange_w, compress, read_w, batch_size=1,
+                   native_topk=False, indexer_topk=None):
     """Attention.forward's decode branch (start_pos>0, seqlen==1), capture-safe. Bit-exact vs eager.
 
     `x` is the attn_norm output (the reference passes exactly this to wq_a/wkv/compressor/indexer).
@@ -367,19 +374,26 @@ def attn_decode_cs(R, A, x, pos, win_topk, comp_topk, arange_w, compress, read_w
     if ratio:
         end_ratio = (pos + 1) // ratio
         if A.indexer is not None:
-            compress_topk_idxs = _indexer_decode_cs(R, A.indexer, x, qr, pos, end_ratio, freqs_row,
-                                                    win, arange_w, compress, read_w)
+            if indexer_topk is not None:
+                # Native request batches preserve the ORIGINAL narrow-width
+                # scoring/topk outside capture and feed the selected indices.
+                # Its compressor has already advanced exactly once there.
+                compress_topk_idxs = indexer_topk
+            else:
+                compress_topk_idxs = _indexer_decode_cs(R, A.indexer, x, qr, pos, end_ratio, freqs_row,
+                                                        win, arange_w, compress, read_w, batch_size=batch_size,
+                                                        native_topk=native_topk)
         else:
             compress_topk_idxs = comp_topk
         topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
     # decode store + compress, then attend
-    A.kv_cache.narrow(0, 0, 1).index_copy_(1, pos % win, kv)
+    A.kv_cache.narrow(0, 0, batch_size).index_copy_(1, pos % win, kv)
     if ratio:
-        _compressor_decode_cs(R, A.compressor, x, pos, compress)
-    o = R.sparse_attn(q, A.kv_cache.narrow(0, 0, 1), A.attn_sink, topk_idxs, A.softmax_scale)
+        _compressor_decode_cs(R, A.compressor, x, pos, compress, batch_size=batch_size)
+    o = R.sparse_attn(q, A.kv_cache.narrow(0, 0, batch_size), A.attn_sink, topk_idxs, A.softmax_scale)
     R.apply_rotary_emb(o[..., -rd:], freqs_row, True)
     # o
-    o = o.view(1, 1, A.n_local_groups, -1)
+    o = o.view(batch_size, 1, A.n_local_groups, -1)
     wo_a = A.wo_a.weight.view(A.n_local_groups, A.o_lora_rank, -1)
     o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
     return A.wo_b(o.flatten(2))
@@ -544,7 +558,8 @@ def coverage_summary(stage):
 
 # ── a whole decode block, capture-safe, from static buffers ─────────────────────────────────────────
 
-def block_pre_cs(R, L, h, pos, win_topk, comp_topk, arange_w, compress, read_w):
+def block_pre_cs(R, L, h, pos, win_topk, comp_topk, arange_w, compress, read_w, batch_size=1,
+                  native_topk=False, indexer_topk=None):
     """Block.forward up to the MoE input: hc_pre/attn_norm, attention, hc_post, hc_pre/ffn_norm.
 
     Returns (ffn_in, residual, post, comb) -- everything the MoE and the trailing hc_post consume. The
@@ -553,7 +568,8 @@ def block_pre_cs(R, L, h, pos, win_topk, comp_topk, arange_w, compress, read_w):
     residual = h
     x, post, comb = L.hc_pre(h, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base)
     x = L.attn_norm(x)
-    x = attn_decode_cs(R, L.attn, x, pos, win_topk, comp_topk, arange_w, compress, read_w)
+    x = attn_decode_cs(R, L.attn, x, pos, win_topk, comp_topk, arange_w, compress, read_w,
+                       batch_size=batch_size, native_topk=native_topk, indexer_topk=indexer_topk)
     x = L.hc_post(x, residual, post, comb)
     residual = x
     x, post, comb = L.hc_pre(x, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base)

@@ -166,8 +166,13 @@ def stage_observation(node, layers, fallback_ms, *, now, start=None, workload=No
     trace = node.get("stage_trace")
     warning = []
     if trace is not None:
-        if not isinstance(trace, dict) or trace.get("schema") not in ("shard-stage-trace/1", "shard-stage-trace/2"):
+        if not isinstance(trace, dict) or trace.get("schema") not in ("shard-stage-trace/1", "shard-stage-trace/2", "shard-stage-trace/3"):
             raise ValueError("unsupported stage trace schema")
+        from .stage_cost import shape_trace
+        selected_shape = shape_trace(trace, workload, start=start, layers=layers,
+                                     source_sha256=node.get("source_sha256"))
+        if selected_shape is not None:
+            trace, layer_scale, exact_shape = selected_shape
         age = now - timestamp(trace["measured_at"])
         ttl = number(trace["ttl_s"], "trace ttl_s", minimum=1e-9)
         lo, hi = trace["layer_start"], trace["layer_end"]
@@ -190,9 +195,10 @@ def stage_observation(node, layers, fallback_ms, *, now, start=None, workload=No
                     "cohort_id": node.get("cohort_id"), "frame_tokens": frame_tokens,
                     "runtime_config_sha256": node.get("runtime_config_sha256")}
         if frame_tokens > 1:
-            if trace.get("schema") != "shard-stage-trace/2":
+            if trace.get("schema") not in ("shard-stage-trace/2", "shard-stage-trace/3"):
                 raise ValueError("verify chunk needs version-2 bound stage measurement")
-            expected.update(context_tokens=(workload or {}).get("context_tokens"), warmness=(workload or {}).get("warmness"))
+            expected.update(context_tokens=trace.get("context_tokens") if selected_shape is not None else
+                            (workload or {}).get("context_tokens"), warmness=(workload or {}).get("warmness"))
         bound = True
         for key, value in expected.items():
             if value is None or trace.get(key) is None:
@@ -208,16 +214,20 @@ def stage_observation(node, layers, fallback_ms, *, now, start=None, workload=No
         if -30 <= age <= ttl and bound:
             scale = layers / (hi - lo)
             matches = scale == 1 and (start is None or lo == start)
+            if selected_shape is not None:
+                scale, matches = layer_scale, exact_shape
             result = {"service_ms": frame * scale, "queue_ms": queue,
                     "shared_ms": shared * scale, "shared_id": trace.get("shared_resource_id"),
                     "prefill_ms": prefill * scale if prefill is not None else None,
-                    "source": "fresh_stage_trace" if matches else "scaled_stage_trace",
+                    "source": "fresh_stage_trace" if matches else "context_layer_cost_prediction" if selected_shape else "scaled_stage_trace",
                     "uncertainty": [] if matches else [f"{node['id']}: stage trace reused for another block/range"]}
             if collect_quality:
                 result.update(quality=quality, observation_age_s=max(0,age)+quality.get("window_s",0),
                     exact_bound=matches and (workload or {}).get("context_tokens") is not None and
                     trace.get("context_tokens") == workload["context_tokens"] and
                     (workload or {}).get("warmness") is not None and trace.get("warmness") == workload["warmness"])
+            if trace.get("context_tokens") != (workload or {}).get("context_tokens"):
+                result["uncertainty"].append(f"{node['id']}: context bucket differs; no exact context observation")
             return result
         if not -30 <= age <= ttl:
             warning.append(f"{node['id']}: expired stage trace")

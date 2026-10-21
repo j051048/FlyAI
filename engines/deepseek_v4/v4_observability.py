@@ -53,7 +53,7 @@ def source_inventory():
     files += list(vendor.rglob("*.py")) if vendor.is_dir() else []
     for name in ("receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport", "speculation_policy",
                  "execution_proof", "job_journal", "service_queue", "http_gateway", "ring_pool", "ring_router",
-                 "continuous_batch", "node_quality", "locality", "planning_cost", "offers", "control_plane",
+                 "continuous_batch", "node_quality", "locality", "planning_cost", "stage_cost", "offers", "control_plane",
                  "network_service", "plan", "topology", "routing_cost", "ring_economics", "receive_buffers", "host_topology"):
         path = root / "shard" / (name + ".py")
         if path.is_file():
@@ -113,6 +113,12 @@ def runtime_observation(stage, *, session_config=None, phase="loaded"):
         "versions": {"python": platform.python_version(), "torch": str(getattr(torch_module, "__version__", "unknown")),
             "cuda": getattr(getattr(torch_module, "version", None), "cuda", None),
             "tilelang": getattr(tilelang_module, "__version__", None)}, "phase": phase}
+    lanes = getattr(stage, "_native_lanes", None)
+    if lanes is not None and hasattr(lanes, "graph_status"):
+        value["optimizations"]["native_batch"] = {
+            "schema": "v4-native-batch-observation/1", "numerical_contract": lanes.contract,
+            "scope": "stage_lifetime_not_per_job", "config": lanes.config(),
+            "counters": dict(lanes.counters), "graphs": lanes.graph_status()}
     return validate_runtime_observation(value)
 
 

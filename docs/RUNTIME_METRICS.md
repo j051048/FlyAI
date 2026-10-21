@@ -65,6 +65,15 @@ Unmeasured work is not manufactured from a flag being enabled. KV/query policies
 declare exact scope/budgets and executed transfers/chunks; query chunks only bound
 query/index-score scratch, preserving full projection/Compressor/MoE shapes.
 
+`V4_PROFILE_TIMELINE=1..4096` optionally adds `performance.timeline`
+(`shard-runtime-timeline/1`): bounded phase/layer spans with clock, track,
+start/duration milliseconds, capacity and dropped count. Host clocks begin at
+the first host interval; each CUDA stream has its own event epoch. Events resolve
+at the job barrier. Epochs are not synchronized with each other or other nodes.
+Export with `phase0/v4_profile_report.py --trace-out timeline.json`; do not infer
+CPU utilization or distributed overlap by aligning independent lanes. Default
+profile fields remain unchanged when the timeline is disabled.
+
 ## Memory residency
 
 `kv` reports current and observed peak `gpu_bytes`/`host_bytes`. These are backing

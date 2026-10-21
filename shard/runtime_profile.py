@@ -9,6 +9,7 @@ from collections import deque
 from contextlib import contextmanager
 import math
 import re
+import threading
 import time
 
 SCHEMA = "shard-runtime-profile/1"
@@ -17,8 +18,10 @@ _FIELDS = {"count", "total_ms", "min_ms", "max_ms", "p50_ms", "p95_ms", "samples
 
 
 def validate_profile(value):
-    if not isinstance(value, dict) or set(value) != {
-            "schema", "gpu_sample_every", "sample_capacity", "phases", "dropped_gpu_samples"}:
+    fields = {"schema", "gpu_sample_every", "sample_capacity", "phases", "dropped_gpu_samples"}
+    if isinstance(value, dict) and "timeline" in value:
+        fields.add("timeline")
+    if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("invalid runtime performance fields")
     if value["schema"] != SCHEMA:
         raise ValueError("unknown runtime performance schema")
@@ -49,16 +52,45 @@ def validate_profile(value):
         mean = row["total_ms"] / row["count"]
         if not row["min_ms"] - 1e-8 <= mean <= row["max_ms"] + 1e-8:
             raise ValueError("inconsistent performance total")
+    if "timeline" in value:
+        validate_timeline(value["timeline"])
+    return value
+
+
+def validate_timeline(value):
+    if (not isinstance(value, dict) or set(value) != {"schema", "capacity", "dropped", "spans"}
+            or value["schema"] != "shard-runtime-timeline/1"):
+        raise ValueError("invalid runtime timeline")
+    if type(value["capacity"]) is not int or not 1 <= value["capacity"] <= 4096:
+        raise ValueError("invalid timeline capacity")
+    if type(value["dropped"]) is not int or value["dropped"] < 0:
+        raise ValueError("invalid timeline dropped count")
+    if not isinstance(value["spans"], list) or len(value["spans"]) > value["capacity"]:
+        raise ValueError("invalid timeline span budget")
+    for span in value["spans"]:
+        if (not isinstance(span, dict) or set(span) != {"name", "clock", "track", "start_ms", "duration_ms"}
+                or not isinstance(span["name"], str) or not _NAME.fullmatch(span["name"])
+                or span["clock"] not in ("host_monotonic", "cuda_event")
+                or not isinstance(span["track"], str) or not _NAME.fullmatch(span["track"])):
+            raise ValueError("invalid timeline span")
+        for key in ("start_ms", "duration_ms"):
+            v = span[key]
+            if type(v) not in (int, float) or not math.isfinite(v) or v < 0:
+                raise ValueError("invalid timeline time")
     return value
 
 
 class RuntimeProfiler:
-    def __init__(self, *, gpu_sample_every=16, sample_capacity=512, max_pending=2048, clock=None):
+    def __init__(self, *, gpu_sample_every=16, sample_capacity=512, max_pending=2048, clock=None,
+                 timeline_capacity=0):
         if any(type(v) is not int or v < 1 for v in (gpu_sample_every, sample_capacity, max_pending)):
             raise ValueError("profile budgets must be positive integers")
         if sample_capacity > 8192 or gpu_sample_every > 1000000 or max_pending > 8192:
             raise ValueError("profile budget exceeds its limit")
         self.every, self.capacity, self.max_pending = gpu_sample_every, sample_capacity, max_pending
+        if type(timeline_capacity) is not int or not 0 <= timeline_capacity <= 4096:
+            raise ValueError("timeline capacity must be 0..4096")
+        self.timeline_capacity = timeline_capacity
         self.clock = clock or time.perf_counter
         self.reset()
 
@@ -68,6 +100,18 @@ class RuntimeProfiler:
         self._pending = deque()
         self._event_pool = []
         self.dropped = 0
+        self._timeline = deque(maxlen=self.timeline_capacity or 1)
+        self._timeline_dropped = 0
+        self._origin = None
+        self._gpu_origins = {}
+
+    def _span(self, name, clock, track, start_ms, duration_ms):
+        if not self.timeline_capacity:
+            return
+        if len(self._timeline) == self.timeline_capacity:
+            self._timeline_dropped += 1
+        self._timeline.append(dict(name=name, clock=clock, track=track,
+                                   start_ms=max(0.0, start_ms), duration_ms=duration_ms))
 
     def record(self, name, elapsed_ms):
         if not isinstance(name, str) or not _NAME.fullmatch(name):
@@ -88,30 +132,42 @@ class RuntimeProfiler:
         row["values"].append(float(elapsed_ms))
 
     @contextmanager
-    def host(self, name):
+    def host(self, name, *, timeline_name=None):
+        if timeline_name is not None and (not isinstance(timeline_name, str) or not _NAME.fullmatch(timeline_name)):
+            raise ValueError("invalid timeline phase name")
         start = self.clock()
+        if self._origin is None:
+            self._origin = start
         try:
             yield
         finally:
-            self.record(name, max(0.0, (self.clock() - start) * 1000.0))
+            elapsed = max(0.0, (self.clock() - start) * 1000.0)
+            self.record(name, elapsed)
+            self._span(timeline_name or name, "host_monotonic", f"thread:{threading.get_ident()}",
+                       (start - self._origin) * 1000.0, elapsed)
 
     def _drain(self, wait=False):
         # Querying an event does not wait for the GPU. Draining at submission
         # boundaries keeps instrumentation memory bounded during long jobs.
         remaining = deque()
         while self._pending:
-            name, start, end = self._pending.popleft()
+            name, start, end, origin, track, timeline_name = self._pending.popleft()
             if wait:
                 end.synchronize()
             if wait or end.query():
-                self.record(name, float(start.elapsed_time(end)))
+                elapsed = float(start.elapsed_time(end))
+                self.record(name, elapsed)
+                if origin is not None:
+                    self._span(timeline_name, "cuda_event", track, float(origin.elapsed_time(start)), elapsed)
                 self._event_pool.append((start, end))
             else:
-                remaining.append((name, start, end))
+                remaining.append((name, start, end, origin, track, timeline_name))
         self._pending = remaining
 
     @contextmanager
-    def gpu(self, name, torch_module, device):
+    def gpu(self, name, torch_module, device, *, timeline_name=None):
+        if timeline_name is not None and (not isinstance(timeline_name, str) or not _NAME.fullmatch(timeline_name)):
+            raise ValueError("invalid timeline phase name")
         if not str(device).startswith("cuda") or torch_module.cuda.is_current_stream_capturing():
             yield
             return
@@ -127,6 +183,20 @@ class RuntimeProfiler:
             return
         with torch_module.cuda.device(device):
             stream = torch_module.cuda.current_stream(device)
+            # Each stream has its own event epoch. It is deliberately NOT
+            # aligned with perf_counter or another stage's wall clock.
+            track = f"{str(device).replace(':', '.')}.stream:{getattr(stream, 'cuda_stream', id(stream))}"
+            origin = None
+            if self.timeline_capacity:
+                origin = self._gpu_origins.get(track)
+                if origin is None:
+                    origin = torch_module.cuda.Event(enable_timing=True)
+                    origin.record(stream)
+                    if len(self._gpu_origins) < 64:
+                        self._gpu_origins[track] = origin
+                    else:
+                        origin = None
+                        self._timeline_dropped += 1
             if self._event_pool:
                 start, end = self._event_pool.pop()
             else:
@@ -137,7 +207,7 @@ class RuntimeProfiler:
                 yield
             finally:
                 end.record(stream)
-                self._pending.append((name, start, end))
+                self._pending.append((name, start, end, origin, track, timeline_name or name))
 
     @contextmanager
     def interval(self, name, torch_module, device):
@@ -154,5 +224,9 @@ class RuntimeProfiler:
             percentile = lambda p: values[min(len(values) - 1, math.ceil(p * (len(values) - 1)))]
             rows[name] = {key: row[key] for key in ("count", "total_ms", "min_ms", "max_ms")}
             rows[name].update(p50_ms=percentile(.5), p95_ms=percentile(.95), samples=len(values))
-        return validate_profile({"schema": SCHEMA, "gpu_sample_every": self.every,
-            "sample_capacity": self.capacity, "phases": rows, "dropped_gpu_samples": self.dropped})
+        result = {"schema": SCHEMA, "gpu_sample_every": self.every,
+            "sample_capacity": self.capacity, "phases": rows, "dropped_gpu_samples": self.dropped}
+        if self.timeline_capacity:
+            result["timeline"] = {"schema": "shard-runtime-timeline/1", "capacity": self.timeline_capacity,
+                                  "dropped": self._timeline_dropped, "spans": list(self._timeline)}
+        return validate_profile(result)

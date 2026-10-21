@@ -70,6 +70,7 @@ epoch-fenced, and held to the same bit-identical bar. See docs/V4_PIPELINED_SPEC
 import argparse
 import collections
 import json
+import math
 import os
 import queue
 import select
@@ -1041,9 +1042,12 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
             st.load(ckpt_dir)
     if session_config is not None and session_config.plan.get("model_cohort"):
         from v4_native_lanes import CONTRACT as native_contract
-        declared_native = session_config.plan["model_cohort"]["numeric_contract"] == native_contract
+        from v4_native_batch import BATCH_CONTRACT
+        declared_native = session_config.plan["model_cohort"]["numeric_contract"] in (native_contract, BATCH_CONTRACT)
         if declared_native != (getattr(st, "_native_lanes", None) is not None):
             raise ValueError("native tokenwise runtime and signed numerical cohort differ")
+        if declared_native and st._native_lanes.contract != session_config.plan["model_cohort"]["numeric_contract"]:
+            raise ValueError("loaded scalar/batched native contract differs from signed cohort")
     if getattr(st, "_native_lanes", None) is not None and V4_SEALED_IDS:
         raise ValueError("native lane v1 does not claim sealed token-ID compatibility")
     preloaded_drafter = {}
@@ -2189,8 +2193,9 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     positions on a round it expects to lose early, the full block on a round it expects a long run.
     Lossless (the tail verifies only what it receives); off unless `conf_gate` / V4_DSPARK_CONF_GATE
     says so, because the raw-score threshold has to be calibrated to the real model first. `conf_probe`,
-    if given, is called `conf_probe(confs, n)` each drafted round with the FULL block's confidence and
-    the number accepted — the hook a calibration run records the conf-vs-accept curve through.
+    if given, is called `conf_probe(confs, n)` each drafted round with the SENT prefix's confidence and
+    the number accepted. Only positions through the first rejection are observed;
+    later positions, including every unsent candidate, are censored.
 
     Returns coordinate()'s dict plus spec stats {rounds, drafted, generated, accepted, g,
     accept_hist, sent, send_hist} — `drafted` being the rounds that carried a real block, `sent` the
@@ -2271,8 +2276,10 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
             slot = rescue_by_depth.setdefault(n + 1, [0, 0])  # judge — would the drafter's runner-up
             slot[1] += 1                                      # at the missed slot have rescued it?
             slot[0] += int(d2s[n] == int(rep["tokens"][n]))   # beta (docs/V4_TREE_VERDICT.md)
-        if conf_probe is not None and block:                  # the FULL block's conf vs what accepted
-            conf_probe(list(confs), n)
+        if conf_probe is not None and drafts:
+            # Unsent drafts are censored, not rejected observations. Only this
+            # offered prefix was verified against the committed history.
+            conf_probe(list(confs[:len(drafts)]), n)
         stop = False
         ready = []
         for t in committed[:max_new-len(toks)]:
@@ -2454,7 +2461,8 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                                 swarm_id="swarm", job_id="job", layer_count=None, receipts=False,
                                 timeout=600.0, on_token=None, depth=None, lazy=None, floor=None,
                                 cancel_check=None, expected_by_signer=None, strict_job_binding=False, conversation=None,
-                                draft_block_limit=None, round_policy=None, draft_prefix_cap=None):
+                                draft_block_limit=None, round_policy=None, draft_prefix_cap=None,
+                                confidence_probe=False):
     """DSPARK speculative decode, PIPELINED — the same lossless round, streamed instead of chunked.
 
     Same contract as coordinate_dspark (same reset, same drafter, same accept rule, same emitted
@@ -2556,6 +2564,12 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         if not isinstance(round_policy, RoundPolicy):
             raise ValueError("round_policy must be a locally validated RoundPolicy")
         round_policy.validate_runtime(depth=W, floor=F, draft_block_limit=draft_block_limit)
+        round_policy.bind_request(prompt_ids, max_new)
+    try:
+        from engines.deepseek_v4.v4_confidence_calibration import ProbeRecorder
+    except ModuleNotFoundError:  # standalone copied engine, without a repo package
+        from v4_confidence_calibration import ProbeRecorder
+    confidence_recorder = ProbeRecorder(confidence_probe or draft_prefix_cap is not None)
     # A coordinator lever has no rebound method for an audit to inspect -- `lazy` is an ARGUMENT to
     # this loop -- so the loop states what it ran with and v4_levers reports THAT, not a second read
     # of the env it already believed. This is the lever that was set on six stages for a night.
@@ -2597,6 +2611,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     sender.start()
     sent = {}                                                 # pos -> token fed there in THIS epoch
     ddepth = {}                                               # pos -> how far ahead it was drafted
+    dconf = {}                                                # submitted candidate's original raw score
     dsrc = {}                                                 # pos -> "block" | "topup"
     dalt = {}                                                 # pos -> the drafter's runner-up there
     horizon = c - 1                                           # highest position a frame has been sent for
@@ -2629,7 +2644,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             tick["durations"][level] = tick["durations"].get(level, 0.0) + dt
         tick["t"] = now
 
-    def _feed(pos, tok, nxt=None, prev=False, dep=0, src="block", alt=None):
+    def _feed(pos, tok, nxt=None, prev=False, dep=0, src="block", alt=None, conf=None):
         """Stream one s=1 frame. `cpos` is the settled watermark the stages free checkpoints against —
         `c - 1`, never `c`: the deepest rewind this coordinator can still ask for is `c` itself (a
         cancel commits at some p+1 > c and re-opens THERE), so anything ending at or before `c - 1` is
@@ -2660,6 +2675,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         proposed_predictions += int(dep > 0)
         sent[pos] = int(tok)
         ddepth[pos] = int(dep)
+        dconf[pos] = conf
         dsrc[pos] = src
         dalt[pos] = None if alt is None else int(alt)
         if src == "topup":
@@ -2764,6 +2780,10 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         m = int(rep["tokens"][0])                             # the model's token at pos+1, at M=b
         fed = sent.get(pos + 1)                               # what we streamed there, if anything yet
         fdep = ddepth.get(pos + 1, 0)                         # 0 == a truth frame, i.e. not a trial
+        if fdep:
+            # The predecessor is now committed. Later scores in a rejected
+            # future never reach this point, and never receive acceptance labels.
+            confidence_recorder.observe(fdep, dconf.get(pos + 1), fed == m)
         _mark()                                               # the old level held until this reply
         ids.append(m)
         c = pos + 1
@@ -2836,12 +2856,18 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         # `m` is what sits at `c` on every path — it is what the two branches below feed there, and on
         # the accepted path `fed == m` was already streamed there. Hints are one per position of it.
         nblk = min(len(blk), max(W - 1, 0))
+        raw_conf = rep.get("conf")
+        if (not isinstance(raw_conf, list) or len(raw_conf) != len(blk)
+                or any(type(score) not in (int, float) or not math.isfinite(score) for score in raw_conf)):
+            raw_conf = []
+        if need:
+            confidence_recorder.refill()
         if draft_prefix_cap is not None:
             nblk = min(nblk, draft_prefix_cap)
         if round_policy is not None and need:
             # Acceptance has settled this frontier; only the unsent suffix is
             # subject to a new cap. Shadow returns exactly the unchanged width.
-            nblk = round_policy.refill(committed_tokens=len(toks), available_drafts=len(blk))
+            nblk = round_policy.refill(committed_tokens=len(toks), available_drafts=len(blk), raw_conf=raw_conf)
         hints = _hints([m] + blk[:nblk])
         if fed is None:                                       # nothing speculated here: feed the truth
             _feed(c, m, hints[0])
@@ -2854,6 +2880,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             for p in [p for p in sent if p > pos]:            # the discarded future
                 del sent[p]
                 ddepth.pop(p, None)
+                dconf.pop(p, None)
                 dsrc.pop(p, None)
                 dalt.pop(p, None)
             _mark()                                           # the fenced span held until the cancel
@@ -2909,7 +2936,8 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                       and draft_prefix_cap is None
                       and not (round_policy is not None and round_policy.changes_frames)),
                       dep=p - c, src="topup" if topup else "block",
-                      alt=alt2[i] if i < len(alt2) else None)
+                      alt=alt2[i] if i < len(alt2) else None,
+                      conf=raw_conf[i] if i < len(raw_conf) else None)
         # THE PIPELINE FILL, measured: positions c..horizon all have a frame in the ring and none of
         # them has been judged yet (replies land in order and this one was for c-1), so that span IS
         # the number of frames in flight. 1 means the pipeline never filled and this is greedy decode
@@ -2917,6 +2945,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         depths.append(horizon - c + 1)
         sent.pop(pos - 1, None)                               # settled two positions back: never read again
         ddepth.pop(pos - 1, None)
+        dconf.pop(pos - 1, None)
         dsrc.pop(pos - 1, None)
         dalt.pop(pos - 1, None)
         prevhint.discard(pos)
@@ -2951,6 +2980,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             "block_len": blen,
             "stale_replies": stale, "unsent_frames": st8.unsent,
             **({"round_speculation": round_policy.finish(gen)} if round_policy is not None else {}),
+            **({"confidence_probe": confidence_recorder.report()} if confidence_recorder.enabled else {}),
             **({"draft_prefix_cap": draft_prefix_cap, "loaded_block_limit": draft_block_limit,
                 "predictive_dprev_disabled": True} if draft_prefix_cap is not None else {}),
             "mode": "pipelined", "legacy_g_definition": "total_generated_tokens_per_cancel_cycle",
@@ -3094,7 +3124,10 @@ ENG_ENV = [
     "V4_DIAL_CONNECT_TIMEOUT", "V4_DIAL_RETRY_S",                               # inter-stage dial
     "V4_TIMING", "V4_TIMING_EVERY",                                             # instrumentation
     "V4_RUNTIME_METRICS",                                                       # signed work/residency observations
-    "V4_PROFILE_RUNTIME", "V4_PROFILE_GPU_EVERY",                               # bounded phase profiling
+    "V4_PROFILE_RUNTIME", "V4_PROFILE_GPU_EVERY", "V4_PROFILE_TIMELINE",          # bounded phase profiling
+    "V4_NATIVE_LANE_DEVICE_MIB", "V4_NATIVE_BATCH", "V4_NATIVE_BATCH_REFERENCE",
+    "V4_NATIVE_ASYNC_DEPTH", "V4_NATIVE_PREFILL_QUANTUM",
+    "V4_NATIVE_BATCH_GRAPH", "V4_NATIVE_BATCH_GRAPH_MIB", "V4_NATIVE_BATCH_GRAPH_LIMIT",
     "V4_EXECUTION_PROFILE", "V4_TRANSPORT_BUFFER_MIB", "V4_TRANSPORT_BUFFER_SLOTS", "V4_TRANSPORT_PINNED",
     "V4_NATIVE_LANES", "V4_NATIVE_LANE_HOST_MIB", "V4_NATIVE_LANE_CACHE_TTL_S",
     "V4_NATIVE_LANE_STATE_DIR", "V4_NATIVE_LANE_DISK_MIB",                        # native independent state
@@ -3651,10 +3684,9 @@ def _encode_prompt(tok, job):
     enc_dir = os.path.join(_vendored("deepseek_v4_ref"), "encoding")
     if enc_dir not in sys.path:
         sys.path.insert(0, enc_dir)
-    from encoding_dsv4 import encode_messages
-    text = encode_messages(job["messages"], "thinking" if job.get("thinking") else "chat",
-                           reasoning_effort=job.get("reasoningEffort"))
-    return tok.encode(text, add_special_tokens=False)
+    from v4_text_protocol import encode_messages_ids
+    return encode_messages_ids(tok, job["messages"], "thinking" if job.get("thinking") else "chat",
+                               reasoning_effort=job.get("reasoningEffort"))
 def _vendored(name):
     """Locate a vendored reference tree, in the repo AND on a deployed box.
 

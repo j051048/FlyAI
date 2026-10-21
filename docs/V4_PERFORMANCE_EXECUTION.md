@@ -84,7 +84,8 @@ python phase0/v4_round_calibration.py --reports r8.json r2.json \
 交错；每个请求有独立窗口 KV、压缩历史、indexer/compressor、前沿、取消和收据。
 权重共享，GPU 目标 buffers 原地恢复，host 槽位与元数据/恢复工作区显式计入资源校准。
 
-这是 **serial scalar lanes**，不是多个请求融合成一次 GEMM；复制状态可能使单请求
+本节原合同是 **serial scalar lanes**；2026-10-20新增的独立设备batch合同见
+[V4_DEVICE_BATCHING](V4_DEVICE_BATCHING.md)，不能只改开关升级既有cohort。本节复制状态可能使单请求
 更慢。本轮实现了真实多请求交错、独立数学与服务接线，没有登记 aggregate speedup。
 首版支持 greedy、显存常驻专家与 KV；拒绝 MTP、旧配方策略、KV tiering、sealed IDs
 及历史相关的 reference bypass 组合。HTTP JSON/SSE 成功结果回显 numerical contract。

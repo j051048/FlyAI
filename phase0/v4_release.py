@@ -26,7 +26,8 @@ GPU_FILES = ("tests/test_v4_runtime_init.py", "tests/test_v4_hybrid_gpu.py",
     "tests/test_v4_native_trace.py", "tests/test_v4_kv_runtime.py",
     "tests/test_v4_kernel_tuning.py", "tests/test_v4_draft_results.py", "tests/test_v4_native_lanes.py",
     "tests/test_v4_numeric_diagnostics.py", "tests/test_v4_island_coverage.py",
-    "tests/test_v4_kernel_capability.py", "tests/test_receive_buffers.py")
+    "tests/test_v4_kernel_capability.py", "tests/test_receive_buffers.py", "tests/test_v4_native_batch.py",
+    "tests/test_v4_native_batch_graph.py")
 REQUIRED_CASES = ("test_actual_cuda_hadamard_smoke_and_graph_capture",
     "test_original_tilelang_grouped_fp4_matches_full_resident_reference",
     "test_cuda_actual_v4_snapshot_restores_same_continuation_and_state_bytes",
@@ -39,7 +40,16 @@ REQUIRED_CASES = ("test_actual_cuda_hadamard_smoke_and_graph_capture",
     "test_cuda_actual_whole_graph_matches_its_eager_twin_and_rejection",
     "test_actual_island_capture_reports_three_per_layer_after_decode",
     "test_actual_native_gpu_kernel_smoke_and_graph_replay",
-    "test_pinned_pool_tensor_stays_pinned_until_cuda_copy_finishes")
+    "test_pinned_pool_tensor_stays_pinned_until_cuda_copy_finishes",
+    "test_actual_cuda_resident_batch_preserves_independent_native_trajectories[2]",
+    "test_actual_cuda_resident_batch_preserves_independent_native_trajectories[3]",
+    "test_actual_cuda_resident_batch_preserves_independent_native_trajectories[4]",
+    "test_cuda_batch_graph_matches_eager_twin_freshness_and_state[1]",
+    "test_cuda_batch_graph_matches_eager_twin_freshness_and_state[2]",
+    "test_cuda_batch_graph_matches_eager_twin_freshness_and_state[3]",
+    "test_cuda_batch_graph_matches_eager_twin_freshness_and_state[4]",
+    "test_cuda_batch_graph_capture_refusal_restores_before_eager_and_commits_exact_state[warmup_failure]",
+    "test_cuda_batch_graph_capture_refusal_restores_before_eager_and_commits_exact_state[graph_count]")
 
 
 def digest(value):
@@ -52,6 +62,13 @@ def _junit(xml):
     return {"cases": [case.get("name", "") for case in cases],
             "failures": sum(bool(case.findall("failure") or case.findall("error")) for case in cases),
             "skips": sum(bool(case.findall("skipped")) for case in cases)}
+
+
+def _required_case_present(name, cases):
+    # Explicit batch widths are separate obligations. A renamed case or a
+    # longer string with a required name as its prefix cannot cover B=4.
+    return any(case == name or ("[" not in name and case.startswith(name + "[")
+                                and case.endswith("]")) for case in cases)
 
 
 def cuda_probe():
@@ -156,7 +173,7 @@ def evaluate_gpu_gate(report):
             result = _junit(xml)
             if result["failures"] or report.get("exit_code") != 0: errors.append("actual GPU tests failed")
             if result["skips"]: missing.append("skipped GPU cases do not qualify")
-            if any(not any(case.startswith(name) for case in result["cases"]) for name in REQUIRED_CASES):
+            if any(not _required_case_present(name, result["cases"]) for name in REQUIRED_CASES):
                 missing.append("mandatory native FP4/state/graph/continuation CUDA cases absent")
         except (ET.ParseError, TypeError, ValueError): errors.append("invalid raw JUnit")
     return {"status": "failed" if errors else "unverified" if missing else "passed",

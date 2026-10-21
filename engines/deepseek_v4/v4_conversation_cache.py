@@ -323,7 +323,7 @@ def _drafter_tail(drafter):
     return getattr(drafter, "tail", drafter)
 
 
-def _buffers(stage, drafter, *, frontier=None, synchronize=True):
+def _buffers(stage, drafter, *, frontier=None, synchronize=True, draft_frontier=-1):
     runtime = getattr(stage, "_kv_runtime", None)
     if runtime is not None:
         if runtime._active is not None:
@@ -336,8 +336,14 @@ def _buffers(stage, drafter, *, frontier=None, synchronize=True):
         entry = runtime.entries.get(id(attn)) if runtime is not None else None
         result[f"main.{i}.kv"] = entry["ring"] if entry is not None else attn.kv_cache
         rows = frontier // attn.compress_ratio if frontier is not None and attn.compress_ratio else None
-        if entry is None and rows is not None:
-            result[f"main.{i}.kv"] = attn.kv_cache[:, :attn.window_size + rows]
+        if frontier is not None and hasattr(attn, "window_size"):
+            # The unfilled ring suffix and chunk scratch are unreachable. Keep
+            # compressed history separately: its fixed base is window_size,
+            # even when the prompt has not filled the window yet. These views
+            # restore into the original allocation and keep CUDA graph aliases.
+            result[f"main.{i}.kv"] = result[f"main.{i}.kv"][:, :min(frontier, attn.window_size)]
+            if entry is None and rows is not None:
+                result[f"main.{i}.compressed"] = attn.kv_cache[:, attn.window_size:attn.window_size + rows]
         if entry is not None:
             result[f"main.{i}.history"] = entry["history"] if rows is None else entry["history"][:, :rows]
         indexer = getattr(attn, "indexer", None)
@@ -352,7 +358,17 @@ def _buffers(stage, drafter, *, frontier=None, synchronize=True):
     tail = _drafter_tail(drafter)
     if tail is not None:
         for i, layer in enumerate(tail.mtp):
-            result[f"draft.{i}.kv"] = layer.attn.kv_cache
+            value = layer.attn.kv_cache
+            # DSpark writes committed main-KV slots only; speculative KV is a
+            # temporary concatenation. Its cursor is the LAST written position,
+            # unlike Stage._pos (the NEXT position). Retain all other draft
+            # tensors/cursors unchanged in _metadata.
+            if frontier is not None and hasattr(layer.attn, "window_size"):
+                pos = tail._pos if draft_frontier == -1 else draft_frontier
+                if pos is not None and (type(pos) is not int or pos < 0):
+                    raise ConversationCacheError("invalid DSpark snapshot cursor")
+                value = value[:, :min(0 if pos is None else pos + 1, layer.attn.window_size)]
+            result[f"draft.{i}.kv"] = value
     return result
 
 
@@ -452,7 +468,7 @@ class StageConversationCache:
                 self.invalidate()
             self.drafter = drafter
 
-    def _boundary(self, frontier=None, *, state_frontier=None):
+    def _boundary(self, frontier=None, *, state_frontier=None, draft_frontier=-1):
         if getattr(self.stage, "_replaying", False):
             raise ConversationCacheError("cannot capture or restore during rollback replay")
         if frontier is not None and (type(frontier) is not int or frontier != self.stage._pos):
@@ -460,7 +476,19 @@ class StageConversationCache:
         device = torch.device(self.stage.device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-        return _buffers(self.stage, self.drafter, frontier=state_frontier)
+        return _buffers(self.stage, self.drafter, frontier=state_frontier, draft_frontier=draft_frontier)
+
+    def _finish_transfer(self):
+        """Own the completion event until every queued pinned copy has finished.
+
+        Called from finally blocks while source entries and partial destination
+        trees are still live. A failed allocation/copy must not free pinned host
+        memory while a previously submitted DMA still references it.
+        """
+        if self.pinned and torch.device(self.stage.device).type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.stage.device))
+            event.synchronize()
 
     def _prune(self):
         for key, entry in tuple(self._entries.items()):
@@ -533,10 +561,7 @@ class StageConversationCache:
             finally:
                 # Keep both source tree and every allocated destination in scope
                 # until queued D2H completes, including a partial allocation failure.
-                if self.pinned and torch.device(self.stage.device).type == "cuda":
-                    event = torch.cuda.Event()
-                    event.record(torch.cuda.current_stream(self.stage.device))
-                    event.synchronize()
+                self._finish_transfer()
             if stamp != _model_stamp(self.stage, self.drafter):
                 raise ConversationCacheError("weights changed while snapshotting")
             self._generation += 1
@@ -581,7 +606,8 @@ class StageConversationCache:
             "prefix": entry.prefix.to_dict() if isinstance(entry.prefix, PrefixBinding) else entry.prefix})
         if state_digest != entry.state_digest or content_digest != entry.content_digest:
             raise ConversationCacheError("cached state content was modified")
-        buffers = self._boundary(state_frontier=_prefix_count(entry.prefix))
+        buffers = self._boundary(state_frontier=_prefix_count(entry.prefix),
+                                 draft_frontier=entry.metadata.get("tail", {}).get("_pos", -1))
         if self.clock() >= entry.expires or _model_stamp(self.stage, self.drafter) != entry.model_stamp:
             raise ConversationCacheError("expired checkpoint or changed model parameters")
         if {k: _signature(t) for k, t in buffers.items()} != entry.signatures:
@@ -607,11 +633,17 @@ class StageConversationCache:
                 if runtime is not None:
                     runtime.invalidate_workspace()
                 # Allocate dynamic rollback/tap objects *before* touching buffers.
-                metadata = _copy_tree(entry.metadata, devices=entry.metadata_devices, restore=True,
-                                      non_blocking=self.pinned)
-                with torch.no_grad():
-                    for name, target in buffers.items():
-                        target.copy_(entry.buffers[name], non_blocking=self.pinned)
+                memo = {}
+                try:
+                    metadata = _copy_tree(entry.metadata, devices=entry.metadata_devices, restore=True,
+                                          non_blocking=self.pinned, memo=memo)
+                    with torch.no_grad():
+                        for name, target in buffers.items():
+                            target.copy_(entry.buffers[name], non_blocking=self.pinned)
+                finally:
+                    # memo owns partial GPU allocations if _copy_tree fails;
+                    # entry owns the pinned sources until this event completes.
+                    self._finish_transfer()
                 for name, value in metadata["main"].items():
                     setattr(self.stage, name, value)
                 tail = _drafter_tail(self.drafter)

@@ -146,7 +146,47 @@ def sign_offer(body, key):
     return result
 
 
-def _offer_trace(offer, cohort_id, profile, *, now):
+def _surface_source(profile, calibrations):
+    """Bind a cost surface to its advertised, calibrated engine inventory.
+
+    A source label inside an operator-signed surface alone is insufficient:
+    require the same inventory in the content-addressed runtime calibration.
+    This is provenance binding, not a hardware/execution attestation.
+    """
+    trace = profile.get("stage_trace")
+    if not isinstance(trace, dict) or trace.get("cost_surface") is None:
+        return profile.get("source_sha256")
+    surface = trace["cost_surface"]
+    source = _hash(profile.get("source_sha256"), "cost surface profile source_sha256")
+    runtime = _hash(profile.get("runtime_config_sha256"), "cost surface runtime_config_sha256")
+    if not isinstance(surface, dict) or surface.get("source_sha256") != source:
+        raise ValueError("cost surface source differs from signed profile")
+    if trace.get("source_sha256", source) != source:
+        raise ValueError("stage trace source differs from signed profile")
+    if not isinstance(calibrations, list):
+        raise ValueError("cost surface requires matching runtime calibration")
+    bound = []
+    for record in calibrations:
+        if not isinstance(record, dict) or not isinstance(record.get("runtime_config"), dict):
+            continue
+        config = record["runtime_config"]
+        provenance = record.get("requirements", {}).get("provenance", {}) if isinstance(record.get("requirements"), dict) else {}
+        if (not isinstance(provenance, dict) or provenance.get("runtime_config_sha256") != runtime or
+                hashlib.sha256(canonical(config)).hexdigest() != runtime):
+            continue
+        inventory = config.get("engine_source_sha256")
+        if not isinstance(inventory, dict) or not 1 <= len(inventory) <= 4096:
+            raise ValueError("cost surface runtime needs a bounded engine source inventory")
+        for name, sha in inventory.items():
+            _text(name, "engine source file", 512)
+            _hash(sha, "engine source file SHA256")
+        bound.append(hashlib.sha256(canonical(inventory)).hexdigest())
+    if not bound or any(value != source for value in bound):
+        raise ValueError("cost surface source differs from its matching runtime calibration")
+    return source
+
+
+def _offer_trace(offer, cohort_id, profile, *, now, calibrations=()):
     """Check a trace in its recorded shape before it can enter a planner pool.
 
     Missing identity bindings allow registration, but never eligibility. The
@@ -170,9 +210,10 @@ def _offer_trace(offer, cohort_id, profile, *, now):
         workload.update(context_tokens=context, warmness=trace["warmness"])
     age = now - timestamp(trace["measured_at"])
     ttl = number(trace["ttl_s"], "trace ttl_s", minimum=1e-9)
+    source = _surface_source(profile, calibrations)
     observed = stage_observation({"id": offer["node_id"], "gpu_uuid": offer["gpu_uuid"],
         "cohort_id": cohort_id, "runtime_config_sha256": profile.get("runtime_config_sha256"),
-        "stage_trace": trace}, trace["layer_end"] - trace["layer_start"], profile.get("layer_ms") or 1,
+        "source_sha256": source, "stage_trace": trace}, trace["layer_end"] - trace["layer_start"], profile.get("layer_ms") or 1,
         now=now, start=trace["layer_start"], workload=workload, require_fresh_chunk=False)
     return observed, -30 <= age <= ttl
 
@@ -248,11 +289,11 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
         profile = entry["profile"]
         permitted = {"layer_ms", "cap_layers", "layer_vram_mb", "total_vram_mb", "h2d_gbps", "up_mbps",
                      "dma_exposed_ms_per_layer", "expert_misses_per_layer", "dma_overlap_fraction", "stage_trace",
-                     "runtime_config_sha256"}
+                     "runtime_config_sha256", "source_sha256"}
         if not isinstance(profile, dict) or set(profile) - permitted:
             raise OfferError("invalid measured profile fields")
         for key, value in profile.items():
-            if key == "runtime_config_sha256":
+            if key in ("runtime_config_sha256", "source_sha256"):
                 _hash(value, key)
             elif key == "stage_trace":
                 if not isinstance(value, dict):
@@ -271,7 +312,8 @@ def validate_offer(body, *, now=None, max_ttl_s=300, max_skew_s=30):
             # make planning fail for every honest node in the same cohort.
             try:
                 trace = profile["stage_trace"]
-                _, fresh = _offer_trace(body, cohort.cohort_id, profile, now=now)
+                _, fresh = _offer_trace(body, cohort.cohort_id, profile, now=now,
+                                        calibrations=entry.get("calibrations", []))
                 if not fresh:
                     raise ValueError("stage trace expired or is from the future")
                 if trace["layer_end"] > cohort.n_layers:
@@ -409,7 +451,8 @@ class OfferRegistry:
                     continue
                 if profile.get("stage_trace") is not None:
                     try:
-                        observed, fresh = _offer_trace(offer, cohort_id, profile, now=now)
+                        observed, fresh = _offer_trace(offer, cohort_id, profile, now=now,
+                                                       calibrations=model.get("calibrations", []))
                     except (ValueError, TypeError, KeyError):
                         # An old persisted record cannot poison all honest offers.
                         continue

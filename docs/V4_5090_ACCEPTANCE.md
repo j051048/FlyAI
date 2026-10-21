@@ -1,5 +1,11 @@
 # 5090 真机验收：whole 回滚、同机多卡与四种解码
 
+2026-10-21补充：[本轮改造](V4_DEEPINFER_IMPROVEMENTS.md)要求新源码重新冻结计划。
+`gpu-check` 已包含2/3/4请求CUDA轨迹、B1–B4 partial图、真实warmup失败恢复和图数量预算专项；
+新batch `/2` cohort另须[scalar/eager/partial真实checkpoint对照](V4_BATCH_GRAPH_ACCEPTANCE.md)，
+不能用原scalar whole或tiny gate替代其数值资格。B4 CPU偏差已零容差修正；GPU/FP4和速度仍待验，
+代码提交不代表真机验收通过。下列原scalar whole/四策略流程保留，不能把其计划改成batch图计划。
+
 更新：2026-10-12。执行架构代码基线为 `01e4c87`；验收工具随源码发布，本地回归通过，真机验收待执行。
 交给 OpenClaw 的应是核对哈希的源码包，或包含本轮验收工具的固定 Git 提交；不要使用缺少工具的旧版本。
 

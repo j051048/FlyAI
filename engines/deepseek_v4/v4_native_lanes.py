@@ -36,6 +36,7 @@ def configured_options():
 
 
 class NativeLanes:
+    contract = CONTRACT
     def __init__(self, stage, *, max_jobs, host_bytes, ttl_s=300, clock=time.monotonic,
                  state_directory=None, disk_bytes=0):
         if type(max_jobs) is not int or not 2 <= max_jobs <= 4:
@@ -119,7 +120,7 @@ class NativeLanes:
         if not isinstance(identity, dict) or not identity or self.owner_epoch is None:
             raise ValueError("durable native state needs a live exact runtime identity")
         binding = {"runtime": deepcopy(identity), "owner_epoch": self.owner_epoch,
-                   "contract": CONTRACT, "horizon": self.stage.args.max_seq_len}
+                   "contract": self.contract, "horizon": self.stage.args.max_seq_len}
         if self.disk_identity is not None and self.disk_identity != binding and self.active:
             raise ValueError("durable native identity changed while jobs are active")
         self.disk_identity = binding
@@ -279,4 +280,22 @@ class NativeLanes:
 
 def configured_runner(stage):
     options = configured_options()
+    enabled = os.environ.get("V4_NATIVE_BATCH", "0")
+    reference = os.environ.get("V4_NATIVE_BATCH_REFERENCE", "0")
+    device_bytes = int(os.environ.get("V4_NATIVE_LANE_DEVICE_MIB", "0")) << 20
+    depth = int(os.environ.get("V4_NATIVE_ASYNC_DEPTH", "2"))
+    prefill_quantum = int(os.environ.get("V4_NATIVE_PREFILL_QUANTUM", "1"))
+    graph_mode = os.environ.get("V4_NATIVE_BATCH_GRAPH", "off")
+    graph_bytes = int(os.environ.get("V4_NATIVE_BATCH_GRAPH_MIB", "0")) << 20
+    graph_limit = int(os.environ.get("V4_NATIVE_BATCH_GRAPH_LIMIT", "64"))
+    if enabled not in ("0", "1") or reference not in ("0", "1") or device_bytes < 0:
+        raise ValueError("native batch flags require booleans and a bounded device quota")
+    if enabled == "1":
+        from v4_native_batch import DeviceNativeLanes
+        return DeviceNativeLanes(stage, **options, device_bytes=device_bytes,
+                                 reference=reference == "1", async_depth=depth,
+                                 prefill_quantum=prefill_quantum, graph_mode=graph_mode,
+                                 graph_bytes=graph_bytes, max_graphs=graph_limit)
+    if reference != "0" or device_bytes or graph_mode != "off" or graph_bytes:
+        raise ValueError("native batch reference/device quota require explicit V4_NATIVE_BATCH=1")
     return NativeLanes(stage, **options) if options["max_jobs"] else None
