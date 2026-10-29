@@ -82,7 +82,7 @@ class RoundPolicy:
             raise ValueError("round speculation requires an object")
         allowed = {"enabled", "mode", "calibration", "ema_alpha", "min_gain",
                    "min_hold_windows", "sample_ttl_s", "max_records",
-                   "max_dma_bytes_per_committed_token", "confidence_calibration"}
+                   "max_dma_bytes_per_committed_token", "confidence_calibration", "exploration"}
         if set(config) - allowed or config.get("enabled") is not True:
             raise ValueError("unknown round speculation options or missing enabled=true")
         self.mode = config.get("mode", "shadow")
@@ -95,6 +95,9 @@ class RoundPolicy:
         self.baseline = min(self.block_size, self.depth - 1)
         if not isinstance(binding, dict) or not binding:
             raise ValueError("round selection requires a pinned local binding")
+        self.stage_count = len(binding["stages"]) if isinstance(binding.get("stages"), list) else None
+        if self.stage_count is not None and not 1 <= self.stage_count <= 64:
+            raise ValueError("bounded pinned cost stages required")
         self.binding_sha256 = digest({"identity": binding, "loaded_block_size": self.block_size,
                                       "depth": self.depth, "floor": floor})
         self.alpha = _number(config.get("ema_alpha", .2), "EMA alpha", .001, 1.)
@@ -102,6 +105,18 @@ class RoundPolicy:
         self.min_hold = _integer(config.get("min_hold_windows", 4), "minimum hold windows", 1, 10000)
         self.sample_ttl = _number(config.get("sample_ttl_s", 60.), "sample TTL", .001, 86400.)
         self.max_records = _integer(config.get("max_records", 64), "record budget", 1, 1024)
+        exploration = config.get("exploration")
+        self.exploration = None
+        if exploration is not None:
+            if not isinstance(exploration, dict) or set(exploration) != {"every_windows", "max_probes", "stale_windows"}:
+                raise ValueError("bounded explicit exploration budget required")
+            self.exploration = {
+                "every_windows": _integer(exploration["every_windows"], "probe interval", 2, 10000),
+                "max_probes": _integer(exploration["max_probes"], "probe budget", 1, 32),
+                "stale_windows": _integer(exploration["stale_windows"], "probe staleness", 2, 10000)}
+        self._probes = 0
+        self._last_observed = {}
+        self._cost_capture_changed = False
         self.dma_limit = config.get("max_dma_bytes_per_committed_token")
         if self.dma_limit is not None:
             self.dma_limit = _number(self.dma_limit, "DMA bytes per committed token", 0.)
@@ -178,10 +193,12 @@ class RoundPolicy:
     def observe_reply_cost(self, cost):
         """Only complete all-stage costs may constrain an end-to-end decision.
 
-        The current wire does not provide this measurement: absence is normal and
-        records unknown, never zero. Tail-only telemetry is also incomplete.
+        Absence records unknown, never zero. Tail-only telemetry is incomplete.
+        Validated frame chains are local observations, not execution proofs.
         """
         self._cost_frames += 1
+        if isinstance(cost, dict) and cost.get("capture_changed") is True:
+            self._cost_capture_changed = True
         if not isinstance(cost, dict) or cost.get("coverage") != "all_stages":
             self._cost_complete = False
             return
@@ -207,7 +224,7 @@ class RoundPolicy:
         measured = count > 0 and elapsed > 0 and math.isfinite(elapsed)
         # EOS/max-new has a partial window; terminal drain is separately reported
         # by the coordinator. Do not train a fully executed profile from it.
-        learned = measured and not truncated and self._window["profile_complete"]
+        learned = measured and not truncated and self._window["profile_complete"] and not self._cost_capture_changed
         if learned:
             previous = self._runtime.get(cap)
             if previous is None or now-previous["at"] > self.sample_ttl:
@@ -216,13 +233,15 @@ class RoundPolicy:
                 rate = self.alpha*(count/elapsed) + (1-self.alpha)*previous["rate"]
             self._runtime[cap] = {"rate": rate, "at": now,
                 "dma_per_token": dma/count if dma is not None else None}
+            self._last_observed[cap] = self._windows
         self._windows += 1
         self._records.append({"kind": "window", "applied_cap": cap, "committed_tokens": count,
             "elapsed_s": elapsed, "expert_dma_bytes": dma, "cost_coverage": "all_stages" if complete else "unknown",
-            "learned": learned, "truncated": truncated,
+            "learned": learned, "truncated": truncated, "capture_changed": self._cost_capture_changed,
             "scope": "coordinator_refill_interval_including_carryover"})
         self._cost_bytes = self._cost_frames = 0
         self._cost_complete = True
+        self._cost_capture_changed = False
 
     def _score(self, cap, now):
         row = self._runtime.get(cap)
@@ -244,6 +263,7 @@ class RoundPolicy:
         # Later closes reset these counters; do the same for that initial case.
         self._cost_bytes = self._cost_frames = 0
         self._cost_complete = True
+        self._cost_capture_changed = False
         valid = self.created_at <= self.wall_clock() < self.expires_at
         reason = "calibration_expired"
         if valid and self._confidence is not None:
@@ -272,6 +292,16 @@ class RoundPolicy:
         else:
             self._selected = self.baseline
         wanted = self._selected if valid else self.baseline
+        if (valid and self.exploration is not None and self._confidence is None and self.changes_frames
+                and self._windows > 0 and self._windows % self.exploration["every_windows"] == 0
+                and self._probes < self.exploration["max_probes"]):
+            candidates = [cap for cap in self.profiles if cap != wanted and cap <= available
+                and self._score(cap, now) is not None and (cap not in self._last_observed or
+                    self._windows-self._last_observed[cap] >= self.exploration["stale_windows"])]
+            if candidates:
+                wanted = min(candidates, key=lambda cap: (self._last_observed.get(cap, -1), cap != self.baseline, cap))
+                self._probes += 1
+                reason = "bounded_reexploration"
         self._applied = wanted if self.changes_frames else self.baseline
         applied = min(self._applied, available)
         self._records.append({"kind": "decision", "selected_cap": wanted, "applied_cap": applied,
@@ -291,6 +321,7 @@ class RoundPolicy:
             "calibration_sha256": self.calibration_sha256, "binding_sha256": self.binding_sha256,
             "baseline_cap": self.baseline, "loaded_block_size": self.block_size,
             "windows": self._windows, "switches": self._switches,
+            "exploration_probes": self._probes,
             "measurement_scope": "local_coordinator_observation_not_execution_proof",
             "expert_cost_missing_is_zero": False, "records": deepcopy(list(self._records)),
             **({"confidence": self._confidence.report()} if self._confidence is not None else {})}

@@ -135,3 +135,37 @@ def test_malformed_signed_capture_metadata_is_a_bounded_validation_error(mutatio
     else: status["coverage"] = []
     with pytest.raises(ValueError):
         P.require_profile_warmup([row], {"worker": "resident-whole"})
+
+def test_default_recipe_freezes_actual_public_defaults_without_model_or_gpu_initialization():
+    root = Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("V4_")}
+    env.update(PYTHONUTF8="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
+    code = """import json,os,sys
+sys.path.insert(0,'engines/deepseek_v4')
+from v4_execution_profiles import baseline_environment,PRIVATE_CONFIG_PATHS
+frozen=baseline_environment()
+assert 'torch' not in sys.modules
+assert not PRIVATE_CONFIG_PATHS.intersection(frozen)
+os.environ.update(frozen)
+import v4_stage,v4_dspark_fast
+from v4_observability import public_environment
+observed=public_environment()
+assert observed==frozen, {'extra':sorted(set(observed)-set(frozen)),'missing':sorted(set(frozen)-set(observed))}
+assert frozen['V4_DSPARK_CHAIN_GRAPH']=='0' and frozen['V4_DSPARK_CHAIN_LIMIT']=='16'
+assert frozen['V4_EXPERT_STORAGE']=='canonical' and frozen['V4_DRAFT_ADAPTER_MIB']=='0'
+print(json.dumps({'complete':True,'count':len(frozen)}))
+"""
+    result = subprocess.run([sys.executable,"-c",code],cwd=root,env=env,capture_output=True,text=True,timeout=30)
+    assert result.returncode==0,result.stderr+result.stdout
+    assert json.loads(result.stdout)["complete"] is True
+
+
+@pytest.mark.parametrize("name",sorted(P.PRIVATE_CONFIG_PATHS))
+def test_private_paths_remain_worker_local_but_never_publish_in_public_recipe(name):
+    with pytest.raises(ValueError,match="private worker"):
+        P.public_environment_overrides({name:"/private/operator/config.json"})
+    assert name not in P.public_environment_overrides({name:""})
+    # Deployment profile expansion is a private launch operation. Publishing a
+    # recipe is a separate operation and must not break this worker interface.
+    selected=P.resolve_profile("resident-whole",{name:"/private/operator/config.json"})
+    assert selected[name]=="/private/operator/config.json"

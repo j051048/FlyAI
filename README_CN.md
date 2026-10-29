@@ -8,9 +8,9 @@
 
 FlyAI 是基于上游 Shard 的分布式推理 fork。目标是允许任意贡献者登记 GPU，优先选择低延迟的近邻与同区域节点，不足时再扩区，将模型切成连续层块执行。同机多 GPU 是合法部署；是否加入执行环还要满足运行时兼容、真实资源、可达链路和租约要求。相同公网 IP 不能证明是同一物理机，也不能当作共享内存域。
 
-**当前核对日期：2026-10-21。** 新增设备驻留请求轴小批、签名原始时间线、置信度/周期预算、精确前沿缓存与质量工具；本轮修正B4 CPU偏差并接入独立partial批图。新增模式默认关闭并有独立数值/资源合同；本轮仅完成本地测试，真实GPU/FP4/性能验收仍待执行。见 [本轮改造与验收](docs/V4_DEEPINFER_IMPROVEMENTS.md)和[文档导航](docs/DOCUMENTATION_INDEX.md)。
+**当前核对日期：2026-10-29。** 本轮完善全环成本反馈、实际字节设备摘要、生产形状选环、持久异长批量状态、RAM 专家分段图和资格门控的增量前缀／精确 KV gather。默认关闭，真实 GPU/FP4/性能及稳定性按[本轮六项验收](docs/V4_SIX_ACCEPTANCE.md)验证；按本次用户安排先发布默认关闭的代码，硬件资格保持待验。前轮角色成本、本机激活、专家冷补集、MTP 图与离线训练见[已有六项合同](docs/V4_DUALGPU_IMPROVEMENTS.md)、[此前验收步骤](docs/V4_DUALGPU_ACCEPTANCE.md)。
 
-本轮另完成显式配方、图覆盖与回滚一致性、原生内核探针、strict 宿主分组、本机缓冲和四策略验收，见 [多卡执行指南](docs/V4_MULTIGPU_EXECUTION.md)。123 文件组合回归为 **2081 passed / 11 skipped / 80 GPU deselected**，不是完整 GitHub CI 或 GPU 认证；真机验证和推送按用户安排延后。
+本轮 Windows / CPU 冻结组合回归覆盖 160 个相关测试文件：**2548 passed / 11 skipped / 117 GPU deselected**；源码、测试和工具摘要全程一致，保留一条 Windows ACL 子进程编码警告。这不是 GitHub CI 或 GPU 认证。前轮 148 文件、2446 项及 2026-10-12 的 123 文件、2081 项均是历史记录，各轮计数不相加。按用户新安排提交代码；真机验证仍待执行。
 
 ## 当前能力与边界
 
@@ -23,6 +23,7 @@ FlyAI 是基于上游 Shard 的分布式推理 fork。目标是允许任意贡�
 | V4 权重准备 | 有界流式转换、局部分片完整摘要、实际文件与准备峰值预算、原子发布及请求边界替换 | 需配置可信目录/来源与已校准候选；没有足够容量时明确拒绝，不清空运行模型 |
 | V4 / GPT-OSS 服务 | 签名会话、多环路由、租户认证、队列、SSE、取消与前缀恢复 | 旧模式每环串行，可选私有作业日志；独立 V4 scalar lanes 有另外的数值合同，未实现分布式 HA |
 | V4 新独立批合同 | `/2`的2–4请求设备驻留状态、逐请求固定算形、有界socket在途与可选partial批图 | 相同前沿分组；MoE/Indexer eager，非融合GEMM；CPU严格通过不代表GPU/FP4资格 |
+| V4 本机专家与草稿 | 独立 expert 热冷所有权、MTP committed 完整图、可信 IPC 与宿主配额、原词表 draft 残差训练工具 | 无跨节点专家副本或未知未来窗口算法；可选实际字节设备 SHA，真实模型及组合性能待验 |
 | GPT-OSS 下载与量化 | 固定 HF revision、完整摘要清单、转换前拦截反量化、转换后 packed 布局校验 | 布局校验不证明 native GPU 内核执行正确或吞吐达标 |
 | 收据与本地仲裁 | 验证 signer、层覆盖、相邻 roots、job 和 nonce；独立重放挑战辅助 | 签名记录不是完整计算证明；本地辅助没有实际链上罚没 |
 
@@ -37,6 +38,8 @@ FlyAI 是基于上游 Shard 的分布式推理 fork。目标是允许任意贡�
 - **V4 自检与排障：** [运行操作指南](docs/V4_OPERATIONS.md) 提供共享初始化、strict SSH 部署、隧道检查、健康诊断和单变量复测。
 - **V4 P0–P2 执行改造：** [配置与验收边界](docs/V4_PERFORMANCE_EXECUTION.md)，包括实际原生 2–4 请求时间片、同轨迹增长前缀、投机校准及健康环经济重组。时间片不是多请求 GEMM，GPU 收益仍需实测。
 - **V4 B4与批图：** [独立batch合同](docs/V4_DEVICE_BATCHING.md)及[scalar/eager/partial真机验收](docs/V4_BATCH_GRAPH_ACCEPTANCE.md)，保留原scalar whole和四策略门槛。
+- **V4 本机与草稿改造：** [默认关闭的六项合同](docs/V4_DUALGPU_IMPROVEMENTS.md)、[CUDA/原模型及离线训练步骤](docs/V4_DUALGPU_ACCEPTANCE.md)。
+- **V4 六项性能衔接：** [全环成本、设备摘要、生产选环、持久异长批、专家分段图和增量 KV 验收](docs/V4_SIX_ACCEPTANCE.md)。
 - **小磁盘节点：** [流式权重准备与请求边界换环](docs/WEIGHT_PREPARATION.md)。当前原 V4 native 适配支持局部分片；GPT-OSS 的完整下载 inventory 要求保持原合同。
 - **开放网络：** [节点登记、资源租约、组环和服务](docs/OPEN_INFERENCE_NETWORK.md)。
 - **M2.5 旧环：** [独立兼容运行指南](phase0/DEPLOY_M25.md)。其协议、依赖和启动器不会自动获得新 GPT-OSS/V4 会话合同。

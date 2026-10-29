@@ -180,6 +180,12 @@ def _surface_source(profile, calibrations):
         for name, sha in inventory.items():
             _text(name, "engine source file", 512)
             _hash(sha, "engine source file SHA256")
+        if surface.get("schema") == "shard-stage-cost-surface/2":
+            from .stage_cost import validate_role
+            role = validate_role(surface["role"], surface["decode_mode"])
+            if (any(type(config.get(name)) is not bool or role[name] != config[name] for name in ("head", "tail"))
+                    or role["draft"] and config.get("dspark") is not True):
+                raise ValueError("cost surface role differs from calibrated head/tail/MTP runtime")
         bound.append(hashlib.sha256(canonical(inventory)).hexdigest())
     if not bound or any(value != source for value in bound):
         raise ValueError("cost surface source differs from its matching runtime calibration")
@@ -201,6 +207,10 @@ def _offer_trace(offer, cohort_id, profile, *, now, calibrations=()):
     if type(frame_tokens) is not int or not 1 <= frame_tokens <= 256:
         raise ValueError("invalid trace frame_tokens")
     workload = {"frame_tokens": frame_tokens}
+    surface = trace.get("cost_surface", {})
+    if surface.get("schema") == "shard-stage-cost-surface/2":
+        workload.update(decode_mode=surface.get("decode_mode"), role=surface.get("role"),
+                        context_tokens=trace.get("context_tokens"), warmness=trace.get("warmness"))
     if frame_tokens > 1:
         context = trace.get("context_tokens")
         if type(context) is not int or not 1 <= context <= 1_000_000:

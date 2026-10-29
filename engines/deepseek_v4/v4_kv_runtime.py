@@ -62,7 +62,7 @@ class V4KVRuntime:
     """
     def __init__(self, layers, args, *, device, dtype, gpu_budget_bytes,
                  host_budget_bytes, spec_depth=0, draft_layers=0, reference=False,
-                 prefill_gate=False):
+                 prefill_gate=False, indexed_gather=False):
         _count(gpu_budget_bytes, "kv_gpu_budget_bytes", positive=True)
         _count(host_budget_bytes, "kv_host_budget_bytes", positive=True)
         _count(spec_depth, "spec_depth")
@@ -70,6 +70,10 @@ class V4KVRuntime:
         if type(reference) is not bool:
             raise ValueError("kv_reference must be a boolean")
         self.device, self.dtype, self.reference = torch.device(device), dtype, reference
+        if type(indexed_gather) is not bool:
+            raise ValueError("indexed_gather must be boolean")
+        self.indexed_gather = indexed_gather
+        self._gather_active = None
         if reference != (self.device.type == "cpu"):
             raise ValueError("tiered KV needs CUDA, or explicit CPU reference emulation")
         if self.device.type not in ("cpu", "cuda"):
@@ -81,7 +85,10 @@ class V4KVRuntime:
         self._resident_prefix = None
         element = torch.empty((), dtype=dtype, device="cpu").element_size()
         self.element_size = element
+        self.gather_scratch_bytes = (args.max_batch_size * (args.window_size + args.index_topk)
+                                    * (4 * args.head_dim * element + 64)) if indexed_gather else 0
         self.fixed_bytes = 0
+        self.index_device_bytes = 0
         self.host_history_bytes = 0
         self.entries = {}
         for layer in self.layers:
@@ -101,6 +108,10 @@ class V4KVRuntime:
                 indexer = getattr(attn, "indexer", None)
                 if indexer is not None:
                     self.host_history_bytes += args.max_batch_size * rows * indexer.head_dim * element
+                    if indexed_gather:
+                        amount = args.max_batch_size * rows * indexer.head_dim * element
+                        self.fixed_bytes += amount
+                        self.index_device_bytes += amount
         self.draft_reserve_bytes = draft_layers * args.max_batch_size * args.window_size * args.head_dim * element
         # Python builds the incoming snapshot before deque.append evicts its
         # oldest entry, so the transient bound is W+1, even for maxlen=0.
@@ -118,10 +129,10 @@ class V4KVRuntime:
         gate_kv = max((max(self._elements(layer.attn, args.max_seq_len) * element,
                           layer.attn.kv_cache.numel() * element) for layer in self.layers), default=0)
         self.gate_host_reserve_bytes = 3 * (gate_kv + largest_state) if prefill_gate else 0
-        required_host = self.host_history_bytes + self.snapshot_reserve_bytes + self.gate_host_reserve_bytes
+        required_host = self.host_history_bytes + self.snapshot_reserve_bytes + self.gate_host_reserve_bytes + self.gather_scratch_bytes
         if host_budget_bytes < required_host:
             raise ValueError(f"KV host quota needs at least {required_host} bytes including rollback reserve")
-        available = gpu_budget_bytes - self.fixed_bytes - self.draft_reserve_bytes
+        available = gpu_budget_bytes - self.fixed_bytes - self.draft_reserve_bytes - self.gather_scratch_bytes
         # Every indexed attention needs a contiguous [ring, compressed] operand.
         minimum = max((args.max_batch_size * args.window_size * layer.attn.head_dim * element
                        for layer in self.layers if layer.attn.compress_ratio), default=0)
@@ -131,8 +142,8 @@ class V4KVRuntime:
         self.workspace_bytes = min(available // element * element, maximum)
         if not reference:
             free, _ = torch.cuda.mem_get_info(self.device)
-            if self.workspace_bytes > free:
-                raise RuntimeError("KV workspace exceeds measured free VRAM")
+            if self.workspace_bytes + self.index_device_bytes + self.gather_scratch_bytes > free:
+                raise RuntimeError("KV workspace, resident index and gather reserve exceed measured free VRAM")
         self.workspace = torch.empty(self.workspace_bytes // element, dtype=dtype, device=self.device)
         for layer in self.layers:
             attn, ratio = layer.attn, layer.attn.compress_ratio
@@ -148,6 +159,12 @@ class V4KVRuntime:
                              if indexer is not None else None)
             self.entries[id(attn)] = {"attention": attn, "ring": attn.kv_cache,
                                      "history": history, "index_history": index_history}
+            if indexed_gather and indexer is not None:
+                entry = self.entries[id(attn)]
+                entry["index_device"] = torch.zeros_like(index_history, device=self.device, pin_memory=False)
+                entry["index_version"] = index_history._version
+                from v4_indexed_kv import install
+                install(attn, self)
         self.reset_stats()
 
     def _elements(self, attn, end_pos):
@@ -232,6 +249,8 @@ class V4KVRuntime:
             if self._active is not None:
                 raise RuntimeError("cannot invalidate an active KV workspace")
             self._resident_prefix = None
+            for entry in self.entries.values():
+                entry["index_version"] = None
 
     def _prefix_stamp(self, entry, rows, batch):
         return (id(entry["attention"]), rows, batch, self.workspace._version,
@@ -267,11 +286,12 @@ class V4KVRuntime:
             # Materialize only the already-valid prefix; retain the full operand
             # shape, so Indexer and attention arithmetic are unchanged.
             previous_rows = 0 if start_pos == 0 else start_pos // attn.compress_ratio
+            gathered = self.indexed_gather and getattr(attn, "indexer", None) is not None and start_pos > 0 and tokens == 1
             reuse = self._resident_prefix == self._prefix_stamp(entry, rows, batch)
             count = self.args.max_batch_size * (attn.window_size + rows) * attn.head_dim
             kv = self.workspace[:count].view(self.args.max_batch_size, attn.window_size + rows, attn.head_dim)
             kv[:, :attn.window_size].copy_(entry["ring"])
-            if previous_rows and not reuse:
+            if previous_rows and not reuse and not gathered:
                 self._copy_host_rows(kv[:, attn.window_size:attn.window_size + previous_rows],
                                      entry["history"][:, :previous_rows], batch)
                 self.h2d_bytes += batch * previous_rows * attn.head_dim * self.element_size if not self.reference else 0
@@ -280,9 +300,11 @@ class V4KVRuntime:
             attn.compressor.freqs_cis = attn.freqs_cis
             indexer = getattr(attn, "indexer", None)
             if indexer is not None:
-                index = self.workspace[count:count + self.args.max_batch_size * rows * indexer.head_dim].view(
-                    self.args.max_batch_size, rows, indexer.head_dim)
-                if previous_rows and not reuse:
+                index = (entry["index_device"][:, :rows] if self.indexed_gather else
+                    self.workspace[count:count + self.args.max_batch_size * rows * indexer.head_dim].view(
+                        self.args.max_batch_size, rows, indexer.head_dim))
+                reload_index = (entry.get("index_version") != entry["index_history"]._version) if self.indexed_gather else not reuse
+                if previous_rows and reload_index:
                     self._copy_host_rows(index[:, :previous_rows], entry["index_history"][:, :previous_rows], batch)
                     self.h2d_bytes += batch * previous_rows * indexer.head_dim * self.element_size if not self.reference else 0
                 indexer.kv_cache = index
@@ -290,6 +312,7 @@ class V4KVRuntime:
                 indexer.compressor.kv_cache = index
                 indexer.compressor.freqs_cis = attn.freqs_cis
             self._active = id(attn)
+            self._gather_active = dict(entry, previous=previous_rows) if gathered else None
             succeeded = False
             try:
                 yield
@@ -315,6 +338,9 @@ class V4KVRuntime:
                     indexer.compressor.kv_cache = None
                 self._record_current_stream(stream)
                 self._active = None
+                self._gather_active = None
+                if indexer is not None and self.indexed_gather:
+                    entry["index_version"] = entry["index_history"]._version if succeeded else None
                 self.layer_calls += int(succeeded)
                 self.prefix_rows_loaded += previous_rows if succeeded and not reuse else 0
                 self.prefix_rows_reused += previous_rows if succeeded and reuse else 0
@@ -323,12 +349,14 @@ class V4KVRuntime:
 
     def reset_stats(self):
         self.h2d_bytes = self.d2h_bytes = self.layer_calls = 0
+        self.gather_calls = self.gather_selected_rows = self.gather_index_d2h_bytes = 0
         self.prefix_rows_loaded = self.prefix_rows_reused = self.new_rows_not_loaded = 0
 
     def reset(self):
         with self._lock:
             if self._active is not None:
                 raise RuntimeError("cannot reset an active KV workspace")
+            stream = self._ordered_stream()
             self.synchronize_host()
             self._resident_prefix = None
             for entry in self.entries.values():
@@ -343,13 +371,42 @@ class V4KVRuntime:
                 entry["history"].zero_()
                 if entry["index_history"] is not None:
                     entry["index_history"].zero_()
+                if "index_device" in entry:
+                    entry["index_device"].zero_()
+                    entry["index_version"] = entry["index_history"]._version
             self.reset_stats()
+            self._record_current_stream(stream)
+
+    def finish_stage_reset(self):
+        """Publish ALL Stage.reset writes, including its Compressor reset.
+
+        The next layer on a different CUDA stream waits on this new event. A
+        record inside reset() alone would precede Stage's later state writes.
+        """
+        with self._lock:
+            if self._active is not None:
+                raise RuntimeError("cannot finish reset while a KV layer is active")
+            self._record_current_stream(self._ordered_stream())
+
+    def scratch_reservation(self):
+        """Transient gather allocations are absent from tensor inventories.
+
+        The bound includes staged rows, compact/device gather outputs and index
+        metadata. Pinned bytes are a subset of the host bound. CPU emulation
+        cannot report virtual GPU capacity as actual device memory.
+        """
+        return {"remaining_host_reserved_bytes": self.gather_scratch_bytes,
+                "remaining_device_reserved_bytes": 0 if self.reference else self.gather_scratch_bytes,
+                "pinned_reserved_bytes": 0 if self.reference else self.gather_scratch_bytes,
+                "scope": "indexed KV transient gather bound; outside persistent tensor inventory"}
 
     def tensors(self):
         """Actual owned storage; callers deduplicate views and module aliases."""
         yield "workspace", self.workspace
         for i, entry in enumerate(self.entries.values()):
-            for name in ("ring", "history", "index_history"):
+            for name in ("ring", "history", "index_history", "index_device"):
+                if name not in entry:
+                    continue
                 yield f"layer_{i}.{name}", entry[name]
 
     def status(self):
@@ -373,6 +430,9 @@ class V4KVRuntime:
     def transfer_status(self):
         """Additional diagnostics, separate from the existing signed KV schema."""
         return {"schema": "v4-kv-transfer/1", "reference": self.reference,
+                "indexed_gather": self.indexed_gather, "gather_calls": self.gather_calls,
+                "gather_selected_rows": self.gather_selected_rows,
+                "gather_index_d2h_bytes": self.gather_index_d2h_bytes,
                 "prefix_rows_loaded": self.prefix_rows_loaded, "prefix_rows_reused": self.prefix_rows_reused,
                 "new_rows_not_loaded": self.new_rows_not_loaded,
                 "contract": "existing-valid-prefix-only; unchanged owner/layout/history/workspace versions",

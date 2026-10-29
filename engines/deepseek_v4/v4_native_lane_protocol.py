@@ -155,13 +155,15 @@ def handle(st, message, *, stage_index, session, signer_key, vp, owner_grant=Non
                     h = st.embed(ids)
                     incoming = vp._payload_bytes(h, ids)
                 else:
-                    h, received, incoming = vp._recv_hids(message, ctx["signer"], device=st.device)
+                    h, received, incoming = vp._recv_hids(message, ctx["signer"], device=st.device,
+                                                        **_host_options(st, request, job, pos))
                     if received.shape != ids.shape or not torch.equal(received.to(ids.device), ids):
                         raise ValueError("native input token changed between authenticated stages")
                 with torch.no_grad():
                     h = st.forward(h, ids, pos)
                 runner.finish_step(key)
-                frame, outgoing = vp._make_step_frame(h, ids, pos, ctx["signer"])
+                frame, outgoing = vp._make_step_frame(h, ids, pos, ctx["signer"],
+                                                      **_host_options(st, request, job, pos))
                 ctx["signer"].observe(incoming, outgoing)
                 result = {"pos": pos + 1}
                 if st.tail:
@@ -216,6 +218,8 @@ def _batch_step(st, message, outer, runner, contexts, *, session, vp):
     # Identity differs between tenants. All other envelope bindings must agree.
     shared.remove("identity_sha256")
     seen, rows, pos, capture_graph = set(), [], None, None
+    persistent = getattr(runner, "storage_mode", "copy") == "persistent"
+    positions = []
     for request in requests:
         if (set(request) != set(outer) or any(request.get(k) != outer[k] for k in shared)
                 or request.get("action") != "step" or not isinstance(request.get("request_id"), str)
@@ -236,8 +240,9 @@ def _batch_step(st, message, outer, runner, contexts, *, session, vp):
             capture_graph = value["capture_graph"]
         if value["capture_graph"] != capture_graph:
             raise ValueError("native batch graph admission must agree within the authenticated cohort")
-        if value["pos"] != pos or key not in runner.active or runner.active[key]["pos"] != pos:
+        if (not persistent and value["pos"] != pos) or key not in runner.active or runner.active[key]["pos"] != value["pos"]:
             raise ValueError("native batch requires equal independent frontiers")
+        positions.append(value["pos"])
         seen.add(key)
         rows.append((key, ctx, value["token"]))
     if outer["job"] != requests[0]["job"] or outer["identity_sha256"] != requests[0]["identity_sha256"]:
@@ -252,21 +257,24 @@ def _batch_step(st, message, outer, runner, contexts, *, session, vp):
         incoming = [vp._payload_bytes(h[i:i + 1], ids[i:i + 1]) for i in range(len(rows))]
     else:
         for index, (_, ctx, _) in enumerate(rows):
-            hrow, received, raw = vp._recv_hids(frames[index], ctx["signer"], device=st.device)
+            hrow, received, raw = vp._recv_hids(frames[index], ctx["signer"], device=st.device,
+                                               **_host_options(st, outer, ctx["job"], positions[index]))
             if received.shape != ids[index:index + 1].shape or not torch.equal(received.to(ids.device), ids[index:index + 1]):
                 raise ValueError("native batch token/hash row changed between authenticated stages")
             payloads.append(hrow)
             incoming.append(raw)
         h = torch.cat(payloads, dim=0)
     with torch.no_grad():
-        h = runner.forward_batch([key for key, _, _ in rows], h, ids, pos, capture_graph=capture_graph)
+        h = runner.forward_batch([key for key, _, _ in rows], h, ids, positions if persistent else pos, capture_graph=capture_graph)
         predictions = runner.logits_all(h, full_logits=False).reshape(len(rows), -1).argmax(-1).tolist() if st.tail else None
     outgoing_frames, results = [], []
     for index, (key, ctx, _) in enumerate(rows):
-        frame, outgoing = vp._make_step_frame(h[index:index + 1], ids[index:index + 1], pos, ctx["signer"])
+        position = positions[index]
+        frame, outgoing = vp._make_step_frame(h[index:index + 1], ids[index:index + 1], position, ctx["signer"],
+                                              **_host_options(st, outer, ctx["job"], position))
         ctx["signer"].observe(incoming[index], outgoing)
         outgoing_frames.append(frame)
-        result = {"job": ctx["job"], "pos": pos + 1}
+        result = {"job": ctx["job"], "pos": position + 1}
         if st.tail:
             result["token"] = int(predictions[index])
         results.append(result)
@@ -274,4 +282,14 @@ def _batch_step(st, message, outer, runner, contexts, *, session, vp):
         message = {"op": "native_lane", "request": message["request"],
                    "acks": message.get("acks", []), "batch_frames": outgoing_frames}
     return message, {"steps": results, "actual_batch_size": len(rows),
-                     "compute": "native_equal_frontier_batch", "graph_capture_allowed": capture_graph}
+                     "compute": "native_persistent_ragged_batch" if persistent else "native_equal_frontier_batch",
+                     "graph_capture_allowed": capture_graph}
+
+
+def _host_options(stage, request, job, position):
+    transport = getattr(stage, "_host_transport", None)
+    if transport is None:
+        return {}
+    from v4_host_transport import request_binding
+    return {"host_transport": transport, "host_binding": request_binding(request["owner_epoch"], job,
+                                                                         start_pos=position)}

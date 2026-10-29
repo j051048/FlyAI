@@ -49,7 +49,9 @@ CONTEXT = "Reference note: measure the actual result, preserve the inputs, and r
 
 # An explicit baseline recipe, not the engine's mutable implicit defaults. Operators must launch
 # their stages with these same values; --env-file can freeze a DIFFERENT experiment recipe.
-from engines.deepseek_v4.v4_execution_profiles import baseline_environment
+from engines.deepseek_v4.v4_execution_profiles import (
+    baseline_environment, public_environment_overrides, PRIVATE_CONFIG_PATHS,
+)
 DEFAULT_ENV = baseline_environment()
 HISTORICAL = {
     "source": "docs/receipts/v4-flash-matrix-20260802.json",
@@ -226,7 +228,10 @@ def source_identity(root: Path = ROOT) -> dict:
     for directory in (root / "engines" / "deepseek_v4", root / "vendor" / "deepseek_v4_ref", root / "shard"):
         paths.update(directory.rglob("*.py"))
     for name in ("phase0/wire.py", "phase0/ngram_draft.py", "phase0/v4_benchmark.py", "phase0/v4_soak.py", "phase0/v4_release.py",
-                 "phase0/v4_profile_report.py", "phase0/v4_ring_economics.py", "phase0/v4_round_calibration.py"):
+                 "phase0/v4_profile_report.py", "phase0/v4_ring_economics.py", "phase0/v4_round_calibration.py",
+                 "phase0/v4_role_calibration.py", "phase0/v4_draft_training.py",
+                 "phase0/v4_draft_chain_probe.py", "phase0/v4_host_transport_probe.py",
+                 "phase0/v4_incremental_qualification.py", "phase0/v4_incremental_case_probe.py"):
         if (root / name).is_file():
             paths.add(root / name)
     files = [{"name": p.relative_to(root).as_posix(), "sha256": file_digest(p)} for p in sorted(paths)]
@@ -377,6 +382,8 @@ def protocol_errors(p: dict) -> list[str]:
                 errors.append("prompt IDs/content do not match frozen workload protocol")
                 break
         env = p.get("env", {})
+        if any(key in env for key in PRIVATE_CONFIG_PATHS):
+            errors.append("private worker configuration paths cannot enter a public benchmark recipe")
         if (not all(k in env for k in DEFAULT_ENV) or not all(isinstance(k, str) and
                 k.startswith("V4_") and isinstance(v, str) for k, v in env.items())):
             errors.append("explicit V4 kernel/graph/quantization environment is incomplete")
@@ -1104,11 +1111,9 @@ def _write(path, obj):
 
 
 def _prepare(args):
+    env = {**DEFAULT_ENV, **public_environment_overrides(_read(args.env_file) if args.env_file else {})}
     inventory = _checkpoint_identity(checkpoint_inventory(args.dir))
     source = source_identity()
-    env = dict(DEFAULT_ENV)
-    if args.env_file:
-        env.update(_read(args.env_file))
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     from engines.deepseek_v4.v4_tokenizer import load_v4_tokenizer
@@ -1185,9 +1190,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "inventory":
-            env = dict(DEFAULT_ENV)
-            if args.env_file:
-                env.update(_read(args.env_file))
+            env = {**DEFAULT_ENV, **public_environment_overrides(_read(args.env_file) if args.env_file else {})}
             _write(args.out, {"checkpoint": checkpoint_inventory(args.dir), "source": source_identity(),
                               "env": env, "stage_env_sha256": digest(env)})
             return 0

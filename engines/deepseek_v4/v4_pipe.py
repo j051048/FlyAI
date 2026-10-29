@@ -458,8 +458,22 @@ def _wire_bytes(h, ids, hs):
     return _tbytes(h) + _tbytes(ids) + _tbytes(hs)
 
 
+def _actual_frame_digest(transport, h, ids, scale=None, envelope=None):
+    """The existing receipt byte order, read from actual local tensors."""
+    if envelope is not None:
+        from v4_privacy import wire_token_bytes
+        tokens = wire_token_bytes(envelope)
+        prefix = b"V4-sealed-wire/1\0" + struct.pack("<QQQ", h.numel()*h.element_size(),
+            0 if scale is None else scale.numel()*scale.element_size(), len(tokens))
+        parts = [prefix, h] + ([] if scale is None else [scale]) + [tokens]
+    else:
+        parts = [h, ids] + ([] if scale is None else [scale])
+    return transport.frame_digest(parts)
+
+
 def _recv_hids(msg, signer, *, device=None, token_privacy=None,
-               stage_lo=0, n_hash_layers=3, is_tail=False, binding=None):
+               stage_lo=0, n_hash_layers=3, is_tail=False, binding=None,
+               host_transport=None, host_binding=None):
     """Take (h, ids) off a received step frame, upcasting h from fp8 when the wire carried it.
     Returns (h, ids, in_bytes) where in_bytes is the receipt in_root digest over the EXACT received
     wire bytes (None when not signing).
@@ -470,7 +484,14 @@ def _recv_hids(msg, signer, *, device=None, token_privacy=None,
     sidecar went missing would otherwise sail through `st.forward`'s `h.to(self.dtype)` as a tensor
     scaled by ~1/scale, with no exception, no NaN, and an intact receipt chain (both sides hash the
     same bytes). ValueError is in _STRAY, so a malformed frame resets the edge like any other."""
-    h = msg["h"]
+    if host_transport is not None:
+        host_transport.touch()
+    if "host_ref" in msg:
+        if host_transport is None or host_binding is None or "h" in msg:
+            raise ValueError("local activation requires the configured strict host channel and exact owner")
+        h = host_transport.receive(msg["host_ref"], host_binding)
+    else:
+        h = msg["h"]
     envelope = msg.get("sealed_ids")
     if token_privacy is not None:
         if envelope is None or "ids" in msg or "dnxt" in msg:
@@ -484,6 +505,8 @@ def _recv_hids(msg, signer, *, device=None, token_privacy=None,
             raise ValueError("sealed token frame on a legacy stage")
         ids = _ids_tensor(msg["ids"])
     def received_bytes(scale=None):
+        if "host_ref" in msg and getattr(host_transport, "device_digest_enabled", False):
+            return _actual_frame_digest(host_transport, h, ids, scale=scale, envelope=envelope)
         if envelope is not None:
             from v4_privacy import wire_payload_bytes
             return wire_payload_bytes(_tbytes(h), envelope, _tbytes(scale) if scale is not None else b"")
@@ -498,6 +521,8 @@ def _recv_hids(msg, signer, *, device=None, token_privacy=None,
             raise ValueError(f"step frame: h8 {getattr(hs, 'shape', type(hs))} does not scale "
                              f"h {tuple(h.shape)} per (position, stream)")
         in_b = received_bytes(hs) if signer is not None else None
+        if h.is_cuda:
+            hs = hs.to(h.device)
         if V4_WIRE_FUSED and device is not None and str(device).startswith("cuda"):
             import v4_wire_codec
             if v4_wire_codec.can_unpack(h, hs, device=device):
@@ -508,7 +533,8 @@ def _recv_hids(msg, signer, *, device=None, token_privacy=None,
     return h, ids, (received_bytes() if signer is not None else None)
 
 
-def _make_step_frame(h, ids, start_pos, signer, *, token_envelope=None):
+def _make_step_frame(h, ids, start_pos, signer, *, token_envelope=None,
+                     host_transport=None, host_binding=None):
     """Build the forwarded step frame + its receipt out_root digest. fp8-packs h when V4_FP8_WIRE,
     carrying the per-tensor scale as the h8 sidecar; the out digest hashes the packed wire bytes so
     the next stage's in_root matches losslessly. The ids ride int64 in both modes.
@@ -520,25 +546,72 @@ def _make_step_frame(h, ids, start_pos, signer, *, token_envelope=None):
     tensor to both is byte-identical by construction — they were always hashing and sending the same
     values, and now they hash and send the same buffer."""
     ids = _ids_tensor(ids)
+    if getattr(host_transport, "device_digest_enabled", False):
+        if token_envelope is not None:
+            from v4_privacy import validate_envelope
+            validate_envelope(token_envelope, shape=list(h.shape[:2]))
+        source, scale = _pack_t(h) if V4_FP8_WIRE else (h, None)
+        reference = host_transport.publish(source, host_binding)
+        if reference is not None:
+            frame = {"op": "step", "host_ref": reference, "start_pos": start_pos}
+            frame["sealed_ids" if token_envelope is not None else "ids"] = token_envelope if token_envelope is not None else ids
+            if scale is not None:
+                frame["h8"] = scale
+            out_b = (_actual_frame_digest(host_transport, source, ids, scale=scale, envelope=token_envelope)
+                     if signer is not None else None)
+            return frame, out_b
     if token_envelope is not None:
         from v4_privacy import validate_envelope, wire_payload_bytes
         validate_envelope(token_envelope, shape=list(h.shape[:2]))
         if V4_FP8_WIRE:
             qh, sh = _pack_t(h)
+            source_h = qh
             qh = qh.detach().cpu().contiguous()
             frame = {"op": "step", "h": qh, "h8": sh, "sealed_ids": token_envelope, "start_pos": start_pos}
-            return frame, (wire_payload_bytes(_tbytes(qh), token_envelope, _tbytes(sh)) if signer else None)
+            out_b = wire_payload_bytes(_tbytes(qh), token_envelope, _tbytes(sh)) if signer else None
+            return _local_frame(frame, source_h, host_transport, host_binding), out_b
         hc = h.detach().cpu().contiguous()
         frame = {"op": "step", "h": hc, "sealed_ids": token_envelope, "start_pos": start_pos}
-        return frame, (wire_payload_bytes(_tbytes(hc), token_envelope) if signer else None)
+        out_b = wire_payload_bytes(_tbytes(hc), token_envelope) if signer else None
+        return _local_frame(frame, h, host_transport, host_binding), out_b
     if V4_FP8_WIRE:
         qh, sh = _pack_t(h)
+        source_h = qh
         qh = qh.detach().cpu().contiguous()
         frame = {"op": "step", "h": qh, "h8": sh, "ids": ids, "start_pos": start_pos}
-        return frame, (_wire_bytes(qh, ids, sh) if signer is not None else None)
+        out_b = _wire_bytes(qh, ids, sh) if signer is not None else None
+        return _local_frame(frame, source_h, host_transport, host_binding), out_b
     hc = h.detach().cpu().contiguous()
     frame = {"op": "step", "h": hc, "ids": ids, "start_pos": start_pos}
-    return frame, (_payload_bytes(hc, ids) if signer is not None else None)
+    out_b = _payload_bytes(hc, ids) if signer is not None else None
+    return _local_frame(frame, h, host_transport, host_binding), out_b
+
+
+def _local_frame(frame, source, transport, binding):
+    if transport is not None:
+        reference = transport.publish(source, binding, witness=frame["h"])
+        if reference is not None:
+            frame = dict(frame, host_ref=reference)
+            frame.pop("h")
+    return frame
+
+
+def _host_frame_options(stage, message):
+    transport = getattr(stage, "_host_transport", None)
+    if transport is None:
+        return {}
+    from v4_host_transport import stage_binding
+    return {"host_transport": transport, "host_binding": stage_binding(stage, message)}
+
+
+def _discard_local_frame(stage, message):
+    if "host_ref" in message:
+        options = _host_frame_options(stage, message)
+        if not options:
+            raise ValueError("fenced local activation on an unconfigured host channel")
+        options["host_transport"].discard(message["host_ref"], options["host_binding"])
+        message = {key: value for key, value in message.items() if key != "host_ref"}
+    return message
 
 
 # ── the epoch fence: recognising frames from a CANCELLED speculation ────────────────────────────────
@@ -570,7 +643,7 @@ def _make_step_frame(h, ids, start_pos, signer, *, token_envelope=None):
 # TAIL reads them, which is exactly why they belong here: a forwarding stage rebuilds the frame around
 # its own activations (`_make_step_frame`), so anything the coordinator says to the tail has to be
 # named as header or it is dropped at the first hop and the tail simply never sees the hint.
-_PASSTHRU = ("epoch", "cpos", "dnxt", "dprev", "conversation_shadow")
+_PASSTHRU = ("epoch", "cpos", "dnxt", "dprev", "conversation_shadow", "round_cost_trace")
 
 
 def _fenced(msg, epoch):
@@ -962,6 +1035,32 @@ def _reset_capacity_error(st, msg):
     return None
 
 
+def _close_stage_local_resources(st, stage):
+    """Best-effort stop without converting uncertain DMA into a free permit."""
+    if st is None:
+        return
+    incomplete = []
+    transport = getattr(st, "_host_transport", None)
+    compute = getattr(st, "_host_compute", None)
+    if transport is not None:
+        try:
+            transport.close()
+            if transport.status().get("quarantined_slots", 0):
+                incomplete.append("host_activation_slots_await_peer_ack")
+        except Exception as error:
+            incomplete.append("host_transport:" + type(error).__name__)
+    if compute is not None and not getattr(compute, "_closed", False):
+        try:
+            # Default close checks that owned work drained. In particular it
+            # refuses a failed completion fence; this path never forces it.
+            compute.close()
+        except Exception as error:
+            incomplete.append("host_compute:" + type(error).__name__)
+    if incomplete:
+        _stage_event("cleanup_incomplete", stage, operation="close", resources=incomplete,
+                     service_ready=False, forced_reclamation=False)
+
+
 def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=None, device=None,
                 receipts=None, key_path=None, timeout=600.0, bind="127.0.0.1", ready=None,
                 ret_relay=None, dspark=False, runtime_metrics=None, token_privacy=None, lease_guard=None,
@@ -1030,124 +1129,131 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
         # it killed the head stage's prefill on the first live ring, 2026-08-01). Guarded by the
         # same cuda condition so the CPU suite keeps its fp32 default.
         torch.set_default_dtype(torch.bfloat16)
-    with _BUILD_LOCK:                                   # process-wide torch/reference globals — see the lock
-        options = dict(head=head, tail=tail, dspark=(dspark and tail), device=dev)
-        if runtime_metrics is not None:
-            options["runtime_metrics"] = runtime_metrics
-        st = V4.Stage(lo, hi, args, **options)
-        if lease_guard is not None:
-            from shard.leased_runtime import install_stage_lease_checks
-            install_stage_lease_checks(st, lease_guard)
-        if ckpt_dir is not None:
-            st.load(ckpt_dir)
-    if session_config is not None and session_config.plan.get("model_cohort"):
-        from v4_native_lanes import CONTRACT as native_contract
-        from v4_native_batch import BATCH_CONTRACT
-        declared_native = session_config.plan["model_cohort"]["numeric_contract"] in (native_contract, BATCH_CONTRACT)
-        if declared_native != (getattr(st, "_native_lanes", None) is not None):
-            raise ValueError("native tokenwise runtime and signed numerical cohort differ")
-        if declared_native and st._native_lanes.contract != session_config.plan["model_cohort"]["numeric_contract"]:
-            raise ValueError("loaded scalar/batched native contract differs from signed cohort")
-    if getattr(st, "_native_lanes", None) is not None and V4_SEALED_IDS:
-        raise ValueError("native lane v1 does not claim sealed token-ID compatibility")
-    preloaded_drafter = {}
-    if tail and dspark and session_config is not None:
-        loaded_drafter = _tail_drafter(st, ckpt_dir, preloaded_drafter)
-        if hasattr(st, "observe_runtime_drafter"):
-            st.observe_runtime_drafter(loaded_drafter)
-    declared_config = getattr(lease_guard, "expected_runtime_config", None)
-    if declared_config is not None:
-        from v4_resources import runtime_config_payload
-        actual_config = runtime_config_payload(st)
-        def portable_config(value):
-            value = dict(value)
-            value["environment"] = {k: v for k, v in value.get("environment", {}).items()
-                                    if k not in ("V4_DIR", "V4_DEV")}
-            return value
-        if (json.dumps(portable_config(actual_config), sort_keys=True, allow_nan=False) !=
-                json.dumps(portable_config(declared_config), sort_keys=True, allow_nan=False)):
-            raise ValueError("loaded V4 runtime differs from its calibrated lease configuration")
-    st._token_privacy = token_privacy if token_privacy is not None else _configured_token_privacy(
-        trusted=head or tail or lo < getattr(args, "n_hash_layers", 3))
-    st._privacy_job = None
-    if V4_WIRE_FUSED and str(dev).startswith("cuda"):
-        import v4_wire_codec
-        example = torch.zeros(1, 1, args.hc_mult, args.dim, dtype=st.dtype, device=dev)
-        v4_wire_codec.warmup(example)
-        del example
-    node_key = load_or_make_node_key(key_path) if receipts or session_config is not None else None
-    print(f"[s{stage}] {st}", flush=True)
-    # THE LEVER AUDIT, here and not later: everything a stage installs is installed by now, and every
-    # number this process is about to produce is about whatever configuration it actually reached.
-    # Requested vs LIVE-observed, per lever, to the log this launch already redirects stderr into.
-    # Raises under V4_LEVERS_STRICT rather than serving a ring whose measurement would be meaningless.
-    v4_levers.report(side=v4_levers.STAGE, stage=st)
-    st._runtime_session_config = session_config
-    st._diagnostic_stage_index = stage
-    st._diagnostic_operation = "listen"
-    from v4_conversation_protocol import configured_cache
-    st._conversation_cache = configured_cache(st)
-    st._conversation_lease_guard = lease_guard
-    st._conversation_restore_note = None
-    from v4_observability import runtime_observation
-    loaded_observation = runtime_observation(st, session_config=session_config)
-    _stage_event("loaded", stage, operation="load", observation=loaded_observation,
-                 lo=lo, hi=hi, strict=session_config is not None)
-
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((bind, port))
-    srv.listen(32)
-    _stage_event("listening", stage, operation="listen", listener=f"{bind}:{port}",
-                 service_ready=False)
-    acceptor = (SessionAcceptor(srv, session_config, _raw_send_msg, _raw_recv_msg,
-                               key=node_key, timeout=timeout) if session_config is not None else None)
-    # non-tail stages dial the forward leg at startup (a dead --next at boot is a launcher bug); the
-    # sidecar tunnels FWD_RING to the next stage's inbound. Kernel accepts the handshake as soon as
-    # the peer is listening, so this completes before the peer calls accept().
-    st._diagnostic_operation = "successor_connect"
-    nxt_sock = _dial(*nxt.rsplit(":", 1), timeout=timeout) if (not tail and nxt) else None
-    if nxt_sock is not None and session_config is not None:
-        nxt_sock = hello_client(nxt_sock, session_config, stage + 1, "forward", _raw_send_msg, _raw_recv_msg, key=node_key)
-    elif nxt_sock is not None and SWARM_TOKEN is not None:
-        send_msg(nxt_sock, {"op": "hello_pred", "token": SWARM_TOKEN})
-    if nxt_sock is not None:
-        _stage_event("successor_connected", stage, operation="successor_connect",
-                     endpoint=nxt, strict=session_config is not None, service_ready=False)
-    print(f"[s{stage}] listening {bind}:{port}"
-          + (f" -> {nxt}" if nxt_sock is not None else " (tail)")
-          + (f" pub={pub_b64(node_key)}" if node_key is not None else ""), flush=True)
-    if ready is not None:
-        ready.set()
-
+    st = None
+    srv = acceptor = nxt_sock = None
     try:
-        if tail:
-            st._diagnostic_operation = "predecessor_accept"
-            _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=(ckpt_dir if dspark
-                                                                               else None), acceptor=acceptor,
-                        drafter_cache=preloaded_drafter)
-        elif ret_relay is not None:
-            _serve_relay_ingress(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts,
-                                 timeout, ret_relay)
+        with _BUILD_LOCK:                                   # process-wide torch/reference globals — see the lock
+            options = dict(head=head, tail=tail, dspark=(dspark and tail), device=dev)
+            if runtime_metrics is not None:
+                options["runtime_metrics"] = runtime_metrics
+            st = V4.Stage(lo, hi, args, **options)
+            if lease_guard is not None:
+                from shard.leased_runtime import install_stage_lease_checks
+                install_stage_lease_checks(st, lease_guard)
+            if ckpt_dir is not None:
+                st.load(ckpt_dir)
+        if session_config is not None and session_config.plan.get("model_cohort"):
+            from v4_native_lanes import CONTRACT as native_contract
+            from v4_native_batch import BATCH_CONTRACT, PERSISTENT_BATCH_CONTRACT
+            declared_native = session_config.plan["model_cohort"]["numeric_contract"] in (native_contract, BATCH_CONTRACT, PERSISTENT_BATCH_CONTRACT)
+            if declared_native != (getattr(st, "_native_lanes", None) is not None):
+                raise ValueError("native tokenwise runtime and signed numerical cohort differ")
+            if declared_native and st._native_lanes.contract != session_config.plan["model_cohort"]["numeric_contract"]:
+                raise ValueError("loaded scalar/batched native contract differs from signed cohort")
+        if getattr(st, "_native_lanes", None) is not None and V4_SEALED_IDS:
+            raise ValueError("native lane v1 does not claim sealed token-ID compatibility")
+        preloaded_drafter = {}
+        if tail and dspark and session_config is not None:
+            loaded_drafter = _tail_drafter(st, ckpt_dir, preloaded_drafter)
+            if hasattr(st, "observe_runtime_drafter"):
+                st.observe_runtime_drafter(loaded_drafter)
+        declared_config = getattr(lease_guard, "expected_runtime_config", None)
+        if declared_config is not None:
+            from v4_resources import runtime_config_payload
+            actual_config = runtime_config_payload(st)
+            def portable_config(value):
+                value = dict(value)
+                value["environment"] = {k: v for k, v in value.get("environment", {}).items()
+                                        if k not in ("V4_DIR", "V4_DEV")}
+                return value
+            if (json.dumps(portable_config(actual_config), sort_keys=True, allow_nan=False) !=
+                    json.dumps(portable_config(declared_config), sort_keys=True, allow_nan=False)):
+                raise ValueError("loaded V4 runtime differs from its calibrated lease configuration")
+        st._token_privacy = token_privacy if token_privacy is not None else _configured_token_privacy(
+            trusted=head or tail or lo < getattr(args, "n_hash_layers", 3))
+        st._privacy_job = None
+        if V4_WIRE_FUSED and str(dev).startswith("cuda"):
+            import v4_wire_codec
+            example = torch.zeros(1, 1, args.hc_mult, args.dim, dtype=st.dtype, device=dev)
+            v4_wire_codec.warmup(example)
+            del example
+        node_key = load_or_make_node_key(key_path) if receipts or session_config is not None else None
+        print(f"[s{stage}] {st}", flush=True)
+        # THE LEVER AUDIT, here and not later: everything a stage installs is installed by now, and every
+        # number this process is about to produce is about whatever configuration it actually reached.
+        # Requested vs LIVE-observed, per lever, to the log this launch already redirects stderr into.
+        # Raises under V4_LEVERS_STRICT rather than serving a ring whose measurement would be meaningless.
+        v4_levers.report(side=v4_levers.STAGE, stage=st)
+        st._runtime_session_config = session_config
+        from v4_host_transport import configured as configured_host_transport
+        st._host_transport = configured_host_transport(st, session_config)
+        st._diagnostic_stage_index = stage
+        st._diagnostic_operation = "listen"
+        from v4_conversation_protocol import configured_cache
+        st._conversation_cache = configured_cache(st)
+        st._conversation_lease_guard = lease_guard
+        st._conversation_restore_note = None
+        st._round_stage_count = nstages
+        from v4_observability import runtime_observation
+        loaded_observation = runtime_observation(st, session_config=session_config)
+        _stage_event("loaded", stage, operation="load", observation=loaded_observation,
+                     lo=lo, hi=hi, strict=session_config is not None)
+
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((bind, port))
+        srv.listen(32)
+        _stage_event("listening", stage, operation="listen", listener=f"{bind}:{port}",
+                     service_ready=False)
+        acceptor = (SessionAcceptor(srv, session_config, _raw_send_msg, _raw_recv_msg,
+                                   key=node_key, timeout=timeout) if session_config is not None else None)
+        # non-tail stages dial the forward leg at startup (a dead --next at boot is a launcher bug); the
+        # sidecar tunnels FWD_RING to the next stage's inbound. Kernel accepts the handshake as soon as
+        # the peer is listening, so this completes before the peer calls accept().
+        st._diagnostic_operation = "successor_connect"
+        nxt_sock = _dial(*nxt.rsplit(":", 1), timeout=timeout) if (not tail and nxt) else None
+        if nxt_sock is not None and session_config is not None:
+            nxt_sock = hello_client(nxt_sock, session_config, stage + 1, "forward", _raw_send_msg, _raw_recv_msg, key=node_key)
+        elif nxt_sock is not None and SWARM_TOKEN is not None:
+            send_msg(nxt_sock, {"op": "hello_pred", "token": SWARM_TOKEN})
+        if nxt_sock is not None:
+            _stage_event("successor_connected", stage, operation="successor_connect",
+                         endpoint=nxt, strict=session_config is not None, service_ready=False)
+        print(f"[s{stage}] listening {bind}:{port}"
+              + (f" -> {nxt}" if nxt_sock is not None else " (tail)")
+              + (f" pub={pub_b64(node_key)}" if node_key is not None else ""), flush=True)
+        if ready is not None:
+            ready.set()
+
+        try:
+            if tail:
+                st._diagnostic_operation = "predecessor_accept"
+                _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=(ckpt_dir if dspark
+                                                                                   else None), acceptor=acceptor,
+                            drafter_cache=preloaded_drafter)
+            elif ret_relay is not None:
+                _serve_relay_ingress(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts,
+                                     timeout, ret_relay)
+            else:
+                _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout, acceptor=acceptor)
+        except Exception as error:
+            _stage_event("failed", stage, operation=getattr(st, "_diagnostic_operation", "serve"),
+                         job_id=getattr(st, "_diagnostic_job_id", None),
+                         error_type=type(error).__name__, error=str(error)[:4096], service_ready=False)
+            raise
         else:
-            _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout, acceptor=acceptor)
-    except Exception as error:
-        _stage_event("failed", stage, operation=getattr(st, "_diagnostic_operation", "serve"),
-                     job_id=getattr(st, "_diagnostic_job_id", None),
-                     error_type=type(error).__name__, error=str(error)[:4096], service_ready=False)
-        raise
-    else:
-        _stage_event("stopped", stage, operation="stop", service_ready=False)
+            _stage_event("stopped", stage, operation="stop", service_ready=False)
     finally:
-        # Teardown: this stage serves no more jobs, so drop the horizon it was carrying. In a real
-        # ring that is one process per stage and the clear is cosmetic; in the IN-PROCESS shape (the
-        # selftest runs every stage as a thread beside the coordinator and the oracle) the horizon is
-        # a shared global, and a dead stage thread must not leave one job's value behind it.
+        # Include load, observation, bind and strict successor startup failures.
+        # No uncertain host copy permit is forcibly reclaimed here.
         _set_job_horizon(None)
-        if acceptor is not None:
-            acceptor.close()
-        else:
-            srv.close()
+        for owned in (nxt_sock, acceptor if acceptor is not None else srv):
+            if owned is not None:
+                try:
+                    owned.close()
+                except OSError:
+                    pass
+        _close_stage_local_resources(st, stage)
 
 
 _STRAY = (ConnectionError, OSError, ValueError, KeyError, TypeError, struct.error)
@@ -1299,6 +1405,8 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 continue
             if op == "reset":
                 st._diagnostic_job_id = msg.get("job_id")
+                from v4_round_cost import reset as reset_round_cost
+                reset_round_cost(st, msg)
                 st._conversation_reset_parameters = dict(msg)
                 from v4_conversation_protocol import reset_shadow
                 reset_shadow(st)
@@ -1341,13 +1449,16 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 _fwd_open(kw, nxt, timeout, msg, tag)          # the sweep opens a leg that idled all job
                 continue
             if op == "step":
+                from v4_round_cost import begin as cost_begin, append as cost_append
                 timer.lap("recv", msg)
                 if _fenced(msg, epoch):                       # stale speculation: pass it on, untouched
+                    msg = _discard_local_frame(st, msg)
                     if getattr(st, "_token_privacy", None) is not None:
                         msg = {key: msg[key] for key in ("op", "start_pos", "epoch", "cpos") if key in msg}
                     msg["fenced"] = True
                     kw.send(msg)
                     continue
+                cost_token = cost_begin(st, msg)
                 epoch = max(epoch, int(msg.get("epoch", 0)))
                 if "cpos" in msg:                             # settled frontier: free the spent snapshots
                     st.commit(int(msg["cpos"]))
@@ -1358,15 +1469,21 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                     envelope = codec.seal(ids, _privacy_binding(st, msg), next_token=msg.get("dnxt")) if codec is not None else None
                     if signer is not None and envelope is not None:
                         from v4_privacy import wire_payload_bytes
-                        in_b = wire_payload_bytes(_tbytes(h), envelope)
+                        transport = getattr(st, "_host_transport", None)
+                        in_b = (_actual_frame_digest(transport, h, ids, envelope=envelope)
+                            if getattr(transport, "device_digest_enabled", False) else wire_payload_bytes(_tbytes(h), envelope))
                     else:
-                        in_b = _payload_bytes(h, ids) if signer is not None else None
+                        transport = getattr(st, "_host_transport", None)
+                        in_b = ((_actual_frame_digest(transport, h, ids)
+                            if getattr(transport, "device_digest_enabled", False) else _payload_bytes(h, ids))
+                            if signer is not None else None)
                 else:
                     codec = getattr(st, "_token_privacy", None)
                     envelope = msg.get("sealed_ids")
                     h, ids, in_b = _recv_hids(msg, signer, device=getattr(st, "device", None),
                         token_privacy=codec, stage_lo=lo, n_hash_layers=getattr(getattr(st, "args", None), "n_hash_layers", 3),
-                        binding=_privacy_binding(st, msg) if codec is not None else None)
+                        binding=_privacy_binding(st, msg) if codec is not None else None,
+                        **_host_frame_options(st, msg))
                 start_pos = int(msg["start_pos"])
                 timer.lap("pre")
                 st._diagnostic_operation = "forward"
@@ -1379,7 +1496,8 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 timer.sync()
                 timer.lap("fwd")
                 st._diagnostic_operation = "encode_output"
-                frame, out_b = _make_step_frame(h, ids, start_pos, signer, token_envelope=envelope)
+                frame, out_b = _make_step_frame(h, ids, start_pos, signer, token_envelope=envelope,
+                                               **_host_frame_options(st, msg))
                 for k in _PASSTHRU:                           # protocol header rides every hop
                     if k == "dnxt" and envelope is not None:
                         continue  # token-valued hint is authenticated inside the opaque envelope
@@ -1388,6 +1506,10 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 if signer is not None:
                     signer.observe(in_b, out_b)
                 timer.lap("out")
+                cost = cost_append(st, msg, cost_token, stage_index=stage,
+                                   nstages=getattr(st, "_round_stage_count", stage + 1))
+                if cost is not None:
+                    frame["round_cost"] = cost
                 st._diagnostic_operation = "send_successor"
                 timer.lap("send", kw.send(frame))
                 timer.frame(h.shape[1])
@@ -1642,6 +1764,8 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                     st._conversation_cache.abort_restore(prepared["ticket"])
                 st._conversation_pending = {}
             if op == "reset":
+                from v4_round_cost import reset as reset_round_cost
+                reset_round_cost(st, msg)
                 reply_identity = ({key: msg.get(key) for key in ("job_id", "swarm_id", "nonce")}
                                   if msg.get("reply_binding") == 1 else {})
                 capacity_error = _reset_capacity_error(st, msg)
@@ -1697,11 +1821,14 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                 chan.send(msg.get("receipts", []))
                 continue
             if op == "step":
+                from v4_round_cost import begin as cost_begin, append as cost_append
                 timer.lap("recv", msg)
                 if _fenced(msg, epoch):                       # stale speculation: answer, compute nothing
+                    msg = _discard_local_frame(st, msg)
                     chan.send({"fenced": True, "epoch": int(msg.get("epoch", 0)),
                                "pos": int(msg["start_pos"]), **reply_identity})
                     continue
+                cost_token = cost_begin(st, msg)
                 epoch = max(epoch, int(msg.get("epoch", 0)))
                 if "cpos" in msg:                             # settled frontier: free the spent snapshots
                     st.commit(int(msg["cpos"]))
@@ -1709,7 +1836,8 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                 envelope = msg.get("sealed_ids")
                 h, ids, in_b = _recv_hids(msg, signer, device=getattr(st, "device", None),
                     token_privacy=codec, stage_lo=lo, n_hash_layers=getattr(getattr(st, "args", None), "n_hash_layers", 3),
-                    is_tail=True, binding=_privacy_binding(st, msg) if codec is not None else None)
+                    is_tail=True, binding=_privacy_binding(st, msg) if codec is not None else None,
+                    **_host_frame_options(st, msg))
                 start_pos = int(msg["start_pos"])
                 timer.lap("pre")
                 st._diagnostic_operation = "forward"
@@ -1724,9 +1852,13 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                 if signer is not None:
                     if envelope is not None:
                         from v4_privacy import wire_payload_bytes
-                        signer.observe(in_b, wire_payload_bytes(_tbytes(h), envelope))
+                        transport = getattr(st, "_host_transport", None)
+                        signer.observe(in_b, _actual_frame_digest(transport, h, ids, envelope=envelope)
+                            if getattr(transport, "device_digest_enabled", False) else wire_payload_bytes(_tbytes(h), envelope))
                     else:
-                        signer.observe(in_b, _payload_bytes(h, ids))
+                        transport = getattr(st, "_host_transport", None)
+                        signer.observe(in_b, _actual_frame_digest(transport, h, ids)
+                            if getattr(transport, "device_digest_enabled", False) else _payload_bytes(h, ids))
                 timer.lap("out")
                 st._diagnostic_operation = "logits"
                 rows = _tail_logit_rows(st, h, start_pos)     # hc_head + norm + lm_head, one row per pos
@@ -1753,6 +1885,11 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None, acc
                     st._conversation_prefill_reply = {k: out[k] for k in MATH_REPLY if k in out}
                 timer.sync()
                 timer.lap("draft")
+                stage_index = getattr(st, "_diagnostic_stage_index", 0)
+                cost = cost_append(st, msg, cost_token, stage_index=stage_index,
+                                   nstages=getattr(st, "_round_stage_count", stage_index + 1))
+                if cost is not None:
+                    out["round_cost"] = cost
                 st._diagnostic_operation = "send_return"
                 timer.lap("send", chan.send(out))
                 timer.frame(h.shape[1])
@@ -2578,9 +2715,11 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     v4_levers.note("V4_PIPELINED_SPEC", True)
     v4_levers.note("V4_REFILL_FLOOR", F)
     ret.settimeout(timeout)
+    cost_trace = os.urandom(16).hex() if round_policy is not None else None
+    cost_header = {"round_cost_trace": cost_trace} if cost_trace is not None else {}
     _send(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
                     "temp": 0.0, "seed": 0, "spec": True, "dspark": True, "pipelined": True,
-                    "max_pos": _job_max_pos(prompt_ids, max_new, _SPEC_POS_MARGIN)})
+                    "max_pos": _job_max_pos(prompt_ids, max_new, _SPEC_POS_MARGIN), **cost_header})
     ack = _recv(ret)
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 dspark ring reset not acked: {ack!r}")
@@ -2591,7 +2730,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
 
     # PREFILL is still one multi-token frame — it is the only place the whole chunk goes in at once
     # (the reference's own collapse-then-slice), and it is where the tail builds its mtp window.
-    _send(pipe, {"op": "step", "ids": [ids], "start_pos": 0, "epoch": 0})
+    _send(pipe, {"op": "step", "ids": [ids], "start_pos": 0, "epoch": 0, **cost_header})
     rep = _recv(ret)
     if not isinstance(rep, dict) or "acc" not in rep:
         raise RuntimeError(
@@ -2683,7 +2822,8 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         _mark()                                               # the old level held until this frame
         horizon = max(horizon, pos)
         frames += 1
-        f = {"op": "step", "ids": [[int(tok)]], "start_pos": pos, "epoch": st8.epoch, "cpos": c - 1}
+        f = {"op": "step", "ids": [[int(tok)]], "start_pos": pos, "epoch": st8.epoch, "cpos": c - 1,
+             **cost_header}
         if lazy and nxt is not None:
             f["dnxt"] = int(nxt)
         if lazy and prev:
@@ -2740,8 +2880,6 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                                    f"{type(sender.err).__name__}: {sender.err}") from sender.err
             raise
         replies_received += 1
-        if round_policy is not None:
-            round_policy.observe_reply_cost(rep.get("round_cost"))
         with st8.lock:
             pos, ep = st8.outstanding.popleft()
             st8.pending -= 1
@@ -2750,6 +2888,10 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 f"v4 pipelined dspark: reply {rep.get('pos')}@e{rep.get('epoch')} for the frame "
                 f"{pos}@e{ep} — the return channel reordered or dropped a frame, and every accept "
                 f"after it would be attributed to the wrong position")
+        if round_policy is not None:
+            from v4_round_cost import validate_reply
+            round_policy.observe_reply_cost(validate_reply(rep.get("round_cost"),
+                trace_id=cost_trace, epoch=ep, pos=pos, expected_stages=round_policy.stage_count))
         if rep.get("fenced") or ep != st8.epoch:              # THE FENCE: a cancelled future's reply
             stale += 1
             continue
@@ -3102,6 +3244,11 @@ GRAPH_MODE_VALUES = frozenset({"0", "1", "island", "on", "whole", "2", "eager"})
 # V4_CUDA_GRAPH (the validated `cuda_graph=` mode — see _graph_env_conflict for why an operator's
 # export of it RAISES rather than quietly winning or quietly losing).
 ENG_ENV = [
+    "V4_EXPERT_READY_FIRST", "V4_EXPERT_READY_MIB", "V4_EXPERT_SEGMENT_GRAPH_MAX", "V4_EXPERT_SEGMENT_GRAPH_MIB",
+    "V4_KV_INDEXED_GATHER", "V4_NATIVE_BATCH_STORAGE",
+    "V4_HOST_TRANSPORT_CONFIG", "V4_HOST_COMPUTE_CONFIG", "V4_EXPERT_STORAGE", "V4_EXPERT_STORAGE_HOST_MIB",
+    "V4_DSPARK_CHAIN_GRAPH", "V4_DSPARK_CHAIN_MIB", "V4_DSPARK_CHAIN_LIMIT", "V4_DSPARK_CHAIN_REFERENCE",
+    "V4_DRAFT_ADAPTER_DIR", "V4_DRAFT_ADAPTER_MIB",
     "V4_KV_PLACEMENT", "V4_KV_GPU_MIB", "V4_KV_HOST_MIB", "V4_PREFILL_QUERY_CHUNK",
     "V4_SEALED_IDS", "V4_TOKEN_PRIVACY_KEY_ID",  # public negotiation only; secret files never forwarded
     "V4_FP8_WIRE", "V4_WIRE_FUSED",                                             # wire codec

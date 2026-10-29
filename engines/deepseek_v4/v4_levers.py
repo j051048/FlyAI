@@ -703,6 +703,22 @@ LEVERS_BY_ENV = {lv.env: lv for lv in LEVERS}
 # fails loudly on its own (a missing V4_DIR cannot be mistaken for a slow ring). Listed rather than
 # pattern-matched so the registry test stays total — an unlisted new name fails the suite.
 NON_LEVER_ENV = {
+    "V4_NATIVE_BATCH_STORAGE": "copy /2 or persistent ragged /3 state storage; default copy",
+    "V4_EXPERT_READY_FIRST": "ready expert execution with fixed logical reduction order; default off",
+    "V4_EXPERT_READY_MIB": "bounded ready-first output temporary per layer",
+    "V4_EXPERT_SEGMENT_GRAPH_MIB": "explicit stage total stateless expert graph reservation",
+    "V4_EXPERT_SEGMENT_GRAPH_MAX": "maximum stateless expert graphs per owned layer",
+    "V4_KV_INDEXED_GATHER": "exact ordered indexed-history gather; default off",
+    "V4_HOST_TRANSPORT_CONFIG": "trusted local host activation channel config; signed binding, default off",
+    "V4_HOST_COMPUTE_CONFIG": "explicit shared host CPU/copy budget with epoch ownership; default off",
+    "V4_EXPERT_STORAGE": "canonical or exclusive hot-GPU/cold-RAM expert storage; default canonical",
+    "V4_EXPERT_STORAGE_HOST_MIB": "exclusive expert cold banks plus exchange allocation bound",
+    "V4_DSPARK_CHAIN_GRAPH": "bounded complete committed-advance and MTP graph, separate from request batch",
+    "V4_DSPARK_CHAIN_MIB": "explicit MTP graph backup/static/private-pool reservation",
+    "V4_DSPARK_CHAIN_LIMIT": "maximum retained complete MTP graphs, no unbounded recapture",
+    "V4_DSPARK_CHAIN_REFERENCE": "explicit CPU eager transcription, never CUDA qualification",
+    "V4_DRAFT_ADAPTER_DIR": "trusted local draft-only residual artifact; target verifier weights unchanged",
+    "V4_DRAFT_ADAPTER_MIB": "explicit draft residual weight and load-peak reservation",
     "V4_PREFILL_EXPERT_PIPELINE": "bounded local expert DMA/compute FIFO; same prefill math",
     "V4_PREFILL_EXPERT_DEPTH": "prefill expert FIFO depth, bounded by allocated cache slots",
     "V4_PREFILL_EXPERT_BATCH": "experts per FIFO batch; zero chooses bounded capacity geometry",
@@ -968,6 +984,7 @@ def report(side=STAGE, stage=None, strict=None, out=None):
 # re-derived from the SOURCE of every module the engine imports rather than maintained by hand
 # anywhere. `tests/test_v4_levers.py` asserts the derived set is exactly LEVERS + NON_LEVER_ENV.
 ENGINE_MODULES = (
+    "v4_device_digest.py", "v4_incremental_prefix.py", "v4_incremental_evidence.py", "v4_indexed_kv.py", "v4_round_cost.py", "v4_persistent_batch.py", "v4_expert_graph.py",
     "v4_pipe.py", "v4_stage.py", "v4_levers.py", "v4_moe_grouped.py", "v4_moe_decode.py",
     "v4_moe_multi.py", "v4_fp8_gemv.py", "v4_dspark_fast.py", "v4_dspark_moe.py",
     "v4_dspark_draft.py", "v4_ref_slim.py", "v4_ref_cpu.py", "v4_whole_layer_graph.py",
@@ -981,6 +998,7 @@ ENGINE_MODULES = (
     "v4_confidence_calibration.py", "v4_text_protocol.py", "v4_quality.py",
     "v4_batch_diagnostics.py",
     "v4_batch_invariant.py", "v4_native_batch_graph.py",
+    "v4_host_transport.py", "v4_host_compute.py", "v4_expert_tiers.py", "v4_draft_chain.py", "v4_draft_adapter.py", "v4_dual_runtime.py",
     "v4_adaptive_round.py", "v4_draft_results.py", "v4_round_evidence.py",
     "v4_prefill_expert_pipeline.py", "v4_conversation_cache.py", "v4_conversation_protocol.py", "v4_request_features.py",
     "v4_execution_profiles.py", "v4_native_capability.py", "v4_numeric_diagnostics.py",

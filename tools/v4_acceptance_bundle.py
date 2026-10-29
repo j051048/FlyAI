@@ -31,6 +31,28 @@ _EXCLUDED_DIRS = frozenset({".git", ".venv", "venv", "__pycache__", ".pytest_cac
 _EXCLUDED_SUFFIXES = frozenset({".key", ".pem", ".p12", ".pfx", ".psk", ".safetensors", ".pt", ".pth",
     ".onnx", ".ckpt", ".bin", ".pyc", ".pyo", ".log", ".db", ".sqlite", ".sqlite3", ".exe", ".dll",
     ".so", ".dylib", ".o", ".a", ".tgz", ".gz", ".zip"})
+_LOCAL_EXECUTION_KIT = (
+    "engines/deepseek_v4/v4_host_transport.py", "engines/deepseek_v4/v4_host_compute.py",
+    "engines/deepseek_v4/v4_expert_tiers.py", "engines/deepseek_v4/v4_draft_chain.py",
+    "engines/deepseek_v4/v4_draft_adapter.py", "engines/deepseek_v4/v4_dual_runtime.py",
+    "shard/host_compute_budget.py", "phase0/v4_role_calibration.py", "phase0/v4_draft_training.py",
+    "phase0/v4_draft_chain_probe.py", "phase0/v4_host_transport_probe.py",
+    "tests/test_host_compute_budget.py", "tests/test_role_calibration.py", "tests/test_role_cost_surface.py",
+    "tests/test_v4_draft_adapter.py", "tests/test_v4_draft_chain.py", "tests/test_v4_dual_runtime.py",
+    "tests/test_v4_expert_tiers.py", "tests/test_v4_expert_tiers_stage.py", "tests/test_v4_host_compute.py",
+    "tests/test_v4_host_transport.py", "tests/test_v4_draft_chain_probe.py",
+    "docs/V4_DUALGPU_IMPROVEMENTS.md", "docs/V4_DUALGPU_ACCEPTANCE.md",
+    "engines/deepseek_v4/v4_device_digest.py", "engines/deepseek_v4/v4_expert_graph.py",
+    "engines/deepseek_v4/v4_round_cost.py", "engines/deepseek_v4/v4_persistent_batch.py",
+    "engines/deepseek_v4/v4_incremental_prefix.py", "engines/deepseek_v4/v4_incremental_evidence.py",
+    "engines/deepseek_v4/v4_indexed_kv.py",
+    "phase0/v4_incremental_qualification.py", "phase0/v4_incremental_case_probe.py",
+    "tools/v4_six_acceptance.py", "tests/test_v4_device_digest.py", "tests/test_v4_expert_segments.py",
+    "tests/test_v4_six_acceptance.py", "tests/test_v4_round_cost.py", "tests/test_production_routing.py",
+    "tests/test_v4_production_runtime.py", "tests/test_v4_persistent_batch.py",
+    "tests/test_v4_persistent_batch_socket.py", "tests/test_v4_incremental_qualification.py", "tests/test_v4_incremental_evidence.py",
+    "tests/test_v4_indexed_kv.py", "tests/test_v4_six_stage.py", "tests/test_v4_incremental_case_probe.py",
+    "docs/V4_SIX_ACCEPTANCE.md", "docs/V4_SIX_IMPROVEMENTS.md")
 
 
 def _canonical(value):
@@ -98,7 +120,7 @@ def selected_paths(root=ROOT, *, executor=subprocess.run):
     for folder, pattern in (("tools", "v4_acceptance*.py"), ("tests", "test_v4_acceptance*.py")):
         kit.update(path.relative_to(root).as_posix() for path in (root / folder).glob(pattern))
     for name in ("tools/v4_5090_acceptance.py", "tests/test_v4_5090_acceptance.py",
-                 "examples/v4_5090_acceptance.json", "docs/V4_5090_ACCEPTANCE.md"):
+                 "examples/v4_5090_acceptance.json", "docs/V4_5090_ACCEPTANCE.md") + _LOCAL_EXECUTION_KIT:
         if (root / name).exists() or (root / name).is_symlink():
             kit.add(name)
     selected, excluded = [], []
@@ -148,7 +170,8 @@ def _core_source(root, included):
     for directory in ("engines/deepseek_v4", "vendor/deepseek_v4_ref", "shard"):
         paths.update((root / directory).rglob("*.py"))
     for name in ("wire", "ngram_draft", "v4_benchmark", "v4_soak", "v4_release", "v4_profile_report",
-                 "v4_ring_economics", "v4_round_calibration"):
+                 "v4_ring_economics", "v4_round_calibration", "v4_role_calibration", "v4_draft_training",
+                 "v4_draft_chain_probe", "v4_host_transport_probe", "v4_incremental_qualification", "v4_incremental_case_probe"):
         path = root / "phase0" / (name + ".py")
         if path.is_file():
             paths.add(path)
@@ -267,6 +290,7 @@ def _manifest_errors(manifest):
     by_name = {row["path"]: row for row in files}
     kit_expected = [row for row in files if (
         re.fullmatch(r"tools/v4_acceptance[^/]*\.py|tests/test_v4_acceptance[^/]*\.py", row["path"])
+        or row["path"] in _LOCAL_EXECUTION_KIT
         or row["path"] in {"tools/v4_5090_acceptance.py", "tests/test_v4_5090_acceptance.py",
                            "examples/v4_5090_acceptance.json", "docs/V4_5090_ACCEPTANCE.md"})]
     if manifest["kit_files"] != kit_expected:
@@ -284,7 +308,9 @@ def _manifest_errors(manifest):
     core_expected = {name for name in by_name if (
         name.endswith(".py") and name.startswith(("engines/deepseek_v4/", "vendor/deepseek_v4_ref/", "shard/"))
         or name in {"phase0/" + filename + ".py" for filename in ("wire", "ngram_draft", "v4_benchmark", "v4_soak",
-            "v4_release", "v4_profile_report", "v4_ring_economics", "v4_round_calibration")})}
+            "v4_release", "v4_profile_report", "v4_ring_economics", "v4_round_calibration", "v4_role_calibration",
+            "v4_draft_training", "v4_draft_chain_probe", "v4_host_transport_probe",
+            "v4_incremental_qualification", "v4_incremental_case_probe")})}
     if core_names != core_expected:
         raise ValueError("benchmark source inventory does not cover every bundled core module")
     return by_name

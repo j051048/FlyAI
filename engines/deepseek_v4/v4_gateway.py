@@ -132,7 +132,7 @@ class V4RingBackend:
             if value is not None and (not isinstance(value, dict) or type(value.get("enabled", False)) is not bool):
                 raise ValueError(f"{name} requires an explicit boolean enabled flag")
         if conversation_cache and conversation_cache.get("enabled", False) and set(conversation_cache) - {
-                "enabled", "max_entries", "ttl_s", "extended_shadow"}:
+                "enabled", "max_entries", "ttl_s", "extended_shadow", "incremental_qualification", "incremental_shadow_every"}:
             raise ValueError("unknown enabled conversation cache configuration")
         feature_cohort = pipeline_plan.get("cohort_id") if pipeline_plan else None
         if any(value and value.get("enabled", False) for value in (speculation_policy, conversation_cache)):
@@ -162,7 +162,9 @@ class V4RingBackend:
             self._conversation_owner = ConversationCoordinator(enabled=True,
                 max_entries=conversation_cache.get("max_entries", 128),
                 ttl_s=conversation_cache.get("ttl_s", 300),
-                extended_shadow=conversation_cache.get("extended_shadow", False))
+                extended_shadow=conversation_cache.get("extended_shadow", False),
+                incremental_qualification=conversation_cache.get("incremental_qualification"),
+                incremental_shadow_every=conversation_cache.get("incremental_shadow_every", 8))
             from v4_observability import source_inventory
             from shard.runtime_observation import digest
             cohort_body = pipeline_plan["model_cohort"]

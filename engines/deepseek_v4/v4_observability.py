@@ -12,14 +12,16 @@ from datetime import datetime, timezone
 import v4_levers
 from shard.runtime_observation import SCHEMA, digest, validate_runtime_observation, gpu_uuid_text
 
+PRIVATE_CONFIG_PATHS = {"V4_HOST_TRANSPORT_CONFIG", "V4_HOST_COMPUTE_CONFIG", "V4_DRAFT_ADAPTER_DIR"}
+
 
 def effective_flags(side, stage=None):
     public = set(v4_levers.LEVERS_BY_ENV) | set(v4_levers.NON_LEVER_ENV)
     return {finding.env: {
-        "requested": os.environ.get(finding.env) if finding.env in public else None,
-        "parsed": str(finding.requested) if finding.env in public else "unregistered",
-        "observed": str(finding.observed),
-        "verdict": str(finding.verdict), "reason": finding.why or "",
+        "requested": ("configured" if os.environ.get(finding.env) else None) if finding.env in PRIVATE_CONFIG_PATHS else os.environ.get(finding.env) if finding.env in public else None,
+        "parsed": "private_content_bound" if finding.env in PRIVATE_CONFIG_PATHS else str(finding.requested) if finding.env in public else "unregistered",
+        "observed": "private_content_bound" if finding.env in PRIVATE_CONFIG_PATHS else str(finding.observed),
+        "verdict": str(finding.verdict), "reason": "private configuration is bound by local_execution content identity" if finding.env in PRIVATE_CONFIG_PATHS else finding.why or "",
     } for finding in v4_levers.audit(side=side, stage=stage)}
 
 
@@ -28,7 +30,7 @@ def public_environment():
     result = {}
     modules = [sys.modules.get(Path(name).stem) for name in v4_levers.ENGINE_MODULES]
     for key in sorted(names):
-        if key in ("V4_DIR", "V4_DEV") or any(part in key for part in ("SECRET", "PASSWORD", "KEY_FILE", "TOKEN_FILE")):
+        if key in PRIVATE_CONFIG_PATHS or key in ("V4_DIR", "V4_DEV") or any(part in key for part in ("SECRET", "PASSWORD", "KEY_FILE", "TOKEN_FILE")):
             continue
         value = os.environ.get(key)
         if value is None:
@@ -54,7 +56,7 @@ def source_inventory():
     for name in ("receipt", "runtime_metrics", "runtime_profile", "runtime_observation", "pipeline_plan", "pipeline_session", "transport", "speculation_policy",
                  "execution_proof", "job_journal", "service_queue", "http_gateway", "ring_pool", "ring_router",
                  "continuous_batch", "node_quality", "locality", "planning_cost", "stage_cost", "offers", "control_plane",
-                 "network_service", "plan", "topology", "routing_cost", "ring_economics", "receive_buffers", "host_topology"):
+                 "network_service", "plan", "topology", "routing_cost", "ring_economics", "receive_buffers", "host_topology", "host_compute_budget"):
         path = root / "shard" / (name + ".py")
         if path.is_file():
             files.append(path)
@@ -109,7 +111,8 @@ def runtime_observation(stage, *, session_config=None, phase="loaded"):
         "optimizations": {
             "prefill_expert_pipeline": stage.prefill_pipeline_status() if hasattr(stage, "prefill_pipeline_status") else {"enabled": False},
             "conversation_cache": stage._conversation_cache.status() if hasattr(stage, "_conversation_cache") else {"enabled": False},
-            "execution_profile": stage_profile_status(stage), "socket_buffers": pool_status},
+            "execution_profile": stage_profile_status(stage), "socket_buffers": pool_status,
+            "kv_transfer": stage.kv_transfer_status() if hasattr(stage, "kv_transfer_status") else {"mode": "gpu_resident"}},
         "versions": {"python": platform.python_version(), "torch": str(getattr(torch_module, "__version__", "unknown")),
             "cuda": getattr(getattr(torch_module, "version", None), "cuda", None),
             "tilelang": getattr(tilelang_module, "__version__", None)}, "phase": phase}
@@ -119,6 +122,8 @@ def runtime_observation(stage, *, session_config=None, phase="loaded"):
             "schema": "v4-native-batch-observation/1", "numerical_contract": lanes.contract,
             "scope": "stage_lifetime_not_per_job", "config": lanes.config(),
             "counters": dict(lanes.counters), "graphs": lanes.graph_status()}
+    from v4_dual_runtime import observation as local_execution_observation
+    value["optimizations"]["local_execution"] = local_execution_observation(stage)
     return validate_runtime_observation(value)
 
 

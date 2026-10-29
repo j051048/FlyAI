@@ -9,7 +9,6 @@ No SSH, package installation, downloads, GPU selection or model-size averaging.
 from __future__ import annotations
 
 import argparse
-import ast
 import csv
 from datetime import datetime, timezone
 import hashlib
@@ -84,32 +83,17 @@ def canonical_environment(overrides=None):
     default cannot silently extend the benchmark recipe after preparation.
     """
     from engines.deepseek_v4.v4_execution_profiles import (
-        baseline_environment, expanded_environment, _known_environment_names,
+        baseline_environment, expanded_environment, public_environment_names,
+        public_environment_overrides,
     )
-    overrides = dict(overrides or {})
-    names = _known_environment_names() - {"V4_DIR", "V4_DEV"}
-    if any(k not in names or not isinstance(v, str) or "\x00" in v
-           for k, v in overrides.items()):
+    overrides = public_environment_overrides(overrides)
+    names = public_environment_names()
+    if any(k not in names for k in overrides):
         raise ValueError("environment must contain registered public V4 string settings")
-    defaults = {}
-    for path in sorted((ROOT / "engines" / "deepseek_v4").glob("v4_*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if (not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute)
-                    or node.func.attr != "get" or not isinstance(node.func.value, ast.Attribute)
-                    or node.func.value.attr != "environ" or len(node.args) < 2
-                    or not isinstance(node.args[0], ast.Constant)):
-                continue
-            key = node.args[0].value
-            if key not in names or not isinstance(node.args[1], ast.Constant):
-                continue
-            value = node.args[1].value
-            if isinstance(value, (str, int, float)):
-                defaults.setdefault(key, str(value))
     # Profile expansion must see only explicit overrides, because its protected
     # settings can differ from the generic baseline (e.g. resident-island).
     recipe = expanded_environment(overrides)
-    env = {**defaults, **baseline_environment(), **recipe}
+    env = {**baseline_environment(), **recipe}
     if env.get("V4_KERNELS") != "tilelang" or env.get("V4_MAX_BATCH") != "1":
         raise ValueError("acceptance ring requires tilelang kernels and batch one")
     if int(env["V4_MAX_SEQ"]) < 64:
@@ -124,7 +108,9 @@ def _source_identity():
     for directory in ("engines/deepseek_v4", "vendor/deepseek_v4_ref", "shard"):
         paths.update((ROOT / directory).rglob("*.py"))
     for name in ("wire", "ngram_draft", "v4_benchmark", "v4_soak", "v4_release",
-                 "v4_profile_report", "v4_ring_economics", "v4_round_calibration"):
+                 "v4_profile_report", "v4_ring_economics", "v4_round_calibration",
+                 "v4_role_calibration", "v4_draft_training", "v4_draft_chain_probe", "v4_host_transport_probe",
+                 "v4_incremental_qualification", "v4_incremental_case_probe"):
         path = ROOT / "phase0" / (name + ".py")
         if path.is_file():
             paths.add(path)

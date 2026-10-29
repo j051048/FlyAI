@@ -317,6 +317,9 @@ class DSparkTail:
         self._pos = None
         self.last_spec = None
         self.reset()
+        self._draft_chain = None
+        from v4_dspark_fast import configure_chain
+        configure_chain(self)
 
     # ---- state ----
 
@@ -883,6 +886,8 @@ def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
               file=sys.stderr, flush=True)
     if ckpt_dir is not None:
         tail.load(ckpt_dir)
+    from v4_draft_adapter import configured as configure_adapter
+    configure_adapter(tail)
     return RingDrafter(tail)
 
 

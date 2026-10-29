@@ -342,13 +342,20 @@ def handle_stage_control(stage, message, *, stage_index, session, signer_key, dr
 class ConversationCoordinator:
     """Serial owner-local index of fully published, node-local snapshots."""
     def __init__(self, *, enabled=False, max_entries=128, ttl_s=300, extended_shadow=False,
-                 max_prefix_tokens=8192):
+                 max_prefix_tokens=8192, incremental_qualification=None, incremental_shadow_every=8):
         if (type(enabled) is not bool or type(extended_shadow) is not bool or type(max_entries) is not int
                 or max_entries < 1 or type(ttl_s) not in (float, int) or not math.isfinite(ttl_s) or ttl_s <= 0
                 or type(max_prefix_tokens) is not int or max_prefix_tokens < 1):
             raise ValueError("bounded conversation coordinator configuration required")
         self.enabled, self.max_entries, self.ttl_s = enabled, max_entries, ttl_s
         self.extended_shadow, self.max_prefix_tokens = extended_shadow, max_prefix_tokens
+        self.incremental = None
+        if incremental_qualification is not None:
+            if not enabled or not extended_shadow:
+                raise ValueError("incremental reuse requires caching and reference shadow canaries")
+            from v4_incremental_prefix import IncrementalQualification
+            self.incremental = IncrementalQualification(incremental_qualification,
+                shadow_every=incremental_shadow_every)
         self.entries = OrderedDict()
 
     def request(self, identity, prefix, *, max_new):
@@ -420,6 +427,15 @@ class ConversationRequest:
                 "parameters_sha256": hashlib.sha256(canonical(parameters or {})).hexdigest()}.items()):
                 raise ValueError("conversation acknowledgement belongs to another stage/request")
             valid.append(body)
+        if action == "shadow_begin":
+            self._canary_begin_request = deepcopy(request)
+        elif action == "shadow_compare" and getattr(self, "_canary_begin_request", None) is not None:
+            evidence = {"begin_request": deepcopy(self._canary_begin_request),
+                        "compare_request": deepcopy(request), "acks": deepcopy(rows)}
+            if len(canonical(evidence)) > 131072:
+                raise ValueError("signed incremental canary evidence exceeds bounded metadata")
+            self.record["incremental_canary_evidence"] = evidence
+            self._canary_begin_request = None
         return valid
 
     def _guard(self):
@@ -512,10 +528,18 @@ class ConversationRequest:
         parent = max(parents, key=lambda entry: len(entry["raw_prefix"]))
         tx, candidate = secrets.token_hex(16), {}
         parent_count = len(parent["raw_prefix"])
+        policy = self.owner.incremental
+        eligible = False
+        if policy is not None:
+            from v4_observability import source_inventory
+            from v4_incremental_prefix import digest
+            eligible = policy.eligible(self.base_identity, source_sha256=digest(source_inventory()),
+                execution=self.execution, parent=parent_count, full=len(self.raw_prefix))
+        reuse = bool(eligible and policy.reuse())
         self.record.update(mode="extended_prefix_reference_shadow", reference_shadow=True,
             parent_prefix_tokens=parent_count, extra_suffix_steps=0, all_stage_shadow_passed=False,
             scope="per-request candidate/full-prefill comparison; current request saves no full prefill")
-        self.shadow = {"transaction_id": tx, "candidate": candidate}
+        self.shadow = {"transaction_id": tx, "candidate": candidate, "qualification_canary": eligible}
         try:
             rows = self._control(pipe, ret, send, recv, "restore_prepare", tx, parent["entries"],
                 identity=parent["identity"], prefix=parent["prefix"])
@@ -525,6 +549,7 @@ class ConversationRequest:
                 identity=parent["identity"], prefix=parent["prefix"])
             if not all(row["ok"] is True and row["entry_digest"] == parent["digests"][str(row["stage"])] for row in rows):
                 raise _OptionalShadowMiss("parent_restore_miss")
+            restored_rows = rows
             rows = self._control(pipe, ret, send, recv, "shadow_begin", tx, {}, parameters={
                 "full_prefix_count": len(self.raw_prefix), "parent_count": parent_count})
             if not all(row["ok"] is True for row in rows):
@@ -541,10 +566,42 @@ class ConversationRequest:
             rows = self._control(pipe, ret, send, recv, "shadow_finish", tx, {}, parameters={})
             if not all(row["ok"] is True for row in rows):
                 raise _OptionalShadowMiss("shadow_finish_refused")
+            incremental_reply = rows[-1]["tail_reply"]
+            if reuse and isinstance(incremental_reply, dict) and incremental_reply.get("token") in self.eos_ids:
+                raise _OptionalShadowMiss("qualified_suffix_eos_requires_original_prefill")
             rows = self._control(pipe, ret, send, recv, "capture", tx, {})
             candidate.update({str(row["stage"]): row["entry_id"] for row in rows if row["entry_id"]})
             if not all(row["ok"] is True for row in rows):
                 raise _OptionalShadowMiss("shadow_candidate_quota_refused")
+            if reuse:
+                if not isinstance(incremental_reply, dict) or type(incremental_reply.get("token")) is not int:
+                    raise ValueError("qualified suffix has no mathematical tail reply")
+                states = []
+                for row in restored_rows:
+                    state = row.get("state_digest")
+                    if (not isinstance(state, str) or len(state) != 64
+                            or any(c not in "0123456789abcdef" for c in state)):
+                        raise ValueError("qualified parent restore lacks actual state digest")
+                    states.append({"stage": row["stage"], "pubkey": pipe.config.stage(row["stage"])["signer_pubkey"],
+                        "entry_id": parent["entries"][str(row["stage"])], "state_digest": state})
+                self.restore_binding = {"transaction_id": tx, "prefix": deepcopy(parent["prefix"]),
+                    "identity_sha256": hashlib.sha256(canonical(parent["identity"])).hexdigest(), "stages": states}
+                self.owner.entries[self.key] = {"entries": dict(candidate),
+                    "digests": {str(row["stage"]): row["entry_digest"] for row in rows},
+                    "expires": time.monotonic() + self.owner.ttl_s, "identity": deepcopy(self.identity),
+                    "prefix": deepcopy(self.prefix), "base_identity": deepcopy(self.base_identity),
+                    "execution": deepcopy(self.execution), "raw_prefix": self.raw_prefix,
+                    "first_token": incremental_reply["token"]}
+                self.owner.entries.move_to_end(self.key)
+                while len(self.owner.entries) > self.owner.max_entries:
+                    self.owner.entries.popitem(last=False)
+                self.pending_reply = {**incremental_reply, **self.job}
+                self.shadow = None
+                self.record.update(hit=True, mode="qualified_incremental_suffix", reference_shadow=False,
+                    reason="qualified_parent_and_suffix", reused_prefix_tokens=parent_count,
+                    recomputed_tokens=len(self.raw_prefix) - parent_count,
+                    qualification_sha256=policy.sha256, scope="new suffix forwards and restored parent boundary")
+                return
             self._native_reset(pipe, ret, send, recv)
             self.record["reason"] = "awaiting_original_full_prefill_shadow"
         except _OptionalShadowMiss as error:
@@ -578,6 +635,8 @@ class ConversationRequest:
             rows = self._control(pipe, ret, send, recv, "shadow_compare", shadow["transaction_id"],
                 shadow["candidate"], parameters={})
             passed = all(row["ok"] is True and row.get("shadow_passed") is True for row in rows)
+            if shadow.get("qualification_canary") and self.owner.incremental is not None:
+                self.owner.incremental.canary(passed)
             self._control(pipe, ret, send, recv, "capture_abort", shadow["transaction_id"], shadow["candidate"])
             self.shadow = None
             self.record.update(all_stage_shadow_passed=passed,

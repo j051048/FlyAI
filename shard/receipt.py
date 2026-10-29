@@ -81,6 +81,26 @@ def wire_receipt(receipt: dict) -> dict:
     return {k: v for k, v in receipt.items() if k != "stage"}
 
 
+class ActualByteDigest:
+    """Process-local SHA256 of bytes already read by a local device hasher.
+
+    Never deserialize a peer's claimed digest into this type. The receipt format
+    and chaining operation remain SHA256(SHA256(chunk_0)||...).
+    """
+    def __init__(self, digest):
+        if type(digest) is not bytes or len(digest) != 32:
+            raise ValueError("exact 32-byte SHA256 digest required")
+        self.digest = digest
+
+
+# Workers historically import this file flat, while local API consumers use
+# shard.receipt. Keep the process-local digest type identical across both names.
+import sys as _receipt_sys
+_receipt_peer = _receipt_sys.modules.get("shard.receipt" if __name__ == "receipt" else "receipt")
+if _receipt_peer is not None and hasattr(_receipt_peer, "ActualByteDigest"):
+    ActualByteDigest = _receipt_peer.ActualByteDigest
+
+
 class ReceiptSigner:
     """Accumulates the activation hash-chain for ONE stage over ONE job, then signs it.
 
@@ -102,8 +122,8 @@ class ReceiptSigner:
         self.n = 0
 
     def observe(self, in_bytes: bytes, out_bytes: bytes) -> None:
-        self._in.update(_h(in_bytes))
-        self._out.update(_h(out_bytes))
+        self._in.update(in_bytes.digest if isinstance(in_bytes, ActualByteDigest) else _h(in_bytes))
+        self._out.update(out_bytes.digest if isinstance(out_bytes, ActualByteDigest) else _h(out_bytes))
         self.n += 1
 
     def finalize(self, runtime_metrics: dict | None = None, runtime_observation: dict | None = None,

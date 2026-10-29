@@ -27,7 +27,7 @@ GPU_FILES = ("tests/test_v4_runtime_init.py", "tests/test_v4_hybrid_gpu.py",
     "tests/test_v4_kernel_tuning.py", "tests/test_v4_draft_results.py", "tests/test_v4_native_lanes.py",
     "tests/test_v4_numeric_diagnostics.py", "tests/test_v4_island_coverage.py",
     "tests/test_v4_kernel_capability.py", "tests/test_receive_buffers.py", "tests/test_v4_native_batch.py",
-    "tests/test_v4_native_batch_graph.py")
+    "tests/test_v4_native_batch_graph.py", "tests/test_v4_expert_tiers.py", "tests/test_v4_draft_chain.py")
 REQUIRED_CASES = ("test_actual_cuda_hadamard_smoke_and_graph_capture",
     "test_original_tilelang_grouped_fp4_matches_full_resident_reference",
     "test_cuda_actual_v4_snapshot_restores_same_continuation_and_state_bytes",
@@ -49,7 +49,10 @@ REQUIRED_CASES = ("test_actual_cuda_hadamard_smoke_and_graph_capture",
     "test_cuda_batch_graph_matches_eager_twin_freshness_and_state[3]",
     "test_cuda_batch_graph_matches_eager_twin_freshness_and_state[4]",
     "test_cuda_batch_graph_capture_refusal_restores_before_eager_and_commits_exact_state[warmup_failure]",
-    "test_cuda_batch_graph_capture_refusal_restores_before_eager_and_commits_exact_state[graph_count]")
+    "test_cuda_batch_graph_capture_refusal_restores_before_eager_and_commits_exact_state[graph_count]",
+    "test_actual_cuda_exclusive_migrations_preserve_all_checkpoint_bytes[False]",
+    "test_actual_cuda_exclusive_migrations_preserve_all_checkpoint_bytes[True]",
+    "test_cuda_draft_chain_full_program_changes_inputs_and_restores_capture_state")
 
 
 def digest(value):

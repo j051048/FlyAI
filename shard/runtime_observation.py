@@ -126,21 +126,44 @@ def validate_runtime_observation(value):
     if "optimizations" in value:
         optimizations = value["optimizations"]
         if (not isinstance(optimizations, dict) or not {"prefill_expert_pipeline", "conversation_cache"} <= set(optimizations)
-                or set(optimizations) - {"prefill_expert_pipeline", "conversation_cache", "execution_profile", "socket_buffers", "native_batch"}):
+                or set(optimizations) - {"prefill_expert_pipeline", "conversation_cache", "execution_profile", "socket_buffers", "native_batch", "local_execution", "kv_transfer"}):
             raise ValueError("unknown runtime optimization observations")
         if any(not isinstance(item, dict) for item in optimizations.values()) or len(json.dumps(optimizations, allow_nan=False)) > 65536:
             raise ValueError("bounded JSON runtime optimization observations required")
+        local = optimizations.get("local_execution")
+        if local is not None:
+            if (set(local) != {"schema", "scope", "performance_qualified", "host_compute", "host_transport", "expert_storage", "draft_chain", "draft_adapter"}
+                    or local["schema"] != "v4-local-execution-observation/1"
+                    or local["scope"] != "stage_lifetime_not_per_job" or local["performance_qualified"] is not False
+                    or any(not isinstance(local[k], dict) for k in ("host_compute", "host_transport", "expert_storage", "draft_chain", "draft_adapter"))):
+                raise ValueError("invalid local execution observation scope")
+            chain = local["draft_chain"]
+            for key in ("captures", "replays"):
+                count = chain.get(key, 0)
+                if type(count) is not int or count < 0:
+                    raise ValueError("invalid draft chain CUDA counts")
+                if count and (value["gpu_uuid"] is None or chain.get("reference") is True):
+                    raise ValueError("CPU reference cannot claim CUDA draft chain execution")
+            ipc = local["host_transport"].get("ipc_copies", 0)
+            if type(ipc) is not int or ipc < 0 or ipc and value["gpu_uuid"] is None:
+                raise ValueError("CPU reference cannot claim CUDA IPC copies")
         native = optimizations.get("native_batch")
         if native is not None:
             if (set(native) != {"schema", "numerical_contract", "scope", "config", "counters", "graphs"}
                     or native["schema"] != "v4-native-batch-observation/1"
                     or native["scope"] != "stage_lifetime_not_per_job"
-                    or native["numerical_contract"] != "v4-native-small-batch-greedy/2"
+                    or native["numerical_contract"] not in ("v4-native-small-batch-greedy/2", "v4-native-persistent-ragged-greedy/3")
                     or any(not isinstance(native[k], dict) for k in ("config", "counters", "graphs"))
                     or native["config"].get("numerical_contract") != native["numerical_contract"]
                     or native["config"].get("graph_qualified") is not False
                     or native["graphs"].get("graph_qualified") is not False):
                 raise ValueError("invalid native batch observation scope/contract")
+            if native["numerical_contract"] == "v4-native-persistent-ragged-greedy/3":
+                if native["graphs"].get("enabled") is not False or native["counters"].get("state_full_copy_bytes") != 0:
+                    raise ValueError("persistent ragged batches require graph-off and no full state copies")
+                for field in ("state_journal_copy_bytes", "state_rollback_copy_bytes", "ragged_forward_calls"):
+                    if type(native["counters"].get(field)) is not int or native["counters"][field] < 0:
+                        raise ValueError("invalid persistent state journal counters")
             for key in ("captured_graphs", "replays"):
                 count = native["graphs"].get(key)
                 if type(count) is not int or count < 0:

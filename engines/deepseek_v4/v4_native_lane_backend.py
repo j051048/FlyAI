@@ -11,7 +11,7 @@ import time
 from v4_conversation_protocol import _sign, _verify, canonical
 from v4_native_lane_protocol import SCHEMA, DOMAIN, ACK_DOMAIN, runtime_binding
 from v4_native_lanes import CONTRACT
-from v4_native_batch import BATCH_CONTRACT
+from v4_native_batch import BATCH_CONTRACT, PERSISTENT_BATCH_CONTRACT
 from v4_batch_invariant import CONTRACT as MATH_CONTRACT
 from shard.continuous_batch import contract_digest
 from shard.execution_proof import verify_prefix_restore
@@ -24,19 +24,22 @@ def _validate_capacity(row, horizon):
     fields = {"enabled", "numerical_contract", "max_jobs", "horizon", "per_job_state_bytes",
         "reserved_state_bytes", "tensor_bytes_per_job", "metadata_bytes_per_job", "prefill_chunk_tokens",
         "restore_workspace_bytes", "durable_prefix", "ttl_s", "state_tier", "compute"}
-    batch = isinstance(row, dict) and row.get("numerical_contract") == BATCH_CONTRACT
+    persistent = isinstance(row, dict) and row.get("numerical_contract") == PERSISTENT_BATCH_CONTRACT
+    batch = isinstance(row, dict) and row.get("numerical_contract") in (BATCH_CONTRACT, PERSISTENT_BATCH_CONTRACT)
+    if persistent:
+        fields.add("persistent_policy")
     if batch:
         fields |= {"host_reserved_bytes", "device_reserved_bytes", "batch_workspace_bytes", "async_depth",
                    "reference", "graph_qualified", "hash_workspace_bytes", "math_contract", "graph_policy"}
     if (not isinstance(row, dict) or set(row) != fields or row["enabled"] is not True
-            or row["numerical_contract"] not in (CONTRACT, BATCH_CONTRACT) or type(row["max_jobs"]) is not int
+            or row["numerical_contract"] not in (CONTRACT, BATCH_CONTRACT, PERSISTENT_BATCH_CONTRACT) or type(row["max_jobs"]) is not int
             or not 2 <= row["max_jobs"] <= 4 or type(row["horizon"]) is not int or row["horizon"] != horizon
             or type(row["ttl_s"]) not in (int, float) or not math.isfinite(row["ttl_s"]) or not 0 < row["ttl_s"] <= 3600
             or type(row["prefill_chunk_tokens"]) is not int
             or not 1 <= row["prefill_chunk_tokens"] <= (8 if batch else 1)
             or (not batch and (row["state_tier"] != "pageable_host" or row["compute"] != "serial_scalar_lanes"))
             or (batch and (row["state_tier"] not in ("device", "cpu_reference")
-                          or row["compute"] != "native_equal_frontier_batch"))):
+                          or row["compute"] != ("native_persistent_ragged_batch" if persistent else "native_equal_frontier_batch")))):
         raise ValueError("native calibrated capacity must be 2..4 finite bounded scalar lanes")
     if batch:
         graph = row["graph_policy"]
@@ -55,6 +58,14 @@ def _validate_capacity(row, horizon):
                 or graph["coverage"] != ("attention_dense_partial" if graph["mode"] == "partial" else "off")
                 or row["math_contract"] != MATH_CONTRACT):
             raise ValueError("native graph policy/math contract differs from bounded partial capture")
+        if persistent:
+            policy = row["persistent_policy"]
+            if (not isinstance(policy, dict) or policy != {
+                    "schema": "v4-persistent-request-slots/1", "positions": "per_request",
+                    "attention": "batched_projections_native_row_reads", "state": "direct_slot_views",
+                    "transaction": "bounded_native_write_set", "journal_bytes": row["batch_workspace_bytes"],
+                    "full_state_copy_per_step": False} or graph["mode"] != "off"):
+                raise ValueError("persistent native state policy must bind its exact write journal and eager arithmetic")
     for name in ("per_job_state_bytes", "reserved_state_bytes", "tensor_bytes_per_job", "metadata_bytes_per_job"):
         if type(row[name]) is not int or not 0 < row[name] <= 2 ** 50:
             raise ValueError("native state reservations must be bounded positive bytes")
@@ -78,8 +89,9 @@ def _validate_capacity(row, horizon):
                 or not 1 <= row["async_depth"] <= row["max_jobs"]
                 or type(row["reference"]) is not bool or row["reference"] != (row["state_tier"] == "cpu_reference")
                 or row["graph_qualified"] is not False or disk["enabled"]
-                or row["batch_workspace_bytes"] != row["tensor_bytes_per_job"] * row["max_jobs"]
-                or row["device_reserved_bytes"] != 2 * row["batch_workspace_bytes"] + graph["graph_bytes"]
+                or (not persistent and row["batch_workspace_bytes"] != row["tensor_bytes_per_job"] * row["max_jobs"])
+                or (persistent and row["batch_workspace_bytes"] > row["tensor_bytes_per_job"] * row["max_jobs"])
+                or row["device_reserved_bytes"] != row["tensor_bytes_per_job"] * row["max_jobs"] + row["batch_workspace_bytes"] + graph["graph_bytes"]
                 or type(row["hash_workspace_bytes"]) is not int or row["hash_workspace_bytes"] != 2 << 20
                 or row["host_reserved_bytes"] != row["metadata_bytes_per_job"] * row["max_jobs"] +
                     row["hash_workspace_bytes"] + graph["host_metadata_bytes"] +
@@ -92,11 +104,12 @@ class NativeLaneBackend:
         self.backend = b = backend
         if (not isinstance(options, dict) or set(options) - {"enabled", "numerical_contract", "prefill_quantum", "prefill_budget"}
                 or not {"enabled", "numerical_contract"}.issubset(options)
-                or options["enabled"] is not True or options["numerical_contract"] not in (CONTRACT, BATCH_CONTRACT)):
+                or options["enabled"] is not True or options["numerical_contract"] not in (CONTRACT, BATCH_CONTRACT, PERSISTENT_BATCH_CONTRACT)):
             raise ValueError("native_lanes must explicitly select its native numerical contract")
         self.numerical_contract = options["numerical_contract"]
-        self.is_batch = self.numerical_contract == BATCH_CONTRACT
-        self.compute = "native_equal_frontier_batch" if self.is_batch else "serial_scalar_lanes"
+        self.is_persistent = self.numerical_contract == PERSISTENT_BATCH_CONTRACT
+        self.is_batch = self.numerical_contract in (BATCH_CONTRACT, PERSISTENT_BATCH_CONTRACT)
+        self.compute = "native_persistent_ragged_batch" if self.is_persistent else "native_equal_frontier_batch" if self.is_batch else "serial_scalar_lanes"
         if b.mode != "greedy" or b._policy is not None or b._conversation_owner is not None:
             raise ValueError("native lane service is a separate greedy cohort, without legacy cache/policy")
         if not b.pipeline_plan or b.pipeline_plan.get("model_cohort", {}).get("numeric_contract") != self.numerical_contract:
@@ -439,11 +452,11 @@ class NativeLaneBackend:
                     # Only decode/first-output cohorts may populate the graph
                     # pool. Prompt length can differ even at the same frontier.
                     capture_graph = state["pos"] >= len(state["prompt"]) - 1
-                    cohorts.setdefault((state["pos"], capture_graph), []).append(row)
+                    cohorts.setdefault((None if self.is_persistent else state["pos"], capture_graph), []).append(row)
                 requests = []
                 ordered = sorted(cohorts.items(), key=lambda item: not item[0][1])
                 for (pos, capture_graph), rows in ordered:
-                    steps = [self._step_request(state, "step", {"pos": pos, "token": token,
+                    steps = [self._step_request(state, "step", {"pos": state["pos"], "token": token,
                                                               "capture_graph": capture_graph})
                              for _, state, token in rows]
                     request = self._step_request(rows[0][1], "batch_step",
@@ -609,7 +622,7 @@ class NativeLaneBackend:
                 "max_jobs": self.max_jobs, "active_jobs": len(self.jobs), "prefix_entries": len(self.cache),
                 "supported_modes": ["greedy"], "mtp": False, "grouped_request_gemm": False,
                 "request_axis_batch": self.is_batch, "math_contract": MATH_CONTRACT if self.is_batch else None,
-                "batching_geometry": "equal_frontier_subgroups" if self.is_batch else None,
+                "batching_geometry": "independent_frontier_rows" if self.is_persistent else "equal_frontier_subgroups" if self.is_batch else None,
                 "graph_qualified": False, "async_depth": self.async_depth,
                 "prefill_quantum_tokens": self.prefill_quantum,
                 "pipeline": deepcopy(self.pipeline_stats),
@@ -692,7 +705,7 @@ class NativeLaneBackend:
 
 def install(backend, options):
     if options is None or options == {"enabled": False}:
-        if (backend.pipeline_plan or {}).get("model_cohort", {}).get("numeric_contract") in (CONTRACT, BATCH_CONTRACT):
+        if (backend.pipeline_plan or {}).get("model_cohort", {}).get("numeric_contract") in (CONTRACT, BATCH_CONTRACT, PERSISTENT_BATCH_CONTRACT):
             raise ValueError("native tokenwise cohort requires explicit native_lanes configuration")
         return None
     client = NativeLaneBackend(backend, options)

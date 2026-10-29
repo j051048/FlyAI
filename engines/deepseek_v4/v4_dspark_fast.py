@@ -57,6 +57,10 @@ import torch
 # to A/B in one process; install() reads the attribute, so the flip takes on the next install().
 V4_DSPARK_FAST = os.environ.get("V4_DSPARK_FAST", "0") not in ("", "0")
 V4_DSPARK_GRAPH = os.environ.get("V4_DSPARK_GRAPH", "0") not in ("", "0")
+V4_DSPARK_CHAIN_GRAPH = os.environ.get("V4_DSPARK_CHAIN_GRAPH", "0") not in ("", "0")
+V4_DSPARK_CHAIN_MIB = int(os.environ.get("V4_DSPARK_CHAIN_MIB", "0"))
+V4_DSPARK_CHAIN_LIMIT = int(os.environ.get("V4_DSPARK_CHAIN_LIMIT", "16"))
+V4_DSPARK_CHAIN_REFERENCE = os.environ.get("V4_DSPARK_CHAIN_REFERENCE", "0") not in ("", "0")
 
 _REF_ADVANCE = None                     # DSparkTail.advance_and_draft, kept for uninstall + fallback
 
@@ -228,15 +232,32 @@ def fast_advance_and_draft(self, input_ids_seq, main_hidden_seq, start_pos):
                            f"past max_seq_len {self.args.max_seq_len} — stop drafting before "
                            f"the context limit, not inside the reference's freqs_cis slice")
     with torch.no_grad():
-        if n > 1:
+        chain = getattr(self, "_draft_chain", None)
+        out = chain.run(ids, mh, start_pos) if chain is not None else None
+        if out is None and n > 1:
             # positions start_pos .. start_pos+n-2 are intermediate: only their KV slot survives.
             _advance_cache_only(self, mh[:, :n - 1], start_pos)
         pos = start_pos + n - 1                                 # the kept (last committed) position
-        out = _kept_forward_spec(self, ids[:, n - 1], mh[:, n - 1:n], pos)
+        if out is None:
+            out = _kept_forward_spec(self, ids[:, n - 1], mh[:, n - 1:n], pos)
         self._pos = pos
     self.last_spec = out
     output_ids, _, confidence = out
     return output_ids[:, 1:], confidence
+
+
+def configure_chain(tail):
+    if not V4_DSPARK_CHAIN_GRAPH:
+        if V4_DSPARK_CHAIN_MIB or V4_DSPARK_CHAIN_REFERENCE:
+            raise ValueError("inactive draft chain cannot reserve bytes or claim a reference run")
+        return
+    if not V4_DSPARK_FAST:
+        raise ValueError("complete draft chain requires V4_DSPARK_FAST=1")
+    if (torch.device(tail.device).type == "cpu") != V4_DSPARK_CHAIN_REFERENCE:
+        raise ValueError("draft chain CPU emulation must be explicit and cannot qualify CUDA")
+    from v4_draft_chain import DraftChain
+    tail._draft_chain = DraftChain(tail, graph_bytes=V4_DSPARK_CHAIN_MIB << 20,
+        max_graphs=V4_DSPARK_CHAIN_LIMIT, reference=V4_DSPARK_CHAIN_REFERENCE)
 
 
 # ── install / uninstall (the v4_moe_decode pattern) ───────────────────────────────────────────────

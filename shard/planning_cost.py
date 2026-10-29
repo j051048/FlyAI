@@ -151,7 +151,10 @@ def workload_spec(value):
             raise ValueError("chunk planning requires observed/explicit cancel_rate and stale_frames_per_valid")
         if number(value["stale_frames_per_valid"], "stale_frames_per_valid") > depth - 1:
             raise ValueError("stale frames exceed the finite in-flight suffix")
-    return {"depth": depth, "block_tokens": block, "acceptance_gain": gain,
+    mode = value.get("decode_mode")
+    if mode is not None and mode not in ("greedy", "spec", "dspark", "pipelined"):
+        raise ValueError("invalid decode_mode for role-aware costs")
+    return {"decode_mode": mode, "depth": depth, "block_tokens": block, "acceptance_gain": gain,
             "generated_tokens": _integer(value.get("generated_tokens", 256), "generated_tokens"),
             "frame_tokens": frame_tokens,
             "context_tokens": value.get("context_tokens"), "warmness": value.get("warmness"),
@@ -171,6 +174,8 @@ def stage_observation(node, layers, fallback_ms, *, now, start=None, workload=No
         from .stage_cost import shape_trace
         selected_shape = shape_trace(trace, workload, start=start, layers=layers,
                                      source_sha256=node.get("source_sha256"))
+        role_unavailable = (trace.get("cost_surface", {}).get("schema") == "shard-stage-cost-surface/2"
+                            and selected_shape is None)
         if selected_shape is not None:
             trace, layer_scale, exact_shape = selected_shape
         age = now - timestamp(trace["measured_at"])
@@ -199,7 +204,9 @@ def stage_observation(node, layers, fallback_ms, *, now, start=None, workload=No
                 raise ValueError("verify chunk needs version-2 bound stage measurement")
             expected.update(context_tokens=trace.get("context_tokens") if selected_shape is not None else
                             (workload or {}).get("context_tokens"), warmness=(workload or {}).get("warmness"))
-        bound = True
+        bound = not role_unavailable
+        if role_unavailable:
+            warning.append(f"{node['id']}: role/decode/context cost binding unavailable; no measured role price")
         for key, value in expected.items():
             if value is None or trace.get(key) is None:
                 bound = False
@@ -216,11 +223,19 @@ def stage_observation(node, layers, fallback_ms, *, now, start=None, workload=No
             matches = scale == 1 and (start is None or lo == start)
             if selected_shape is not None:
                 scale, matches = layer_scale, exact_shape
-            result = {"service_ms": frame * scale, "queue_ms": queue,
-                    "shared_ms": shared * scale, "shared_id": trace.get("shared_resource_id"),
-                    "prefill_ms": prefill * scale if prefill is not None else None,
+            role_price = trace.get("_role_cost_prediction")
+            service = role_price["frame"]["total_ms"] if role_price else frame * scale
+            pf_service = (role_price["prefill"]["total_ms"] if role_price and role_price["prefill"] else
+                          None if role_price else prefill * scale if prefill is not None else None)
+            result = {"service_ms": service, "queue_ms": queue,
+                    "shared_ms": min(service, shared * scale + role_price["frame"]["fixed_ms"]) if shared and role_price else shared * scale,
+                    "shared_id": trace.get("shared_resource_id"), "prefill_ms": pf_service,
                     "source": "fresh_stage_trace" if matches else "context_layer_cost_prediction" if selected_shape else "scaled_stage_trace",
                     "uncertainty": [] if matches else [f"{node['id']}: stage trace reused for another block/range"]}
+            if role_price:
+                result["role_cost"] = deepcopy(role_price)
+                result["decode_mode"] = trace["cost_surface"]["decode_mode"]
+                result["role"] = deepcopy(trace["cost_surface"]["role"])
             if collect_quality:
                 result.update(quality=quality, observation_age_s=max(0,age)+quality.get("window_s",0),
                     exact_bound=matches and (workload or {}).get("context_tokens") is not None and
@@ -276,8 +291,10 @@ def estimate(order, alloc, layer_ms, L, c_out, c_in, nodes, model, workload,
              *, edges=None, now, objective="pipeline", slo=None, coordinator_id=None, host_groups=None):
     w = workload_spec(workload)
     stages, start = [], 0
-    for n in order:
-        stages.append(stage_observation(nodes[n], alloc[n], layer_ms[n], now=now, start=start, workload=w))
+    for index, n in enumerate(order):
+        role = {"head": index == 0, "tail": index == len(order) - 1,
+                "draft": index == len(order) - 1 and w["decode_mode"] in ("dspark", "pipelined")}
+        stages.append(stage_observation(nodes[n], alloc[n], layer_ms[n], now=now, start=start, workload={**w, "role": role}))
         start += alloc[n]
     warnings = [warning for stage in stages for warning in stage["uncertainty"]]
     if not isinstance(workload, dict) or workload.get("context_tokens") is None:
@@ -412,8 +429,10 @@ def assess_slo(point, order, alloc, layer_ms, L, c_out, c_in, nodes, model, work
     w = workload_spec(workload)
     selected = [nodes[n] for n in order]
     observed, cursor = [], 0
-    for n in order:
-        observed.append(stage_observation(nodes[n], alloc[n], layer_ms[n], now=now, start=cursor, workload=w, collect_quality=True))
+    for index, n in enumerate(order):
+        role = {"head": index == 0, "tail": index == len(order)-1,
+                "draft": index == len(order)-1 and w["decode_mode"] in ("dspark", "pipelined")}
+        observed.append(stage_observation(nodes[n], alloc[n], layer_ms[n], now=now, start=cursor, workload={**w,"role":role}, collect_quality=True))
         cursor += alloc[n]
     coordinator = coordinator_id if coordinator_id is not None else nodes[order[0]]["id"]
     route_pairs = [(nodes[a]["id"],nodes[b]["id"]) for a,b in zip(order,order[1:])]

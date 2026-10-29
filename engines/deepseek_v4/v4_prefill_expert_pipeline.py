@@ -37,7 +37,9 @@ def plan(cache, *, enabled=False, depth=2, batch_size=0):
             "slot_budget": size * effective_depth if active else 0,
             "byte_budget": size * effective_depth * cache.pool.bytes_per_expert if active else 0,
             "additional_gpu_bytes": 0, "additional_pinned_bytes": 0,
-            "source": "canonical_host_expert_banks", "consumer_order": "logical_expert_ascending"}
+            "source": ("exclusive_local_tiers" if getattr(cache.pool, "storage_mode", "canonical") == "exclusive"
+                       else "canonical_host_expert_banks"),
+            "consumer_order": "logical_expert_ascending"}
 
 
 class ExpertBatchPipeline:

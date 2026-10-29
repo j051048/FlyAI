@@ -1,6 +1,6 @@
 # 当前文档导航与历史证据
 
-核对日期：2026-10-21；当前工作区增加设备驻留批执行、B4数值修正、可选partial批图、时间线、置信预算、精确缓存与质量工具。本页区分操作合同、接口规范、
+核对日期：2026-10-29；最新六项完善全环成本、设备摘要、生产形状选环、持久异长 batch、专家分段图和资格门控的增量前缀／KV。此前角色成本、本机激活、专家补集、committed-MTP 图、宿主预算和离线训练保留；B4、whole及独立partial批图合同继续分别验收。本页区分操作合同、接口规范、
 有日期的实验记录和参考实现来源。历史性能数字按原实验条件保留；新版计时、
 会话或资源合同需要新的原始运行证据。
 
@@ -20,6 +20,10 @@
 | 本轮 DeepInfer 思路的 P0–P2 落地、预算和新真机门槛 | [V4_DEEPINFER_IMPROVEMENTS](V4_DEEPINFER_IMPROVEMENTS.md) |
 | 新独立批合同、设备驻留、请求轴batch与取消排空 | [V4_DEVICE_BATCHING](V4_DEVICE_BATCHING.md) |
 | B4零容差修正、partial图桶、scalar/eager/graph三方真机对照 | [V4_BATCH_GRAPH_ACCEPTANCE](V4_BATCH_GRAPH_ACCEPTANCE.md) |
+| Strata-DualGPU思路的六项本机执行／草稿合同、默认值和兼容矩阵 | [V4_DUALGPU_IMPROVEMENTS](V4_DUALGPU_IMPROVEMENTS.md) |
+| 本机IPC、expert热冷补集、完整MTP图、宿主预算及离线训练验收 | [V4_DUALGPU_ACCEPTANCE](V4_DUALGPU_ACCEPTANCE.md) |
+| 最新六项成本／直传／选环／持久批执行／专家图／增量KV的本地与原模型验收 | [V4_SIX_ACCEPTANCE](V4_SIX_ACCEPTANCE.md) |
+| 最新六项实现、配置和数值／资源合同 | [V4_SIX_IMPROVEMENTS](V4_SIX_IMPROVEMENTS.md) |
 | 条件概率校准、shadow与周期成本预算 | [V4_CONFIDENCE_BUDGET](V4_CONFIDENCE_BUDGET.md) |
 | 精确缓存、UTF-8/控制token、独立质量比较 | [V4_CACHE_QUALITY](V4_CACHE_QUALITY.md) |
 | 小磁盘节点、流式转换、权重准备与请求边界换环 | [WEIGHT_PREPARATION](WEIGHT_PREPARATION.md) |
@@ -71,6 +75,10 @@ decode tok/s 仍是固定验收目标；`v4_acceptance.py` 的模拟结果不通
 | [V4_NEXT_PHASE](V4_NEXT_PHASE.md) | 当前 V4 集成与下一阶段验证 |
 | [V4_PRODUCTION_OPTIMIZATIONS](V4_PRODUCTION_OPTIMIZATIONS.md) | 运行时优化开关及门控 |
 | [V4_HYBRID_RUNTIME](V4_HYBRID_RUNTIME.md) | GPU/RAM 双资源设计和各里程碑实际状态 |
+| [V4_DUALGPU_IMPROVEMENTS](V4_DUALGPU_IMPROVEMENTS.md) | 角色固定成本、本机真实字节传输、exclusive专家、完整committed草稿链、宿主预算与draft残差训练合同 |
+| [V4_DUALGPU_ACCEPTANCE](V4_DUALGPU_ACCEPTANCE.md) | 新路径单变量CUDA/原模型对照、四模式与whole边界、teacher数据采集／训练及发布证据 |
+| [V4_SIX_ACCEPTANCE](V4_SIX_ACCEPTANCE.md) | 全环成本、设备SHA、真实业务选环、持久异长batch、RAM专家分段图、前缀资格及indexed KV；GPU未运行保持pending |
+| [V4_SIX_IMPROVEMENTS](V4_SIX_IMPROVEMENTS.md) | 六项性能路径的服务集成、默认值、拒绝边界、局部与原生验收范围 |
 | [V4_TRUST_BOUNDARIES](V4_TRUST_BOUNDARIES.md) | 注册、执行身份、收据和激活可见性 |
 | [MLX_RUNTIME](MLX_RUNTIME.md) | Apple Silicon 后端的独立范围 |
 | [MiniMax 部署](../phase0/DEPLOY_M25.md) | 既有 M2.5 路径，不能套用 GPT-OSS/V4 新握手 |

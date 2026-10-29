@@ -132,6 +132,13 @@ V4_PREFILL_EXPERT_PIPELINE = os.environ.get("V4_PREFILL_EXPERT_PIPELINE", "0") n
 V4_PREFILL_EXPERT_DEPTH = int(os.environ.get("V4_PREFILL_EXPERT_DEPTH", "2"))
 V4_PREFILL_EXPERT_BATCH = int(os.environ.get("V4_PREFILL_EXPERT_BATCH", "0"))
 V4_EXPERT_PLACEMENT = os.environ.get("V4_EXPERT_PLACEMENT", "gpu")
+V4_EXPERT_STORAGE = os.environ.get("V4_EXPERT_STORAGE", "canonical")
+V4_EXPERT_STORAGE_HOST_MIB = int(os.environ.get("V4_EXPERT_STORAGE_HOST_MIB", "0"))
+V4_EXPERT_READY_FIRST = os.environ.get("V4_EXPERT_READY_FIRST", "0") not in ("", "0")
+V4_EXPERT_READY_MIB = int(os.environ.get("V4_EXPERT_READY_MIB", "8"))
+V4_EXPERT_SEGMENT_GRAPH_MIB = int(os.environ.get("V4_EXPERT_SEGMENT_GRAPH_MIB", "0"))
+V4_EXPERT_SEGMENT_GRAPH_MAX = int(os.environ.get("V4_EXPERT_SEGMENT_GRAPH_MAX", "32"))
+V4_KV_INDEXED_GATHER = os.environ.get("V4_KV_INDEXED_GATHER", "0") not in ("", "0")
 V4_EXPERT_CACHE_SLOTS = int(os.environ.get("V4_EXPERT_CACHE_SLOTS", "0"))
 V4_EXPERT_CACHE_MIB = int(os.environ.get("V4_EXPERT_CACHE_MIB", "0"))
 V4_EXPERT_CACHE_RESERVE_MIB = int(os.environ.get("V4_EXPERT_CACHE_RESERVE_MIB", "2048"))
@@ -796,11 +803,12 @@ class Stage:
 
     def __init__(self, lo, hi, args=None, *, head=False, tail=False, dspark=False,
                  device=None, dtype=None, spec_depth=None, fast_verify=None, runtime_metrics=None,
-                 expert_placement=None, expert_cache_slots=None, expert_cache_bytes=None,
+                 expert_placement=None, expert_cache_slots=None, expert_cache_bytes=None, expert_storage=None,
+                 expert_storage_host_bytes=None,
                  expert_cache_reserve_bytes=None, expert_cache_reference=False,
                  runtime_profile=None, expert_prefetch=None, kv_placement=None,
                  kv_gpu_budget_bytes=None, kv_host_budget_bytes=None,
-                 kv_reference=False, prefill_query_chunk=None,
+                 kv_reference=False, kv_indexed_gather=None, prefill_query_chunk=None,
                  prefill_expert_pipeline=None, prefill_expert_depth=None, prefill_expert_batch=None):
         for name, value in (("runtime_profile", runtime_profile), ("expert_prefetch", expert_prefetch)):
             if value is not None and type(value) is not bool:
@@ -817,6 +825,11 @@ class Stage:
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ValueError(f"{name[1:]} must be a nonnegative integer")
         self._kv_reference = kv_reference
+        self._kv_indexed_gather = V4_KV_INDEXED_GATHER if kv_indexed_gather is None else kv_indexed_gather
+        if type(self._kv_indexed_gather) is not bool:
+            raise ValueError("kv_indexed_gather must be boolean")
+        if self._kv_indexed_gather and (self._kv_placement != "layer" or self._prefill_query_chunk):
+            raise ValueError("indexed gather requires layer KV and native full-prompt prefill")
         self._kv_runtime = None
         if self._kv_placement == "layer":
             if not self._kv_gpu_budget_bytes or not self._kv_host_budget_bytes:
@@ -846,6 +859,25 @@ class Stage:
         if not 0 <= lo < hi <= a.n_layers:
             raise RuntimeError(f"v4 stage[{lo}:{hi}) is not a range inside 0..{a.n_layers}")
         self._expert_placement = V4_EXPERT_PLACEMENT if expert_placement is None else expert_placement
+        self._expert_storage = V4_EXPERT_STORAGE if expert_storage is None else expert_storage
+        self._expert_storage_host_bytes = (V4_EXPERT_STORAGE_HOST_MIB << 20
+            if expert_storage_host_bytes is None else expert_storage_host_bytes)
+        if type(self._expert_storage_host_bytes) is not int or self._expert_storage_host_bytes < 0:
+            raise ValueError("expert_storage_host_bytes must be a nonnegative integer")
+        if self._expert_storage not in ("canonical", "exclusive"):
+            raise ValueError("expert_storage must be 'canonical' or 'exclusive'")
+        if self._expert_storage == "exclusive" and self._expert_placement != "ram":
+            raise ValueError("exclusive expert storage requires RAM expert placement")
+        if (self._expert_storage == "exclusive") != bool(self._expert_storage_host_bytes):
+            raise ValueError("exclusive storage requires its own explicit positive host tensor budget")
+        self._expert_segment_bytes = V4_EXPERT_SEGMENT_GRAPH_MIB << 20
+        self._expert_ready_bytes = V4_EXPERT_READY_MIB << 20 if V4_EXPERT_READY_FIRST else 0
+        if (self._expert_segment_bytes < 0 or V4_EXPERT_READY_MIB < 1
+                or not 1 <= V4_EXPERT_SEGMENT_GRAPH_MAX <= 4096):
+            raise ValueError("expert execution requires bounded graph and ready-output quotas")
+        segmented = self._expert_segment_bytes > 0 and _graph_mode() == "whole"
+        if self._expert_storage == "exclusive" and ((_graph_mode() != "off" and not segmented) or self._kv_placement != "gpu"):
+            raise ValueError("exclusive expert storage requires scalar graph-off execution with resident KV")
         if self._expert_placement not in ("gpu", "ram"):
             raise ValueError("expert_placement must be 'gpu' or 'ram'")
         from v4_prefill_expert_pipeline import validate_options
@@ -869,6 +901,8 @@ class Stage:
         for name in ("_expert_cache_slots", "_expert_cache_bytes", "_expert_cache_reserve_bytes"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ValueError(f"{name[1:]} must be a nonnegative integer")
+        if self._expert_storage == "exclusive" and (not self._expert_cache_slots or self._expert_cache_bytes):
+            raise ValueError("exclusive expert storage requires explicit fixed cache slots")
         if self._expert_placement == "ram":
             if not str(self.device).startswith("cuda") and not self._expert_cache_reference:
                 raise ValueError("RAM expert placement requires CUDA; CPU reference emulation must be explicit")
@@ -884,7 +918,8 @@ class Stage:
             self._expert_cache = v4_expert_cache.StageBudgetManager(
                 slots_per_pool=self._expert_cache_slots or None,
                 budget_bytes=None if self._expert_cache_slots else self._expert_cache_bytes,
-                device=self.device, emulation=self._expert_cache_reference)
+                device=self.device, emulation=self._expert_cache_reference, storage_mode=self._expert_storage,
+                host_budget_bytes=self._expert_storage_host_bytes or None)
         block_cls = chunk_block_cls(M) if self._fast else M.Block
         if self._prefill_query_chunk:
             import v4_chunked_prefill
@@ -916,6 +951,13 @@ class Stage:
                     self.hc_head_base = torch.nn.Parameter(torch.empty(a.hc_mult))
                     self.hc_head_scale = torch.nn.Parameter(torch.empty(1))
         self._hybrid_blocks = list(self.layers) if self._expert_cache is not None else []
+        if (self._expert_segment_bytes or V4_EXPERT_READY_FIRST) and self._expert_cache is None:
+            raise ValueError("expert segment graphs/ready-first require RAM expert placement")
+        for block in self._hybrid_blocks:
+            block.ffn._hybrid_runtime.configure_execution(ready_first=V4_EXPERT_READY_FIRST,
+                ready_bytes=V4_EXPERT_READY_MIB << 20,
+                graph_bytes=self._expert_segment_bytes // len(self._hybrid_blocks),
+                max_graphs=V4_EXPERT_SEGMENT_GRAPH_MAX, reference=self._expert_cache_reference)
         self._hybrid_cache_ready = False
         # Re-lay the routed experts as ONE contiguous bank per layer, so the grouped fp4 MoE kernel
         # can gather them without holding a second copy of the weights. HERE, between construction and
@@ -973,7 +1015,8 @@ class Stage:
                 self.layers, a, device=self.device, dtype=self.dtype,
                 gpu_budget_bytes=self._kv_gpu_budget_bytes, host_budget_bytes=self._kv_host_budget_bytes,
                 spec_depth=self._spec_depth, draft_layers=a.n_mtp_layers if dspark else 0,
-                reference=self._kv_reference, prefill_gate=bool(self._prefill_query_chunk))
+                reference=self._kv_reference, prefill_gate=bool(self._prefill_query_chunk),
+                indexed_gather=self._kv_indexed_gather)
         self._last_tap = {}
         self._pos = 0
         self._replaying = False
@@ -1025,6 +1068,10 @@ class Stage:
         v4_fp8_gemv.configure_tuning_execution("eager")
         from v4_native_lanes import configured_runner
         self._native_lanes = configured_runner(self)
+        from v4_host_compute import configure as configure_host_compute
+        self._host_compute = configure_host_compute(self)
+        if self._expert_cache is not None:
+            self._expert_cache.set_host_compute(self._host_compute)
 
     def _graph_refusal(self):
         """Why this stage cannot graph its decode step, or None. Loud and specific, never silent.
@@ -1139,6 +1186,8 @@ class Stage:
             # A rollback never calls reset: every reset here starts a fresh job's counters.
             self._runtime_metrics.reset()
             self._runtime_metrics.sample_kv(self._runtime_kv_tensors())
+        if self._kv_runtime is not None:
+            self._kv_runtime.finish_stage_reset()
 
     def _runtime_kv_tensors(self):
         """Owned KV/indexer/compressor allocations and retained rollback KV state.
@@ -1310,6 +1359,11 @@ class Stage:
             # explicit headroom for prefill and lazy graphs before filling slots.
             torch.cuda.empty_cache()
             free, _ = torch.cuda.mem_get_info(self.device)
+            if (self._expert_storage == "exclusive"
+                    and free < self._expert_cache_reserve_bytes):
+                # Hot banks already exist in this mode. A zero *additional*
+                # allocation must still leave the declared runtime headroom.
+                raise RuntimeError("exclusive expert hot slots consumed the declared runtime VRAM reserve")
             available = max(0, free - self._expert_cache_reserve_bytes)
             if not self._expert_cache_slots:
                 budget = self._expert_cache_bytes or available
@@ -1319,6 +1373,7 @@ class Stage:
             else:
                 need = sum(self._expert_cache_slots * pool.bytes_per_expert
                            for pool in self._expert_cache.pools.values())
+                need -= self._expert_cache.preallocated_device_bytes
                 if need > available:
                     raise RuntimeError("expert cache slot budget exceeds measured free VRAM after runtime reserve")
         caches = self._expert_cache.allocate()
@@ -1762,6 +1817,14 @@ class Stage:
         proof = verify_checkpoint_artifacts(d, expected_checkpoint_id=expected_checkpoint_id,
             expected_manifest_sha256=expected_manifest_sha256, lo=self.lo, hi=self.hi,
             head=self.head, tail=self.tail, dspark=self._dspark_capable)
+        if self._expert_storage == "exclusive":
+            if proof is None and not self._expert_cache_reference:
+                raise RuntimeError("exclusive production expert storage requires verified checkpoint artifacts")
+            # verify_checkpoint_artifacts validates the complete logical identity,
+            # whose native ABI is "tensor-sha256:<digest>", not a bare digest.
+            # Retain that namespace instead of rejecting every published pack.
+            identity = proof["checkpoint_id"] if proof is not None else "unverified-cpu-reference"
+            self._expert_cache.bind_model_identity(identity)
         wm = weight_map(d)
         for li in range(self.lo, self.hi):
             prefix = f"layers.{li}."

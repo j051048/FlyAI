@@ -19,7 +19,7 @@ import v4_stage as V
 import v4_pipe as VP
 from v4_gateway import V4RingBackend
 from v4_native_lanes import CONTRACT
-from v4_native_batch import BATCH_CONTRACT
+from v4_native_batch import BATCH_CONTRACT, PERSISTENT_BATCH_CONTRACT
 from v4_resources import runtime_config_payload
 from shard.offers import ModelCohort
 from shard.pipeline_plan import build_plan
@@ -39,13 +39,16 @@ def ring(tmp_path, monkeypatch, request):
     old_threads = torch.get_num_threads(); torch.set_num_threads(1)
     monkeypatch.setenv("V4_NATIVE_LANES", "2")
     monkeypatch.setenv("V4_NATIVE_LANE_HOST_MIB", "32")
-    batch_mode = getattr(request, "param", None) in ("batch", "batch_graph")
-    numerical_contract = BATCH_CONTRACT if batch_mode else CONTRACT
+    persistent = getattr(request, "param", None) == "persistent"
+    batch_mode = getattr(request, "param", None) in ("batch", "batch_graph", "persistent")
+    numerical_contract = PERSISTENT_BATCH_CONTRACT if persistent else BATCH_CONTRACT if batch_mode else CONTRACT
     if batch_mode:
         monkeypatch.setenv("V4_NATIVE_BATCH", "1")
         monkeypatch.setenv("V4_NATIVE_BATCH_REFERENCE", "1")
         monkeypatch.setenv("V4_NATIVE_LANE_DEVICE_MIB", "32")
         monkeypatch.setenv("V4_NATIVE_PREFILL_QUANTUM", "8")
+        if persistent:
+            monkeypatch.setenv("V4_NATIVE_BATCH_STORAGE", "persistent")
         if getattr(request, "param", None) == "batch_graph":
             monkeypatch.setenv("V4_NATIVE_BATCH_GRAPH", "partial")
             monkeypatch.setenv("V4_NATIVE_BATCH_GRAPH_MIB", "16")

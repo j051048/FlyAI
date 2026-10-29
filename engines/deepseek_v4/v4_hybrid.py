@@ -1,7 +1,8 @@
 """Local RAM expert pools behind V4's original Block and Expert mathematics.
 
 Only storage and dispatch change. Resident attention/router/shared/HC parameters
-stay on the execution device; every routed expert remains a canonical host view.
+stay on the execution device. The default pool owns canonical host weights; the
+explicit exclusive pool instead owns hot GPU weights and only the cold RAM complement.
 Cache slot modules are not registered under the checkpoint's MoE, and a lease
 protects their fixed addresses until its last GPU consumer finishes.
 
@@ -54,7 +55,6 @@ def hybrid_block_cls(base_cls, ref_model, manager, *, device, emulation=False,
         attention_cls = _AttentionPlaceholder
 
         def __init__(self, layer_id, args):
-            from v4_expert_cache import HostExpertPool
             with torch.device("meta"):
                 super().__init__(layer_id, args)
             self.attention_cls = attention_cls
@@ -76,9 +76,8 @@ def hybrid_block_cls(base_cls, ref_model, manager, *, device, emulation=False,
             for name, parameter in list(self.named_parameters(recurse=False)):
                 self._parameters[name] = torch.nn.Parameter(
                     torch.empty_like(parameter, device=device), requires_grad=parameter.requires_grad)
-            pool = HostExpertPool.from_moe(self.ffn, pin=not emulation,
-                                          emulation=emulation, preserve=False)
             key = (role, layer_id)
+            pool = manager.new_pool(self.ffn, key, preserve=False)
             manager.register(pool, key, min_slots=1)
             runtime = HybridMoE(self.ffn, ref_model, pool, key, device=device,
                                 emulation=emulation, role=role, observer=metrics)
@@ -144,6 +143,43 @@ class HybridMoE:
         self._prefetch_counts = dict(requested=0, used=0, wasted=0, skipped=0, candidate_count=0)
         self._prefill_pipeline_options = {"enabled": False, "depth": 2, "batch_size": 0}
         self._prefill_pipeline_counts = self._empty_pipeline_counts()
+        self.ready_first = False
+        self.ready_output_bytes = 0
+        self.segment_graphs = None
+        self._ready_counts = dict(batches=0, completed_before_pending=0, staged_output_bytes=0)
+
+    def configure_execution(self, *, ready_first=False, ready_bytes=8 << 20,
+                            graph_bytes=0, max_graphs=32, reference=False):
+        """Explicit local experiment; graph bytes are a PER-LAYER reservation."""
+        if type(ready_first) is not bool or type(graph_bytes) is not int or graph_bytes < 0:
+            raise ValueError("expert execution needs boolean ready-first and bounded graph bytes")
+        if type(ready_bytes) is not int or ready_bytes < 0 or ready_first and not ready_bytes:
+            raise ValueError("ready-first requires a positive output-staging byte quota")
+        if self.segment_graphs is not None:
+            raise RuntimeError("expert segment configuration is fixed for the Stage lifetime")
+        self.ready_first = ready_first
+        self.ready_output_bytes = ready_bytes if ready_first else 0
+        if graph_bytes:
+            from v4_expert_graph import ExpertSegmentGraphs
+            self.segment_graphs = ExpertSegmentGraphs(self, max_bytes=graph_bytes,
+                max_graphs=max_graphs, reference=reference)
+
+    def execution_status(self):
+        return {"ready_first": self.ready_first, "ready_output_bytes": self.ready_output_bytes,
+                "scope": "stage_lifetime", "ready_observations": dict(self._ready_counts),
+                "segments": self.segment_graphs.status() if self.segment_graphs is not None else None}
+
+    def _stateless(self, key, fn, *inputs):
+        # WholeBlockGraphs primes the split's MoE outside its pre/post captures.
+        # That probe is not a committed model position: do not bind segment
+        # identities, retain static buffers or claim replays from its throwaway
+        # routing. The first actual MoE execution owns first-use capture.
+        if self._warmup_depth or self.segment_graphs is None or inputs[0].shape[0] != 1:
+            return fn(*inputs)
+        return self.segment_graphs.run(key, fn, *inputs)
+
+    def _shared(self, xv):
+        return self._stateless("shared", self.moe.shared_experts, xv)
 
     @staticmethod
     def _empty_pipeline_counts():
@@ -161,6 +197,8 @@ class HybridMoE:
         config = (plan(self.cache, **self._prefill_pipeline_options) if self.cache is not None else
                   {"schema": SCHEMA, "requested": dict(self._prefill_pipeline_options),
                    "active": False, "reason": "cache_not_bound"})
+        if self.ready_first and config.get("active"):
+            config = {**config, "active": False, "reason": "ready_first_owns_individual_slot_admission"}
         return {"config": config, "observations": dict(self._prefill_pipeline_counts)}
 
     def _prefill_pipeline(self, ordered, rows):
@@ -341,7 +379,7 @@ class HybridMoE:
             # Experimental ordering only. The default queues shared AFTER expert
             # acquire, so on-demand weight DMA still overlaps its computation.
             with self._gpu("shared"):
-                shared = self.moe.shared_experts(xv)
+                shared = self._shared(xv)
         with self._host("router_readback"):
             scratch["ids_ready"].synchronize()  # one necessary host wait, not a device-wide sync
             rows = scratch["ids"][:indices.shape[0]].tolist()
@@ -452,12 +490,49 @@ class HybridMoE:
             if observed:
                 timings.extend(observed)
 
+    def _ready_batch(self, batch, pairs, xv, weights, counts, timings):
+        """Queue current hits BEFORE acquiring cold slots.
+
+        Exclusive storage preserves unique evicted weights with a D2H fence;
+        acquiring all misses first can therefore hold the host before any hit
+        has even launched. Completed hits are leased/consumed first, then cold
+        experts one at a time. Release events protect any hit slot reused later.
+        Outputs remain separate until the caller performs the original fold.
+        """
+        ready = set(self.cache.cached_ids()) & set(batch)
+        groups = ([list(eid for eid in batch if eid in ready)] if ready else [])
+        groups.extend([eid] for eid in batch if eid not in ready)
+        staged = {}
+        for group in groups:
+            with self._host("cache_schedule"):
+                lease = self.cache.acquire(group)
+            try:
+                for eid in group:
+                    lease.wait_for([eid])
+                    rows, top = zip(*pairs[eid])
+                    row_idx = torch.tensor(rows, dtype=torch.long, device=xv.device)
+                    top_idx = torch.tensor(top, dtype=torch.long, device=xv.device)
+                    physical = lease.mapping[eid]
+                    result = self._stateless(("slot", physical), self.cache.experts[physical],
+                        xv[row_idx], weights[row_idx, top_idx, None])
+                    staged[eid] = (row_idx, result)
+                self._record_lease(lease, pairs, counts, timings)
+            finally:
+                lease.release()
+        if not self._warmup_depth:
+            self._ready_counts["batches"] += 1
+            self._ready_counts["completed_before_pending"] += len(ready) if len(ready) < len(batch) else 0
+            self._ready_counts["staged_output_bytes"] += sum(t.numel() * t.element_size() for _, t in staged.values())
+        return staged
+
     def forward(self, x, input_ids):
         # One module normally has one serving thread. Serializing host scratch use
         # also makes direct callers safe; different CUDA streams retain independent
         # GPU/pinned buffers and the cache's consumer-event leases stay authoritative.
         with self._forward_lock:
-            return self._forward(x, input_ids)
+            admission = getattr(self.pool, "_host_compute", None)
+            with admission.compute() if admission is not None else nullcontext():
+                return self._forward(x, input_ids)
 
     def _forward(self, x, input_ids):
         self._require_cache()
@@ -466,7 +541,7 @@ class HybridMoE:
         shape = x.shape
         xv = x.view(-1, self.moe.dim)
         with self._gpu("gate"):
-            weights, indices = self.moe.gate(xv, input_ids.flatten())
+            weights, indices = self._stateless("gate", self.moe.gate, xv, input_ids.flatten())
         # Exactly one IDs readback per layer; the host still must resolve demand
         # misses. GPU shared work is queued while a dedicated stream copies into
         # reusable pinned IDs instead of synchronously allocating a CPU tensor.
@@ -486,14 +561,15 @@ class HybridMoE:
                   "dma_bytes": 0, "dma_wait_ms": 0.0, "cpu_misses": 0, "reference_routes": 0}
         timings = []
         y = torch.zeros_like(xv, dtype=torch.float32)
-        if xv.shape[0] == 1 and self.supports_grouped and len(ordered) <= self.cache.capacity and indices.shape[1] <= 32:
+        if (xv.shape[0] == 1 and self.supports_grouped and len(ordered) <= self.cache.capacity
+                and indices.shape[1] <= 32 and not self.ready_first and self.segment_graphs is None):
             with self._host("cache_schedule"):
                 lease = self.cache.acquire(ordered)
             try:
                 # Copies run on their own stream while the independent shared expert computes.
                 if shared is None:
                     with self._gpu("shared"):
-                        shared = self.moe.shared_experts(xv)
+                        shared = self._shared(xv)
                 lease.wait_on()
                 from v4_moe_grouped import grouped_routed_sum
                 physical = self._physical_slots(logical_rows[0], lease.mapping, xv, scratch)
@@ -506,7 +582,9 @@ class HybridMoE:
             finally:
                 lease.release()
         else:
-            pipeline = self._prefill_pipeline(ordered, xv.shape[0])
+            # Ready-first owns its individual slot admissions. The separately
+            # opt-in prefill batch producer cannot pre-acquire those cold slots.
+            pipeline = None if self.ready_first else self._prefill_pipeline(ordered, xv.shape[0])
             try:
                 if pipeline is not None:
                     with self._host("cache_schedule"):
@@ -516,23 +594,35 @@ class HybridMoE:
                     batches = ((ordered[begin:begin + self.cache.capacity], None)
                                for begin in range(0, len(ordered), self.cache.capacity))
                 for batch, lease in batches:
+                    ready_active = self.ready_first and sum(len(pairs[eid]) for eid in batch) * self.moe.dim * 4 <= self.ready_output_bytes
+                    if ready_active:
+                        if shared is None:
+                            with self._gpu("shared"):
+                                shared = self._shared(xv)
+                        with self._gpu("routed"):
+                            staged = self._ready_batch(batch, pairs, xv, weights, counts, timings)
+                            for eid in batch:
+                                row_idx, result = staged[eid]
+                                y[row_idx] += result
+                        continue
                     if lease is None:
                         with self._host("cache_schedule"):
                             lease = self.cache.acquire(batch)
                     try:
                         if shared is None:
                             with self._gpu("shared"):
-                                shared = self.moe.shared_experts(xv)
-                        lease.wait_on()
+                                shared = self._shared(xv)
                         with self._gpu("routed"):
+                            lease.wait_on()
                             for eid in batch:
                                 rows, top = zip(*pairs[eid])
                                 row_idx = torch.tensor(rows, dtype=torch.long, device=xv.device)
                                 top_idx = torch.tensor(top, dtype=torch.long, device=xv.device)
-                                expert = self.cache.experts[lease.mapping[eid]]
-                                # Expert row shapes and the logical ascending fold are identical;
-                                # the producer only changes when original packed bytes arrive.
-                                y[row_idx] += expert(xv[row_idx], weights[row_idx, top_idx, None])
+                                physical = lease.mapping[eid]
+                                expert = self.cache.experts[physical]
+                                result = self._stateless(("slot", physical), expert,
+                                    xv[row_idx], weights[row_idx, top_idx, None])
+                                y[row_idx] += result
                         self._record_lease(lease, pairs, counts, timings)
                     finally:
                         lease.release()
@@ -542,7 +632,7 @@ class HybridMoE:
             if not self._warmup_depth:
                 self.generic_steps += 1
         if shared is None:
-            shared = self.moe.shared_experts(xv)
+            shared = self._shared(xv)
         y += shared  # Always last, after the logical ascending expert fold.
         self._event(counts, timings)
         return y.type_as(xv).view(shape)

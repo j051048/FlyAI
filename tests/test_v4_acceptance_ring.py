@@ -343,3 +343,19 @@ def test_oversized_initial_stage_log_aborts_standalone_warmup_with_owned_cleanup
         assert "synthetic-ring.warmup" not in manager.started
     finally:
         path.unlink(missing_ok=True)
+
+@pytest.mark.parametrize("name",["V4_HOST_TRANSPORT_CONFIG","V4_HOST_COMPUTE_CONFIG","V4_DRAFT_ADAPTER_DIR"])
+def test_public_ring_recipe_rejects_private_paths_and_omits_empty_defaults(name):
+    with pytest.raises(ValueError,match="private worker"):
+        ring.canonical_environment({name:"/private/operator/config.json"})
+    assert name not in ring.canonical_environment({name:""})
+    assert ring.canonical_environment({name:""})==ring.canonical_environment()
+
+
+def test_ring_and_benchmark_source_catalogues_cover_all_new_owned_diagnostics():
+    from phase0.v4_benchmark import source_identity
+    actual=ring._source_identity()["files"]
+    assert actual==source_identity()["files"]
+    names={row["name"] for row in actual}
+    assert {"phase0/v4_role_calibration.py","phase0/v4_draft_training.py",
+            "phase0/v4_draft_chain_probe.py","phase0/v4_host_transport_probe.py"}<=names

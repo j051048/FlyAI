@@ -288,6 +288,9 @@ def configured_runner(stage):
     graph_mode = os.environ.get("V4_NATIVE_BATCH_GRAPH", "off")
     graph_bytes = int(os.environ.get("V4_NATIVE_BATCH_GRAPH_MIB", "0")) << 20
     graph_limit = int(os.environ.get("V4_NATIVE_BATCH_GRAPH_LIMIT", "64"))
+    storage_mode = os.environ.get("V4_NATIVE_BATCH_STORAGE", "copy")
+    if storage_mode not in ("copy", "persistent") or (enabled != "1" and storage_mode != "copy"):
+        raise ValueError("persistent batch storage requires explicit V4_NATIVE_BATCH=1")
     if enabled not in ("0", "1") or reference not in ("0", "1") or device_bytes < 0:
         raise ValueError("native batch flags require booleans and a bounded device quota")
     if enabled == "1":
@@ -295,7 +298,7 @@ def configured_runner(stage):
         return DeviceNativeLanes(stage, **options, device_bytes=device_bytes,
                                  reference=reference == "1", async_depth=depth,
                                  prefill_quantum=prefill_quantum, graph_mode=graph_mode,
-                                 graph_bytes=graph_bytes, max_graphs=graph_limit)
+                                 graph_bytes=graph_bytes, max_graphs=graph_limit, storage_mode=storage_mode)
     if reference != "0" or device_bytes or graph_mode != "off" or graph_bytes:
         raise ValueError("native batch reference/device quota require explicit V4_NATIVE_BATCH=1")
     return NativeLanes(stage, **options) if options["max_jobs"] else None

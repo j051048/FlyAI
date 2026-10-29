@@ -715,3 +715,21 @@ def test_source_experiment_allows_bound_repo_hadamard_function_change():
         value["backend_identity"]["hadamard"]["source_sha256"] = "f"*64
     result = bench.compare_reports(observed_report(p, keys), observed_report(q, keys, observation_mutator=function_change), vary="source")
     assert result["status"] == "verified_target_pass", result
+
+@pytest.mark.parametrize("name",["V4_HOST_TRANSPORT_CONFIG","V4_HOST_COMPUTE_CONFIG","V4_DRAFT_ADAPTER_DIR"])
+def test_prepare_refuses_private_env_file_before_reading_checkpoint(name,tmp_path,monkeypatch):
+    env_file=tmp_path/"private-launch.json"
+    env_file.write_text(json.dumps({name:"/private/operator/config.json"}),encoding="utf-8")
+    monkeypatch.setattr(bench,"checkpoint_inventory",lambda *a:pytest.fail("private paths must be rejected before model reads"))
+    with pytest.raises(ValueError,match="private worker"):
+        bench._prepare(SimpleNamespace(env_file=str(env_file)))
+
+
+def test_empty_private_public_override_is_removed_and_crafted_protocol_cannot_publish_a_path():
+    assert not bench.public_environment_overrides({"V4_HOST_COMPUTE_CONFIG":""})
+    p,_=protocol()
+    p["env"]["V4_HOST_COMPUTE_CONFIG"]="/private/operator/config.json"
+    for node in p["hardware"]:
+        node["stage_env_sha256"]=bench.digest(p["env"])
+    p=bench.seal_protocol(p)
+    assert any("private worker" in error for error in bench.protocol_errors(p))

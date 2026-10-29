@@ -19,6 +19,10 @@ class ExpertCacheError(RuntimeError):
     pass
 
 
+class ExpertCopyAdmissionError(ExpertCacheError):
+    """No DMA was queued; an unchanged slot can be retried after backpressure."""
+
+
 def _integer(value, name, *, positive=False):
     if type(value) is not int or value < (1 if positive else 0):
         raise ExpertCacheError(f"{name} must be an {'positive' if positive else 'nonnegative'} integer")
@@ -283,21 +287,44 @@ class CacheLease:
         self.released = False
         self.waited = False
         self._consumer_streams = {}
+        self._waited_by_stream = {}
         self._copies = copies
         self._wait_pairs = []
 
     def wait_on(self, stream=None):
+        return self.wait_for(self.mapping, stream)
+
+    def ready_ids(self):
+        """Actual completed copy dependencies, without a host synchronization."""
         with self.cache._lock:
             self._validate()
+            return tuple(eid for eid, index in self.mapping.items()
+                         if self.cache._slots[index].ready.query())
+
+    def wait_for(self, ids, stream=None):
+        """Order only these leased experts before their consumer.
+
+        A ready hit must not wait for an unrelated miss in the same lease. The
+        release fence still covers ALL consumers, including partial waits and
+        exceptions before the remaining experts are reached.
+        """
+        with self.cache._lock:
+            self._validate()
+            requested = tuple(dict.fromkeys(ids))
+            if any(eid not in self.mapping for eid in requested):
+                raise ExpertCacheError("expert wait is outside this lease")
             if self.cache.emulation:
-                for event in self.ready_events:
+                for event in dict.fromkeys(self.cache._slots[self.mapping[eid]].ready for eid in requested):
                     event.synchronize()
             else:
                 with torch.cuda.device(self.cache.device):
                     stream = stream or torch.cuda.current_stream(self.cache.device)
-                    if stream.cuda_stream in self._consumer_streams:
+                    waited = self._waited_by_stream.setdefault(stream.cuda_stream, set())
+                    remaining = [eid for eid in requested if eid not in waited]
+                    if not remaining:
                         return self
-                    pending = [event for event in self.ready_events if not event.query()]
+                    pending = list(dict.fromkeys(self.cache._slots[self.mapping[eid]].ready
+                                   for eid in remaining if not self.cache._slots[self.mapping[eid]].ready.query()))
                     if pending:
                         wait_start, wait_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                         wait_start.record(stream)
@@ -309,12 +336,15 @@ class CacheLease:
                         if bank is not None:
                             bank.record_stream(stream)
                     self._consumer_streams[stream.cuda_stream] = stream
+                    waited.update(remaining)
             self.waited = True
         return self
 
     def _validate(self):
         if self.released:
             raise ExpertCacheError("lease has already been released")
+        if self.cache.closed or self.cache._faulted:
+            raise ExpertCacheError("expert cache is closed or faulted")
         if self.epoch != self.cache.pool.epoch:
             raise ExpertCacheError("lease belongs to stale weights")
 
@@ -466,11 +496,13 @@ class FixedSlotCache:
             # Capacity failure above leaves all owners and counters unchanged.
             for eid, index in zip(missing, candidates):
                 slot = self._slots[index]
-                if slot.owner is not None:
-                    self._owners.pop(slot.owner, None)
-                    self._stats["evictions"] += 1
+                previous_owner = slot.owner
                 try:
                     start, ready = self._copy_expert(eid, index)
+                except ExpertCopyAdmissionError:
+                    # No copy started, so the existing canonical/cache owner is
+                    # still intact. Do not poison it for ordinary backpressure.
+                    raise
                 except BaseException:
                     # A partly overwritten slot must never advertise old/new weights.
                     slot.owner, slot.epoch, slot.ready = None, -1, None
@@ -481,10 +513,16 @@ class FixedSlotCache:
                             changed_slot = self._slots[changed_index]
                             changed_slot.owner, changed_slot.epoch = None, -1
                     raise
+                if previous_owner is not None:
+                    self._owners.pop(previous_owner, None)
+                    self._stats["evictions"] += 1
                 slot.owner, slot.epoch, slot.ready = eid, self.pool.epoch, ready
                 slot.use_events = []
                 self._owners[eid] = index
                 mapping[eid] = index
+                self._stats["new_copies"] += 1
+                self._stats["copied_bytes"] += self.pool.bytes_per_expert
+                self._stats["dma_bytes"] += 0 if self.emulation else self.pool.bytes_per_expert
                 if start is not None:
                     copies.append((start, ready))
             if demand:
@@ -500,12 +538,37 @@ class FixedSlotCache:
             self._stats["hits"] += len(hits) if demand else 0
             self._stats["misses"] += len(missing) + len(pending) if demand else 0
             self._stats["pending_hits"] += len(pending)
-            self._stats["new_copies"] += len(missing)
-            self._stats["copied_bytes"] += len(missing) * self.pool.bytes_per_expert
-            self._stats["dma_bytes"] += 0 if self.emulation else len(missing) * self.pool.bytes_per_expert
             return CacheLease(self, mapping, hits, missing + pending, pending, missing, copies)
 
     def _copy_expert(self, eid, index):
+        admission = getattr(self.pool, "_host_compute", None)
+        if admission is None:
+            return self._copy_expert_unbudgeted(eid, index)
+        completion = [None]
+        entered = False
+        def fence():
+            if completion[0] is not None:
+                completion[0].synchronize()
+            elif self.copy_stream is not None:
+                self.copy_stream.synchronize()
+        try:
+            # Host copy permits must cover completed DMA, not just enqueueing.
+            # Opting into this shared budget intentionally adds a local fence.
+            with admission.copy(completion=fence):
+                entered = True
+                result = self._copy_expert_unbudgeted(eid, index)
+                completion[0] = result[1]
+                return result
+        except BaseException as error:
+            if not entered:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise ExpertCopyAdmissionError("host copy admission refused before any expert transfer") from error
+            if getattr(self.pool, "storage_mode", "canonical") == "exclusive":
+                self.pool._poisoned = True
+            raise
+
+    def _copy_expert_unbudgeted(self, eid, index):
         slot = self._slots[index]
         if self.emulation:
             # Cold reload/copy tests may inject an unfinished event. CPU emulation
@@ -598,7 +661,10 @@ class FixedSlotCache:
             chosen = (existing + missing)[:self.capacity]
             if not chosen:
                 return None
-            lease = self.acquire(chosen, demand=False, protect_ids=protected_experts)
+            try:
+                lease = self.acquire(chosen, demand=False, protect_ids=protected_experts)
+            except ExpertCopyAdmissionError:
+                return None
             try:
                 lease.wait_on(self.copy_stream)
             finally:
@@ -658,14 +724,25 @@ class StageBudgetManager:
     replace pointers already captured by graphs. Build lazy MTP pools eagerly
     before this boundary, or rebuild the stage with a new complete budget.
     """
-    def __init__(self, budget_bytes=None, *, slots_per_pool=None, device="cuda:0", emulation=False):
+    def __init__(self, budget_bytes=None, *, slots_per_pool=None, device="cuda:0", emulation=False,
+                 storage_mode="canonical", host_budget_bytes=None):
         if budget_bytes is None and slots_per_pool is None:
             raise ExpertCacheError("an explicit cache byte budget or slots_per_pool is required")
         if budget_bytes is not None:
             _integer(budget_bytes, "budget_bytes")
         if slots_per_pool is not None:
             _integer(slots_per_pool, "slots_per_pool", positive=True)
+        if storage_mode not in ("canonical", "exclusive") or (storage_mode == "exclusive" and slots_per_pool is None):
+            raise ExpertCacheError("exclusive expert storage requires an explicit fixed slots_per_pool")
+        if host_budget_bytes is not None:
+            _integer(host_budget_bytes, "host_budget_bytes", positive=True)
+        if storage_mode == "exclusive" and host_budget_bytes is None:
+            raise ExpertCacheError("exclusive expert storage needs an explicit host tensor budget")
         self.budget_bytes, self.slots_per_pool = budget_bytes, slots_per_pool
+        self.storage_mode = storage_mode
+        self.host_budget_bytes = host_budget_bytes
+        self.model_identity = None
+        self._host_compute = None
         self.device, self.emulation = device, emulation
         self.pools, self.caches, self._minimums = OrderedDict(), {}, {}
         self.allocated_bytes = 0
@@ -675,6 +752,62 @@ class StageBudgetManager:
     @property
     def host_bytes(self):
         return sum(pool.host_bytes for pool in self.pools.values())
+
+    @property
+    def preallocated_device_bytes(self):
+        return sum(getattr(pool, "hot_bytes", 0) for pool in self.pools.values())
+
+    def new_pool(self, moe, key, *, preserve=False):
+        """Allocate an opt-in cold complement before checkpoint materialization."""
+        if self._allocated or key in self.pools:
+            raise ExpertCacheError("duplicate/frozen expert pool registration")
+        if self.storage_mode == "exclusive":
+            from v4_expert_tiers import ExclusiveExpertPool
+            count = len(moe.experts)
+            size = sum(spec.bytes_per_expert for spec in _bank_specs(list(moe.experts)))
+            if self.slots_per_pool > count:
+                raise ExpertCacheError("exclusive hot capacity exceeds expert count")
+            need = (count - self.slots_per_pool + int(self.slots_per_pool < count)) * size
+            if self.emulation:
+                need += self.slots_per_pool * size
+            used = self.host_bytes + (self.preallocated_device_bytes if self.emulation else 0)
+            if used + need > self.host_budget_bytes:
+                raise ExpertCacheError("exclusive cold/exchange storage exceeds the declared host tensor budget")
+            pool = ExclusiveExpertPool(moe, hot_slots=self.slots_per_pool,
+                device=self.device, identity=key, pin=not self.emulation,
+                emulation=self.emulation, preserve=preserve)
+            if self.model_identity is not None:
+                pool.bind_model_identity(self.model_identity)
+            pool._host_compute = self._host_compute
+            return pool
+        pool = HostExpertPool.from_moe(moe, pin=not self.emulation,
+                                      emulation=self.emulation, preserve=preserve)
+        pool._host_compute = self._host_compute
+        return pool
+
+    def set_host_compute(self, owner):
+        self._host_compute = owner
+        for pool in self.pools.values():
+            pool._host_compute = owner
+
+    def storage_tensors(self):
+        for key, pool in self.pools.items():
+            if hasattr(pool, "storage_tensors"):
+                for label, value in pool.storage_tensors():
+                    yield f"{key}.{label}", value
+            else:
+                for label, value in pool.banks.items():
+                    if value is not None:
+                        yield f"{key}.canonical.{label}", value
+
+    def bind_model_identity(self, value):
+        if self.storage_mode != "exclusive":
+            return
+        if self.model_identity not in (None, value):
+            raise ExpertCacheError("exclusive storage cannot change checkpoint identity in a live Stage")
+        for pool in self.pools.values():
+            pool.bind_model_identity(value)
+        self.model_identity = value
 
     def register(self, pool, key, *, min_slots=1):
         _integer(min_slots, "min_slots", positive=True)
@@ -722,7 +855,11 @@ class StageBudgetManager:
             created = {}
             try:
                 for key, pool in self.pools.items():
-                    created[key] = FixedSlotCache(pool, capacities[key], device=self.device, emulation=self.emulation)
+                    if self.storage_mode == "exclusive":
+                        from v4_expert_tiers import ExclusiveTierCache
+                        created[key] = ExclusiveTierCache(pool, capacities[key], device=self.device, emulation=self.emulation)
+                    else:
+                        created[key] = FixedSlotCache(pool, capacities[key], device=self.device, emulation=self.emulation)
             except BaseException:
                 for cache in created.values():
                     cache.close()
@@ -740,6 +877,8 @@ class StageBudgetManager:
 
     def stats(self):
         return {"mode": "cpu_reference" if self.emulation else "cuda_dma",
+                "storage_mode": self.storage_mode,
+                "host_budget_bytes": self.host_budget_bytes,
                 "budget_bytes": self.budget_bytes, "allocated_bytes": self.allocated_bytes,
                 "host_bytes": self.host_bytes, "registered_pools": len(self.pools),
                 "allocated": self._allocated,

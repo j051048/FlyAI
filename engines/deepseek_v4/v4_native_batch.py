@@ -16,6 +16,7 @@ from v4_native_lanes import NativeLanes
 from v4_batch_invariant import CONTRACT as MATH_CONTRACT, prepare_native_row_math, request_row_math
 
 BATCH_CONTRACT = "v4-native-small-batch-greedy/2"
+PERSISTENT_BATCH_CONTRACT = "v4-native-persistent-ragged-greedy/3"
 
 
 class DeviceNativeLanes(NativeLanes):
@@ -23,7 +24,15 @@ class DeviceNativeLanes(NativeLanes):
 
     def __init__(self, stage, *, max_jobs, host_bytes, device_bytes, ttl_s=300,
                  reference=False, async_depth=2, prefill_quantum=1, clock=time.monotonic,
-                 state_directory=None, disk_bytes=0, graph_mode="off", graph_bytes=0, max_graphs=64):
+                 state_directory=None, disk_bytes=0, graph_mode="off", graph_bytes=0, max_graphs=64,
+                 storage_mode="copy"):
+        if storage_mode not in ("copy", "persistent"):
+            raise ValueError("native batch storage must be copy or persistent")
+        self.storage_mode = storage_mode
+        if storage_mode == "persistent":
+            self.contract = PERSISTENT_BATCH_CONTRACT
+            if graph_mode != "off" or graph_bytes:
+                raise ValueError("persistent ragged batch currently requires graph-off; partial graphs keep their /2 contract")
         if type(max_jobs) is not int or not 2 <= max_jobs <= 4:
             raise ValueError("native batch count must be 2..4")
         if (type(host_bytes) is not int or host_bytes <= 0 or type(device_bytes) is not int
@@ -67,7 +76,11 @@ class DeviceNativeLanes(NativeLanes):
         self.restore_workspace_bytes = 0
         self.hash_workspace_bytes = 2 << 20
         self.per_job_bytes = self.tensor_bytes + self.metadata_bytes
-        self.batch_workspace_bytes = self.tensor_bytes * max_jobs
+        if storage_mode == "persistent":
+            from v4_persistent_batch import journal_bytes
+            self.batch_workspace_bytes = journal_bytes(self.buffers, max_jobs)
+        else:
+            self.batch_workspace_bytes = self.tensor_bytes * max_jobs
         self.device_reserved_bytes = self.tensor_bytes * max_jobs + self.batch_workspace_bytes + graph_bytes
         # On a reference CPU run these are real CPU tensors, but the explicit
         # emulated device quota is still enforced identically before allocation.
@@ -75,10 +88,19 @@ class DeviceNativeLanes(NativeLanes):
                                + (self.device_reserved_bytes if reference else 0))
         if self.device_reserved_bytes > device_bytes or self.reserved_bytes > host_bytes:
             raise ValueError("native batch states/workspace exceed declared device or host reservation")
-        self.workspace = {name: torch.empty((max_jobs, *value.shape[1:]), dtype=value.dtype, device=value.device)
+        if storage_mode == "persistent":
+            from v4_persistent_batch import journal_layout
+            self.workspace = {}
+            self.arena = {name: torch.empty((max_jobs, *value.shape[1:]), dtype=value.dtype, device=value.device)
                           for name, value in self.buffers.items()}
-        self.slots = [{"buffers": {name: torch.empty_like(value[0:1]) for name, value in self.buffers.items()},
-                       "job": None, "cache": None, "pos": 0} for _ in range(max_jobs)]
+            self.slots = [{"buffers": {name: value[index:index + 1] for name, value in self.arena.items()},
+                           "job": None, "cache": None, "pos": 0} for index in range(max_jobs)]
+            self.journal = journal_layout(stage, self.buffers, max_jobs)
+        else:
+            self.workspace = {name: torch.empty((max_jobs, *value.shape[1:]), dtype=value.dtype, device=value.device)
+                              for name, value in self.buffers.items()}
+            self.slots = [{"buffers": {name: torch.empty_like(value[0:1]) for name, value in self.buffers.items()},
+                           "job": None, "cache": None, "pos": 0} for _ in range(max_jobs)]
         self.active, self.owner_epoch, self.current = {}, None, None
         self.model_stamp, self.disk_identity, self.store = None, None, None
         self.last_cache_write_error = None
@@ -86,13 +108,16 @@ class DeviceNativeLanes(NativeLanes):
         self._batch_fault = False
         self.counters = {"batch_forward_calls": 0, "batched_request_rows": 0,
                          "scalar_forward_calls": 0, "state_host_copy_bytes": 0}
+        if storage_mode == "persistent":
+            self.counters.update(state_journal_copy_bytes=0, state_rollback_copy_bytes=0,
+                                 state_full_copy_bytes=0, ragged_forward_calls=0)
         if graph_mode == "partial":
             from v4_native_batch_graph import NativeBatchGraphPool
             self.graph_pool = NativeBatchGraphPool(stage, self.workspace, max_jobs=max_jobs,
                 max_graphs=max_graphs, graph_bytes=graph_bytes, reference=reference)
 
     def config(self):
-        return {"enabled": True, "numerical_contract": self.contract, "max_jobs": self.max_jobs,
+        value = {"enabled": True, "numerical_contract": self.contract, "max_jobs": self.max_jobs,
                 "horizon": self.stage.args.max_seq_len, "per_job_state_bytes": self.per_job_bytes,
                 "reserved_state_bytes": self.per_job_bytes * self.max_jobs + self.batch_workspace_bytes + self.hash_workspace_bytes
                     + self.graph_bytes + self.graph_host_bytes,
@@ -109,6 +134,13 @@ class DeviceNativeLanes(NativeLanes):
                     "host_metadata_bytes": self.graph_host_bytes, "max_graphs": self.max_graphs if self.graph_pool else 0,
                     "coverage": "attention_dense_partial" if self.graph_pool else "off",
                     "selection": "native_exact_width_topk"}}
+        if self.storage_mode == "persistent":
+            value["compute"] = "native_persistent_ragged_batch"
+            value["persistent_policy"] = {"schema": "v4-persistent-request-slots/1",
+                "positions": "per_request", "attention": "batched_projections_native_row_reads",
+                "state": "direct_slot_views", "transaction": "bounded_native_write_set",
+                "journal_bytes": self.batch_workspace_bytes, "full_state_copy_per_step": False}
+        return value
 
     def graph_status(self):
         return self.graph_pool.status() if self.graph_pool is not None else {"enabled": False,
@@ -127,6 +159,8 @@ class DeviceNativeLanes(NativeLanes):
         yield from super().tensors()
         for name, value in self.workspace.items():
             yield f"batch_workspace.{name}", value
+        for name, value in getattr(self, "journal", {}).items():
+            yield f"batch_journal.{name}", value
         if self.graph_pool is not None:
             yield from self.graph_pool.tensors()
 
@@ -139,6 +173,8 @@ class DeviceNativeLanes(NativeLanes):
 
     def activate(self, job, pos):
         self._check()
+        if self.storage_mode == "persistent":
+            raise ValueError("persistent native execution requires authenticated batch_step, including single rows")
         slot = self.active.get(job)
         if slot is None or type(pos) is not int or pos != slot["pos"] or pos >= self.stage.args.max_seq_len:
             raise ValueError("native frame does not match its live lane frontier")
@@ -202,6 +238,9 @@ class DeviceNativeLanes(NativeLanes):
         Canonical states commit only after the complete local forward succeeds.
         A failing workspace is discarded, preserving every admitted frontier.
         """
+        if self.storage_mode == "persistent":
+            from v4_persistent_batch import forward
+            return forward(self, jobs, h, ids, pos, capture_graph=capture_graph)
         self._check()
         if (not isinstance(jobs, (list, tuple)) or not 1 <= len(jobs) <= self.max_jobs
                 or len(set(jobs)) != len(jobs) or type(pos) is not int

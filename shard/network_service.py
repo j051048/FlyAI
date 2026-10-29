@@ -146,7 +146,9 @@ class OpenNetworkService:
             raise ControlError("shard-open-network/1 configuration required")
         self.key = load_sidecar_key(self.local(self.config["controller_sidecar_key"]))
         self.registry = registry or OfferRegistry(self.local(self.config["registry_db"]))
-        self.pool = pool or RingPool()
+        self.pool = pool or RingPool(routing_policy=self.config.get("production_routing"))
+        if pool is not None and self.config.get("production_routing") is not None:
+            self.pool.configure_routing(self.config["production_routing"])
         self.quality = None
         quality = self.config.get("quality_policy")
         if quality is not None:

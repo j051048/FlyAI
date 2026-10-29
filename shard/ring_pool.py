@@ -73,7 +73,7 @@ class RingBinding:
 
 
 class RingPool:
-    def __init__(self, *, max_rings=256, max_history=256):
+    def __init__(self, *, max_rings=256, max_history=256, routing_policy=None):
         if any(type(value) is not int or value < 1 for value in (max_rings, max_history)):
             raise ValueError("ring capacity and history must be positive integers")
         self._lock = threading.RLock()
@@ -84,6 +84,17 @@ class RingPool:
         self.max_history = max_history
         self._reconciliation = {}
         self._admission_holds = set()
+        from .routing_cost import production_policy
+        self.routing_policy = production_policy(routing_policy)
+        self._production_admissions = 0
+
+    def configure_routing(self, policy):
+        from .routing_cost import production_policy
+        value = production_policy(policy)
+        with self._lock:
+            if self._rings:
+                raise ValueError("routing policy must be fixed before rings are registered")
+            self.routing_policy = value
 
     def hold_admission(self, ring_id):
         """Quarantine a locally planned replacement before registration/warmup."""
@@ -128,7 +139,7 @@ class RingPool:
                 raise ValueError("one backend connection owner cannot belong to multiple rings")
             ring = Ring(ring_id, backend, model_id, cohort_id, ids, region, on_stopped=on_stopped)
             from .routing_cost import RoutingCosts
-            ring.routing_costs = RoutingCosts()
+            ring.routing_costs = RoutingCosts(production=self.routing_policy)
             ring.admission_held = ring_id in self._admission_holds
             self._admission_holds.discard(ring_id)
             self._rings[ring_id] = ring
@@ -456,11 +467,27 @@ class RingPool:
             candidates = local or candidates
             ring = min(candidates, key=lambda r: (r.reserved_seconds + costs[r.ring_id]["service_s"],
                 r.ring_id != preferred_ring_id, r.bound_jobs, r.ring_id))
+            probe = False
+            if self.routing_policy is not None:
+                self._production_admissions += 1
+                if self._production_admissions % self.routing_policy["explore_every"] == 0:
+                    ceiling = ring.reserved_seconds + costs[ring.ring_id]["service_s"] + self.routing_policy["max_probe_extra_s"]
+                    from .routing_cost import runtime_identity
+                    exploratory = [r for r in candidates if r is not ring
+                        and costs[r.ring_id]["fresh_samples"] < self.routing_policy["min_samples"]
+                        and runtime_identity(r.backend, cohort_id) is not None
+                        and r.reserved_seconds + costs[r.ring_id]["service_s"] <= ceiling]
+                    if exploratory:
+                        ring = min(exploratory, key=lambda r: (costs[r.ring_id]["fresh_samples"], r.bound_jobs, r.ring_id))
+                        probe = True
             cost = costs[ring.ring_id]
             decision = {**cost, "queue_s": ring.reserved_seconds,
                         "expected_completion_s": ring.reserved_seconds + cost["service_s"],
                         "region_policy": "local_first" if local else "available_fallback",
                         "affinity": "tie_break_only", "candidates": len(candidates)}
+            if self.routing_policy is not None:
+                decision["production_probe"] = probe
+                decision["probe_scope"] = "new_request_ready_same_cohort_locality_preserved"
             ring.bound_jobs += 1
             ring.reserved_seconds += cost["service_s"]
             return RingBinding(ring, cost["service_s"], admission=decision)
@@ -584,7 +611,7 @@ class RingPool:
                             token_count=len(offsets), first_s=offsets[0], last_s=offsets[-1],
                             elapsed_s=time.perf_counter() - started,
                             identity=runtime_identity(ring.backend, ring.cohort_id),
-                            cache_hit=scope == "fresh_suffix_with_signed_prefix_restore")
+                            cache_hit=scope == "fresh_suffix_with_signed_prefix_restore", max_new_tokens=job.max_new)
             result["route"] = {"ring_id": ring.ring_id, "model_id": ring.model_id,
                                "cohort_id": ring.cohort_id, "region": ring.region,
                                "admission": binding.admission}

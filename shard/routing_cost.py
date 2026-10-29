@@ -36,8 +36,26 @@ def runtime_identity(backend, cohort):
         return None
 
 
+def production_policy(value):
+    """Local operator opt-in; never accepted from contributor offers."""
+    if value is None:
+        return None
+    fields = {"enabled", "context_bucket_tokens", "output_bucket_tokens", "min_samples",
+              "uncertainty_fraction", "explore_every", "max_probe_extra_s"}
+    if not isinstance(value, dict) or set(value) != fields or value.get("enabled") is not True:
+        raise ValueError("complete production routing policy required")
+    for key, low, high in (("context_bucket_tokens", 16, 4096), ("output_bucket_tokens", 1, 512),
+                          ("min_samples", 3, 64), ("explore_every", 10, 10000)):
+        if type(value[key]) is not int or not low <= value[key] <= high:
+            raise ValueError("bounded production routing policy required")
+    if (not _number(value["uncertainty_fraction"], positive=True) or not .05 <= value["uncertainty_fraction"] <= 2
+            or not _number(value["max_probe_extra_s"]) or value["max_probe_extra_s"] > 10):
+        raise ValueError("bounded routing uncertainty and probe cost required")
+    return dict(value)
+
+
 class RoutingCosts:
-    def __init__(self, *, ttl_s=120.0, max_shapes=64, samples_per_shape=8, clock=time.time):
+    def __init__(self, *, ttl_s=120.0, max_shapes=64, samples_per_shape=8, clock=time.time, production=None):
         if (not _number(ttl_s, positive=True) or type(max_shapes) is not int or not 1 <= max_shapes <= 1024
                 or type(samples_per_shape) is not int or not 1 <= samples_per_shape <= 64):
             raise ValueError("finite bounded routing observation policy required")
@@ -45,6 +63,19 @@ class RoutingCosts:
         self._samples = OrderedDict()
         self._traffic = deque(maxlen=256)
         self._lock = threading.RLock()
+        self.production = production_policy(production)
+        if self.production is not None:
+            self.samples_per_shape = max(self.samples_per_shape, self.production["min_samples"])
+        self._bucket_samples = OrderedDict()
+
+    def _bucket(self, payload, count, maximum, identity):
+        if self.production is None or identity is None:
+            return None
+        if type(maximum) is not int or maximum <= 0:
+            return None
+        base = self.shape(payload, count, identity)[1:]
+        return (count // self.production["context_bucket_tokens"],
+                maximum // self.production["output_bucket_tokens"], *base)
 
     def note_completion(self, payload, prompt_tokens, max_new_tokens):
         ids = payload.get("prompt_ids")
@@ -75,7 +106,7 @@ class RoutingCosts:
                 payload.get("numerical_contract"), None if identity is None else identity["runtime_config_sha256"])
 
     def observe(self, *, payload, prompt_tokens, token_count, first_s, last_s,
-                elapsed_s, identity, cache_hit=False):
+                elapsed_s, identity, cache_hit=False, max_new_tokens=None):
         if (type(prompt_tokens) is not int or prompt_tokens <= 0 or type(token_count) is not int
                 or token_count < 2 or any(not _number(x) for x in (first_s, last_s, elapsed_s))
                 or not 0 < first_s < last_s <= elapsed_s or cache_hit):
@@ -91,6 +122,14 @@ class RoutingCosts:
             self._samples.move_to_end(key)
             while len(self._samples) > self.max_shapes:
                 self._samples.popitem(last=False)
+            bucket = self._bucket(payload, prompt_tokens, max_new_tokens, identity)
+            if bucket is not None:
+                values = self._bucket_samples.setdefault(bucket, [])
+                values.append({**row, "prompt_tokens": prompt_tokens})
+                del values[:-self.samples_per_shape]
+                self._bucket_samples.move_to_end(bucket)
+                while len(self._bucket_samples) > self.max_shapes:
+                    self._bucket_samples.popitem(last=False)
         return True
 
     def estimate(self, backend, *, cohort, payload, prompt_tokens, max_new_tokens,
@@ -100,6 +139,27 @@ class RoutingCosts:
         with self._lock:
             rows = [r for r in self._samples.get(self.shape(payload, prompt_tokens, identity), [])
                     if 0 <= now - r["measured_at"] <= self.ttl_s]
+            bucket = self._bucket(payload, prompt_tokens, max_new_tokens, identity)
+            grouped = [r for r in self._bucket_samples.get(bucket, [])
+                       if 0 <= now-r["measured_at"] <= self.ttl_s] if bucket is not None else []
+        if not rows and self.production is not None and len(grouped) >= self.production["min_samples"]:
+            # A bucket is a bounded forecast, not a numerical qualification.
+            # Limit extrapolation and price the worst observed phase with an
+            # explicit safety allowance; no prompt hash or tenant text is kept.
+            minimum = min(r["prompt_tokens"] for r in grouped)
+            maximum = max(r["prompt_tokens"] for r in grouped)
+            ratio = prompt_tokens / minimum
+            if minimum*.8 <= prompt_tokens <= maximum*1.25:
+                margin = 1 + self.production["uncertainty_fraction"]
+                prefill = max(r["prefill_s"] for r in grouped) * max(1., ratio**2) * margin
+                decode = max(r["decode_token_s"] for r in grouped) * max(0, max_new_tokens-1) * margin
+                completion = max(r["completion_s"] for r in grouped) * margin
+                return {"service_s": prefill+decode+completion, "source": "bounded_local_shape_forecast",
+                    "fresh_samples": len(grouped), "prefill_s": prefill, "decode_s": decode,
+                    "completion_s": completion, "cache_saved_s": 0., "restore_s": None,
+                    "runtime_identity": identity, "measured_at": max(r["measured_at"] for r in grouped),
+                    "context_range": [minimum, maximum], "ttl_s": self.ttl_s,
+                    "uncertainty": ["bucket_forecast_not_exact_workload", "worst_phase_with_safety_allowance"]}
         if not rows:
             return {"service_s": (prompt_tokens + max_new_tokens) * fallback_s_per_token,
                     "source": "warmup_or_service_scalar_fallback", "fresh_samples": 0,

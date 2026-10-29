@@ -126,7 +126,9 @@ def test_engine_modules_accounts_for_every_v4_module_on_disk():
                   "v4_benchmark.py", "v4_acceptance.py", "v4_soak.py", "v4_release.py",
                   "v4_stream_prepare.py", "v4_deploy.py", "v4_link_probe.py",
                       "v4_profile_report.py", "v4_ring_economics.py", "v4_round_calibration.py",
-                      "v4_local_transport_bench.py", "v4_numeric_diagnose.py", "v4_kernel_capability.py"}
+                      "v4_local_transport_bench.py", "v4_numeric_diagnose.py", "v4_kernel_capability.py",
+                      "v4_role_calibration.py", "v4_draft_training.py", "v4_draft_chain_probe.py",
+                      "v4_host_transport_probe.py", "v4_incremental_qualification.py", "v4_incremental_case_probe.py"}
     unclassified = on_disk - set(VL.ENGINE_MODULES) - bench_only
     assert not unclassified, (
         f"{sorted(unclassified)} is neither in v4_levers.ENGINE_MODULES (scraped for levers, and the "

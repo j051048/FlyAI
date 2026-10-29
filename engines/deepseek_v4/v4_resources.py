@@ -425,11 +425,13 @@ def runtime_config_payload(stage):
             "expert_cache_bytes": getattr(stage, "_expert_cache_bytes", 0),
             "expert_cache_reserve_bytes": getattr(stage, "_expert_cache_reserve_bytes", 0),
             "kv_placement": getattr(stage, "_kv_placement", "gpu"),
+            "kv_indexed_gather": getattr(stage, "_kv_indexed_gather", False),
             "kv_reference": getattr(stage, "_kv_reference", False),
             "kv_gpu_budget_bytes": getattr(stage, "_kv_gpu_budget_bytes", 0),
             "kv_host_budget_bytes": getattr(stage, "_kv_host_budget_bytes", 0),
             "prefill_query_chunk_tokens": getattr(stage, "_prefill_query_chunk", 0),
-            "environment": {key: value for key, value in sorted(os.environ.items()) if key.startswith("V4_")}}
+            "environment": {key: value for key, value in sorted(os.environ.items()) if key.startswith("V4_")
+                and key not in {"V4_HOST_TRANSPORT_CONFIG", "V4_HOST_COMPUTE_CONFIG", "V4_DRAFT_ADAPTER_DIR"}}}
     import sys
     torch_module = sys.modules.get("torch")
     body["runtime_versions"] = {"torch": str(getattr(torch_module, "__version__", "unknown")),
@@ -447,6 +449,8 @@ def runtime_config_payload(stage):
     tail = getattr(drafter, "tail", drafter)
     body["dspark_loaded"] = tail is not None
     body["dspark_block_size"] = getattr(tail, "block_size", None)
+    from v4_dual_runtime import config as local_execution_config
+    body["local_execution"] = local_execution_config(stage)
     # A calibration cannot silently survive an engine implementation change.
     directory = Path(__file__).resolve().parent
     body["engine_source_sha256"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -489,8 +493,14 @@ def placement_requirements_for_stage(stage, calibration=None, checkpoint_dir=Non
         raise ResourceError("DSpark placement needs the actually loaded drafter; main-stage storage is insufficient")
     if report["allocator"]["allocated_bytes"] is None or report["allocator"]["reserved_bytes"] is None:
         raise ResourceError("actual CUDA allocator evidence is unavailable")
+    local_reserve = report.get("local_execution_reservation", {})
+    kv_scratch = report.get("kv_scratch_reservation")
+    if kv_scratch is None:
+        if getattr(stage, "_kv_indexed_gather", False):
+            raise ResourceError("indexed KV needs explicit transient gather reservation evidence")
+        kv_scratch = {}
     observed = max(report["module_storage"]["gpu_bytes"], report["allocator"]["allocated_bytes"],
-                   report["allocator"]["reserved_bytes"])
+                   report["allocator"]["reserved_bytes"]) + local_reserve.get("driver_device_allocated_bytes", 0)
     if requirements.gpu.peak_bytes < observed:
         raise ResourceError("calibration budget is below actual GPU module/process allocator storage")
     cache = report.get("conversation_cache_reservation")
@@ -505,12 +515,12 @@ def placement_requirements_for_stage(stage, calibration=None, checkpoint_dir=Non
     native_remaining = (native or {}).get("remaining_host_reserved_bytes", 0)
     from v4_execution_profiles import transport_buffer_reservation
     buffers = transport_buffer_reservation()
-    if requirements.host.peak_bytes < report["module_storage"]["host_bytes"] + cache["remaining_host_reserved_bytes"] + native_remaining + buffers["host_reserved_bytes"]:
+    if requirements.host.peak_bytes < report["module_storage"]["host_bytes"] + cache["remaining_host_reserved_bytes"] + native_remaining + buffers["host_reserved_bytes"] + local_reserve.get("remaining_host_reserved_bytes", 0) + kv_scratch.get("remaining_host_reserved_bytes", 0):
         raise ResourceError("calibration budget is below actual host tensor storage")
     graph_remaining = (native or {}).get("remaining_device_reserved_bytes", 0)
-    if requirements.gpu.peak_bytes < observed + cache["restore_gpu_reserved_bytes"] + graph_remaining:
+    if requirements.gpu.peak_bytes < observed + cache["restore_gpu_reserved_bytes"] + graph_remaining + local_reserve.get("remaining_device_reserved_bytes", 0) + kv_scratch.get("remaining_device_reserved_bytes", 0):
         raise ResourceError("calibration GPU budget omits the declared conversation restore reserve")
-    if requirements.host.pinned_bytes < report["module_storage"]["host_pinned_bytes"] + buffers["pinned_reserved_bytes"]:
+    if requirements.host.pinned_bytes < report["module_storage"]["host_pinned_bytes"] + buffers["pinned_reserved_bytes"] + kv_scratch.get("pinned_reserved_bytes", 0):
         raise ResourceError("calibration budget is below actual pinned host tensor storage")
     return requirements
 
@@ -565,6 +575,8 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
     if kv_runtime is not None:
         for name, tensor in kv_runtime.tensors():
             record(f"kv_runtime.{name}", tensor, "kv")
+    kv_scratch = kv_runtime.scratch_reservation() if kv_runtime is not None else {
+        "remaining_host_reserved_bytes": 0, "remaining_device_reserved_bytes": 0, "pinned_reserved_bytes": 0}
     for name, module, _ in modules:
         for buffer_name, tensor in module.named_buffers():
             record(f"{name}.{buffer_name}", tensor, "state")
@@ -606,6 +618,10 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
     if conversation is not None:
         for name, tensor in conversation.snapshot_tensors():
             record(f"conversation_cache.{name}", tensor, "conversation_cache")
+    from v4_dual_runtime import tensors as local_tensors, reservation as local_reservation
+    for name, tensor in local_tensors(stage, draft):
+        record(name, tensor, "local_execution")
+    local_reserve = local_reservation(stage, draft)
     gpu_bytes = sum(entry["storage_bytes"] for entry in entries if entry["device"].startswith("cuda"))
     host_bytes = sum(entry["storage_bytes"] for entry in entries if entry["device"] == "cpu")
     # Tensor inventory already includes the preallocated slots. Account for the
@@ -668,6 +684,8 @@ def measure_stage_resources(stage, draft=None, *, checkpoint_id, peak_interval_s
                                "by_kind": totals, "storages": entries},
             "conversation_cache_reservation": conversation_reserve,
             "transport_buffer_reservation": socket_reservation,
+            "local_execution_reservation": local_reserve,
+            "kv_scratch_reservation": kv_scratch,
             "native_lane_reservation": {"host_reserved_bytes": lanes.reserved_bytes if lanes else 0,
                                         "device_reserved_bytes": getattr(lanes, "device_reserved_bytes", 0),
                                         "remaining_device_reserved_bytes": graph_remaining,

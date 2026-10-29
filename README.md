@@ -4,7 +4,7 @@
 
 ## 当前版本（中文）
 
-文档核对日期：**2026-10-21**；当前版本新增设备驻留小批执行、原始时间线、校准置信预算、精确缓存与质量工具。本轮修正B4 CPU数值偏差，新增独立partial批图分桶，默认关闭且GPU资格待验。配置与真机门槛见 [本轮改造](docs/V4_DEEPINFER_IMPROVEMENTS.md)。
+文档核对日期：**2026-10-29**。本轮补全全环成本反馈、实际字节设备摘要、生产形状选环、持久异长批量状态、RAM 专家分段图和资格门控的增量前缀／精确 KV gather。新路径默认关闭，原模型 GPU、性能与稳定性仍待按[六项验收步骤](docs/V4_SIX_ACCEPTANCE.md)验证。前轮角色成本、本机激活、专家冷补集、MTP 图和训练工具见[已有六项合同](docs/V4_DUALGPU_IMPROVEMENTS.md)；原 B4、whole 回滚与独立 partial 批图门槛保留。
 FlyAI 基于 Shard 的分布式推理框架演进。上游项目为 [leyten/shard](https://github.com/leyten/shard)，
 其 c0mpute 集成背景和历史实验保留在仓库记录中。
 
@@ -23,8 +23,9 @@ GPU 身份、共享 RAM／锁页预算和实际链路决定放置。节点注册
 | GPT-OSS 服务 | 原 `specpipe` 运行时接入签名会话、认证 HTTP/SSE、租户队列和多环 | 当前生产适配器为 greedy text chat；单环一个串行 worker |
 | V4 服务 | DSpark、可选本地专家 RAM／GPU 缓存、受控预取、KV 工作区、查询分块预填充 | 每项优化有数值／资源门控；新增路径 GPU 速度线待验收 |
 | V4 权重准备 | 有界 HF 流式转换、按层/角色分发、局部分片完整哈希、磁盘/RAM 准备租约和原子发布 | 配置准备源后自动执行；只支持已声明的原 V4-Flash native ABI，真实集群仍须验收 |
-| V4 状态优化 | 请求边界选择校准投机配方、签名全环恢复、保序专家预填充 DMA 流水 | 默认关闭；完全相同前缀可复用，扩展前缀每请求完整参考预填充验证；GPU 收益待实测 |
+| V4 状态优化 | 请求边界选择校准投机配方、签名全环恢复、保序专家预填充 DMA 流水 | 默认关闭；精确重复可复用，扩展前缀须完整原生资格和首轮/周期 canary；GPU 收益待实测 |
 | V4 多卡执行 | 显式共享配方、实际图覆盖、数值/回滚诊断、原生内核探针、strict 宿主分组与有界接收缓冲 | 保留逐 GPU 身份和共享预算；四策略及故障矩阵已接入，GPU/速度资格待验，见 [多卡指南](docs/V4_MULTIGPU_EXECUTION.md) |
+| V4 本机执行与草稿 | 角色成本、可信 CUDA IPC／共享内存路径、可选专家热冷补集、完整 committed-MTP 图、宿主预算与离线 draft 残差训练 | 默认关闭；收据仍哈希实际字节，target verifier 不变，真实 packed 模型与组合性能待验，见[本轮边界](docs/V4_DUALGPU_IMPROVEMENTS.md) |
 | 5090 真机验收 | whole/eager 回滚状态、同机多卡、四模式短/长矩阵、持续 soak、原始证据归档 | [OpenClaw 操作步骤和验收入口](docs/V4_5090_ACCEPTANCE.md)；本地回归通过，真机资格待验 |
 | 多环与恢复 | 多环并行、私有 SQLite 日志/owner fencing、原请求重放、SSE 游标、aging 与成本路由 | 原scalar lanes保留；独立`/2` greedy批合同、逐请求固定算形与可选partial图，非融合GEMM；GPU/FP4收益待验，无分布式HA |
 | 回放质量 | 本机固定验证者的鲜活签名复算报告、按节点/cohort 限制新组环 | 不接受节点自报质量分，也不是硬件 attestation 或模型密码学证明 |
@@ -40,7 +41,7 @@ CI 报告复核后的部署／资源补充回归为 **218 通过、1 项 POSIX �
 尚未把本机结果登记为 GitHub Python 3.12 全仓 CI 或真实 GPU 性能验收。
 上一构建的 1839 项及后续 137 项重叠回归保留在历史状态记录中。
 该构建另有两项 CUDA 缓存／图指针用例因本机条件跳过。这些是旧构建记录，不是本轮整体结果或 GPU 验收。
-P0–P2 的相关组合回归已完成；真实 MXFP4 GPU 执行及 V4 四卡／六卡速度与持续运行仍需按新发布门槛实测。本轮按用户安排暂缓硬件验证。
+此前 P0–P2 的相关组合回归已完成；最新六项组合回归结果另行登记，历史数字不累加。真实 MXFP4 GPU 执行及 V4 四卡／六卡速度与持续运行仍需按新发布门槛实测。本轮按用户安排暂缓硬件验证。
 
 ### 使用当前入口
 
@@ -54,6 +55,8 @@ P0–P2 的相关组合回归已完成；真实 MXFP4 GPU 执行及 V4 四卡／
 * 小磁盘节点、流式分片与请求边界换环：[WEIGHT_PREPARATION](docs/WEIGHT_PREPARATION.md)。
 * V4 固定速度线与原始证据：[V4_BENCHMARK](docs/V4_BENCHMARK.md)。
 * B4数值修正、独立partial批图与scalar/eager/graph真机对照：[V4_BATCH_GRAPH_ACCEPTANCE](docs/V4_BATCH_GRAPH_ACCEPTANCE.md)。
+* 本机 CUDA IPC、专家冷补集、完整 MTP 图与离线草稿训练：[六项合同](docs/V4_DUALGPU_IMPROVEMENTS.md)、[独立验收步骤](docs/V4_DUALGPU_ACCEPTANCE.md)。
+* 全环成本、设备摘要、生产选环、持久异长批执行、专家分段图和增量 KV：[本轮六项原模型验收](docs/V4_SIX_ACCEPTANCE.md)。
 * 全部当前规范、研究与历史记录：[DOCUMENTATION_INDEX](docs/DOCUMENTATION_INDEX.md)。
 
 完整仓库中的生产服务入口是：
@@ -105,7 +108,7 @@ V4 新增路径继续以 **4×5090 ≥40、6×5090 ≥30 valid output tok/s**、
 
 ## Current version (English)
 
-Documentation reviewed **2026-10-11**. The working tree adds restored-prefix evidence checks, optional durable jobs, SLO/risk planning and shortest-request scheduling with aging. See [service hardening](docs/V4_SERVICE_HARDENING.md).
+Documentation reviewed **2026-10-29**. The latest default-off work connects all-stage round costs, actual-byte device hashing, production-shaped ring selection, persistent ragged request state, RAM-expert CUDA segments and qualified incremental-prefix/indexed-KV reuse. Native checkpoint, CUDA performance and long-running qualification remain pending; see [six-part acceptance](docs/V4_SIX_ACCEPTANCE.md). The preceding local-execution/draft work is described [here](docs/V4_DUALGPU_IMPROVEMENTS.md). Existing whole rollback, four decode modes and the separate batch contracts retain their gates.
 FlyAI evolves the Shard inference framework. The [upstream repository](https://github.com/leyten/shard),
 c0mpute integration history and dated experiments remain attributed in the documentation.
 
@@ -153,7 +156,7 @@ model content identities, calibrated local stage templates and configured infere
 legacy CLI modes retain older experiments. Public control/HTTP listeners require TLS, while existing
 sidecars own peer transport and NAT handling.
 
-The selected current CPU/socket/HTTP regression passed **1813 tests with 8 environment-dependent skips**; 66 GPU-marked tests were deselected. The subsequent deployment/resource regression passed **218 tests with one POSIX case skipped on Windows**; the process-lifecycle suite passed **51 tests on WSL Ubuntu 22.04**. Overlapping results are not additive and do not claim a complete GitHub Python 3.12 CI or GPU performance pass.
+The current selected regression spans **160 test files: 2548 passed, 11 skipped, 117 GPU deselected**, with stable source/test/tool hashes and one inherited Windows ACL subprocess encoding warning. The historical CPU/socket/HTTP regression passed **1813 tests with 8 environment-dependent skips**; 66 GPU-marked tests were deselected. The subsequent deployment/resource regression passed **218 tests with one POSIX case skipped on Windows**; the process-lifecycle suite passed **51 tests on WSL Ubuntu 22.04**. Overlapping results are not additive and do not claim a complete GitHub Python 3.12 CI or GPU performance pass.
 Two additional CUDA cache/graph-pointer gates were conditionally skipped on that CPU-only runtime.
 These are earlier-build records, not the current hardening regression total or GPU acceptance. Historical GPU numbers above retain their original workload,
 recipe and timing scope. Actual native MXFP4 GPU execution and new V4 four-card >=40 / six-card >=30 tok/s

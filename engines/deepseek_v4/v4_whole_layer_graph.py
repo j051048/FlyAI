@@ -635,6 +635,10 @@ def _layer_state(L):
     return bufs
 
 
+class UnsafeCaptureState(Exception):
+    """A failed capture could not restore live KV; the Stage must be rebuilt."""
+
+
 class WholeBlockGraphs:
     """One decode Block captured as CUDA graph(s): the whole layer (attn + islands + MoE) per replay.
 
@@ -843,6 +847,28 @@ class WholeBlockGraphs:
         self.moe_mode = "eager" if self.moe_mode == "graph" else self.moe_mode
 
     def _capture(self, key, ids=None):
+        # The eager-MoE split also executes real attention in its shape probe.
+        # Preserve the state on EVERY exception, including a failed expert warmup
+        # after the pre graph has already advanced KV. Falling back on mutated KV
+        # would execute this model position twice.
+        originals = list(_layer_state(self.L))
+        saved = [value.clone() for value in originals]
+        try:
+            return self._capture_unchecked(key, ids)
+        except BaseException:
+            try:
+                if torch.device(self.dev).type == "cuda":
+                    torch.cuda.synchronize(self.dev)
+                for target, source in zip(originals, saved):
+                    target.copy_(source)
+                if torch.device(self.dev).type == "cuda":
+                    torch.cuda.synchronize(self.dev)
+            except BaseException as error:
+                self.unsafe_capture_state = True
+                raise UnsafeCaptureState("whole graph capture failed to restore KV; restart Stage") from error
+            raise
+
+    def _capture_unchecked(self, key, ids=None):
         """Capture the graph(s) for one (bucket, compress) key. moe_eager captures g_pre (+ g_post once)."""
         self._check_aliases()
         bucket, compress = key

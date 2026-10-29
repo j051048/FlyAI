@@ -59,8 +59,59 @@ def _known_environment_names():
     return frozenset(names)
 
 
+PRIVATE_CONFIG_PATHS = frozenset({"V4_HOST_TRANSPORT_CONFIG", "V4_HOST_COMPUTE_CONFIG", "V4_DRAFT_ADAPTER_DIR"})
+
+
+def public_environment_names():
+    """The same publishable registry projection as runtime observations.
+
+    Private worker configuration is bound by runtime_config_sha256 and its
+    content identities; local paths never belong in the public recipe.
+    """
+    return frozenset(key for key in _known_environment_names()
+        if key not in PRIVATE_CONFIG_PATHS and key not in {"V4_DIR", "V4_DEV"}
+        and not any(part in key for part in ("SECRET", "PASSWORD", "KEY_FILE", "TOKEN_FILE")))
+
+
+@lru_cache(maxsize=1)
+def _public_literal_default_items():
+    # Parse known literal defaults without importing Torch/model modules. An
+    # unbound dynamic setting still needs an explicit operator override.
+    names, defaults = public_environment_names(), {}
+    for path in sorted(Path(__file__).resolve().parent.glob("v4_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute)
+                    or node.func.attr != "get" or not isinstance(node.func.value, ast.Attribute)
+                    or node.func.value.attr != "environ" or len(node.args) < 2
+                    or not isinstance(node.args[0], ast.Constant)
+                    or not isinstance(node.args[1], ast.Constant)):
+                continue
+            key, value = node.args[0].value, node.args[1].value
+            if key in names and isinstance(value, (str, int, float)):
+                defaults.setdefault(key, str(value))
+    return tuple(sorted(defaults.items()))
+
+
+def public_literal_defaults():
+    return dict(_public_literal_default_items())
+
+
+def public_environment_overrides(environment=None):
+    """Validate public recipe input without restricting worker-local profiles."""
+    environment = dict(environment or {})
+    if any(not isinstance(k, str) or not isinstance(v, str) or "\x00" in k + v
+           for k, v in environment.items()):
+        raise ValueError("public environment requires string keys/values")
+    if any(environment.get(key) for key in PRIVATE_CONFIG_PATHS):
+        raise ValueError("private worker configuration paths cannot enter the public recipe; "
+                         "use worker-local launch configuration and pin its measured runtime_config_sha256")
+    return {key: value for key, value in environment.items() if key not in PRIVATE_CONFIG_PATHS}
+
+
 def baseline_environment():
-    return dict(BASELINE_ENV)
+    # Explicit historical recipe values win over generic literal defaults.
+    return {**public_literal_defaults(), **BASELINE_ENV}
 
 
 def resolve_profile(name, overrides=None):
@@ -75,7 +126,7 @@ def resolve_profile(name, overrides=None):
     unknown = sorted(k for k in overrides if k.startswith("V4_") and k not in _known_environment_names())
     if unknown:
         raise ValueError("unrecognized profile environment names: " + ", ".join(unknown))
-    selected = {**BASELINE_ENV, **_PROFILES[name]}
+    selected = {**baseline_environment(), **_PROFILES[name]}
     protected = {"V4_REF_SLIM", "V4_REF_SLIM_NOQAT", "V4_FAST_VERIFY", "V4_FP8_WIRE",
         "V4_CUDA_GRAPH", "V4_MOE_IN_GRAPH", "V4_MOE_GROUPED", "V4_EXPERT_PLACEMENT", "V4_DSPARK_MOE"}
     for key in protected:
