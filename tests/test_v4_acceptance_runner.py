@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -112,6 +113,32 @@ def test_public_log_is_copied_only_after_owned_cleanup(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "write_bytes", write_bytes)
     owner.command("order", [sys.executable, "-c", "print('done')"], 15)
     assert_clean(owner, "order")
+
+
+def test_unrelated_unreadable_process_is_reported_not_charged_to_the_launch(tmp_path, monkeypatch):
+    """A same-user stranger that denies environ proves nothing about this launch.
+
+    Shared runners keep such processes (elevated or setuid'd daemons under the
+    same username). Charging them to the launch leaves a reservation that no
+    later stop or recover can clear, which is a worse failure than the leak it
+    was guarding against: report them, release the slot, keep the evidence.
+    """
+    import psutil
+    decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    real_environ = psutil.Process.environ
+    def environ(process):
+        if process.pid == decoy.pid:
+            raise psutil.AccessDenied(decoy.pid)
+        return real_environ(process)
+    try:
+        monkeypatch.setattr(psutil.Process, "environ", environ)
+        owner = runner(tmp_path)
+        owner.command("opaque", [sys.executable, "-c", "pass"], 15)
+        assert decoy.pid in owner.records[-1]["cleanup_unverified_pids"]
+        assert_clean(owner, "opaque")
+    finally:
+        decoy.kill()
+        decoy.wait()
 
 
 def test_timeout_preserves_launch_token_and_cleans_real_descendants(tmp_path):

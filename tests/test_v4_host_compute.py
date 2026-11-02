@@ -45,6 +45,7 @@ def test_failed_completion_stays_charged_until_explicit_owned_process_cleanup(tm
 
 
 def test_default_off_and_configured_stage_reuses_one_owner(tmp_path,monkeypatch):
+    import torch
     st=SimpleNamespace(device="cpu")
     monkeypatch.delenv("V4_HOST_COMPUTE_CONFIG",raising=False)
     assert configure(st) is None
@@ -52,7 +53,14 @@ def test_default_off_and_configured_stage_reuses_one_owner(tmp_path,monkeypatch)
     monkeypatch.setenv("V4_HOST_COMPUTE_CONFIG",str(cfg))
     first=configure(st)
     assert configure(st) is first
-    with first.compute(): assert first.budget.status()["active_workers"]==1
+    # Declared workers are charged as a whole team: the owning process must have
+    # been configured for them before serving, exactly as a launched worker is.
+    # This test is the operator, so it pins the intra-op pool it declares.
+    previous=torch.get_num_threads(); torch.set_num_threads(1)
+    try:
+        with first.compute(): assert first.budget.status()["active_workers"]==1
+    finally:
+        torch.set_num_threads(previous)
     first.close()
     with pytest.raises(HostBudgetError,match="closed"):
         with first.compute(): pass

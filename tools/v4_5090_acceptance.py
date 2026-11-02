@@ -165,7 +165,7 @@ class Runner:
         write(request, payload)
         record = {"name": name, "started_utc": datetime.now(timezone.utc).isoformat(),
                   "timeout_s": timeout, "request_nonce": nonce, "request_sha256": digest(payload),
-                  "exit_code": None, "cleanup_acknowledged": False}
+                  "exit_code": None, "cleanup_acknowledged": False, "cleanup_unverified_pids": None}
         self.records.append(record)
         output = self.directory / "logs" / (name + ".log")
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -202,6 +202,7 @@ class Runner:
             try:
                 stopped = self.manager.stop(name)
                 record["cleanup_acknowledged"] = stopped.get("running") is False
+                record["cleanup_unverified_pids"] = stopped.get("unverified_pids", [])
             except BaseException as error:
                 record["cleanup_failure"] = {"class": type(error).__name__, "message": str(error)}
                 if primary_error is None:

@@ -2,7 +2,9 @@
 
 The public network uses LeasedProcessRunner. This manual/SSH utility is not a GPU
 resource lease. Durable pre-spawn reservations survive failed bookkeeping and
-restart; an unresolved launch is never interpreted as an available slot.
+restart; an unresolved launch is never interpreted as an available slot. A
+same-user process this launcher may not inspect is reported as unverified, never
+counted as an owned child of a launch.
 """
 from __future__ import annotations
 
@@ -77,12 +79,22 @@ class ManagedLauncher:
 
     @staticmethod
     def _token_processes(token, since=None):
-        """Explicit local recovery only: identify this launch, never a port/GPU pattern."""
+        """Explicit local recovery only: identify this launch, never a port/GPU pattern.
+
+        Returns ``(owned, opaque)``. ``owned`` are live processes carrying this
+        launch's token; ``opaque`` are same-user processes whose environ this
+        process may not read. An unreadable environ is never evidence about a
+        launch: shared runners keep unrelated same-user daemons that deny
+        /proc/<pid>/environ, and ``since`` is another process's boot-relative
+        start time, so it cannot separate them (measured off by days on the CI
+        runner). Turning that into an error leaves a reservation no stop can
+        clear, so callers report ``opaque`` as unverified audit detail instead.
+        """
         import psutil
         if not token:
-            return []
+            return [], []
         owner = psutil.Process(os.getpid()).username()
-        result = []
+        result, opaque = [], []
         for process in psutil.process_iter():
             try:
                 if process.username() != owner:
@@ -97,14 +109,8 @@ class ManagedLauncher:
             except psutil.NoSuchProcess:
                 continue
             except psutil.AccessDenied:
-                # Do not silently classify an inaccessible same-user process idle.
-                try:
-                    same_user = process.username() == owner
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
-                    same_user = False
-                if same_user:
-                    raise RuntimeError("owned-process recovery cannot inspect all same-user candidates")
-        return result
+                opaque.append(process.pid)
+        return result, opaque
 
     @staticmethod
     def _terminate_targets(targets, timeout, *, child=None):
@@ -155,7 +161,7 @@ class ManagedLauncher:
 
     def _cleanup_child(self, process, token, timeout, since=None):
         import psutil
-        targets = self._token_processes(token, since)
+        targets, _ = self._token_processes(token, since)
         if process.poll() is None:
             try:
                 root = psutil.Process(process.pid)
@@ -170,10 +176,13 @@ class ManagedLauncher:
             process.kill()
             process.wait(timeout=timeout)
         # Catch an owned descendant forked between enumeration and termination.
-        remaining = self._token_processes(token, since)
+        # A stranger we may not inspect cannot prove a descendant survived, so
+        # only positively identified token carriers can block this cleanup.
+        remaining, _ = self._token_processes(token, since)
         if remaining:
             self._terminate_targets(remaining, timeout)
-        if self._token_processes(token, since):
+        survivors, _ = self._token_processes(token, since)
+        if survivors:
             raise RuntimeError("owned descendant cleanup not acknowledged")
 
     def _clear(self, name, token=None):
@@ -225,7 +234,7 @@ class ManagedLauncher:
                 if row["argv_hash"] != digest:
                     raise RuntimeError("deployment process already running with different configuration; stop it explicitly")
                 return {"name": name, "pid": existing.pid, "running": True, "reused": True}
-            if launch is not None and self._token_processes(launch["token"], launch["starter_birth"]):
+            if launch is not None and self._token_processes(launch["token"], launch["starter_birth"])[0]:
                 raise RuntimeError("old owned descendants remain; explicit local recover required")
             if row is not None and launch is None:
                 raise RuntimeError("legacy dead process record requires explicit stop/recover before restart")
@@ -295,19 +304,27 @@ class ManagedLauncher:
             token = launch["token"] if launch else None
             since = launch["starter_birth"] if launch else None
             root = self._process(row) or self._process(launch)
-            targets = self._token_processes(token, since)
+            targets, opaque = self._token_processes(token, since)
             if root is not None:
                 targets.append(root)
             self._terminate_targets(targets, timeout)
-            remaining = self._token_processes(token, since)
+            remaining, unaudited = self._token_processes(token, since)
+            opaque += unaudited
             if remaining:
                 self._terminate_targets(remaining, timeout)
-            if self._token_processes(token, since):
+            survivors, unaudited = self._token_processes(token, since)
+            opaque += unaudited
+            if survivors:
                 raise RuntimeError("owned process cleanup not acknowledged")
             conn.execute("DELETE FROM processes WHERE name=?", (name,))
             conn.execute("DELETE FROM launches WHERE name=?", (name,))
             conn.commit()
-            return {"name": name, "running": False, "stopped": bool(targets)}
+            # Release the slot once every attributable process is gone. Strangers
+            # we may not inspect are reported, not charged to this launch: they
+            # cannot be distinguished from the runner's own daemons, and refusing
+            # here would leave a reservation that no later stop can ever clear.
+            return {"name": name, "running": False, "stopped": bool(targets),
+                    "verified": not opaque, "unverified_pids": sorted(set(opaque))}
 
     def stop(self, name, *, timeout=5):
         return self._stop(name, timeout)
